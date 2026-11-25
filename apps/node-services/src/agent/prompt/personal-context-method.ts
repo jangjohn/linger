@@ -39,9 +39,14 @@ A record of a past event does not by itself prove a present status. Where source
 const INTRO =
   "What each source you can query here can tell you. When none of them holds a changing fact, say it is unconfirmed rather than presenting it as current.";
 
+const CALENDAR_COMMANDS: Record<string, string> = {
+  google_calendar: "teamhub gcal",
+  outlook: "teamhub outlook-calendar",
+};
 const MAIL_COMMANDS: Record<string, string> = {
   gmail: "teamhub gmail",
   outlook: "teamhub outlook",
+  feishu_mail: "teamhub feishu-mail",
 };
 const DOCUMENT_SOURCES: Record<string, string> = {
   googledrive: "Drive (teamhub gdrive)",
@@ -54,12 +59,12 @@ const APP_SOURCES: readonly {
   readonly render: (present: readonly string[]) => string;
 }[] = [
   {
-    keys: ["google_calendar"],
-    render: () =>
-      "- calendar (teamhub gcal list / free / read): scheduled meetings and events, attendees, free time.",
+    keys: ["google_calendar", "outlook"],
+    render: (present) =>
+      `- calendar (${present.map((key) => CALENDAR_COMMANDS[key]).join(" or ")} list / free / read): scheduled meetings and events, attendees, free time.`,
   },
   {
-    keys: ["gmail", "outlook"],
+    keys: ["gmail", "outlook", "feishu_mail"],
     render: (present) =>
       `- mail (${present.map((key) => MAIL_COMMANDS[key]).join(" or ")} list / read): the latest exchanges with people, including meeting invites, reschedules, confirmations, replies and attachments. Knowledge holds mail only up to its last import; newer mail is only here.`,
   },

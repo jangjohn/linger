@@ -129,24 +129,57 @@ func TestRefreshRejectsStatusOutsideTheContract(t *testing.T) {
 	// An Agent stores pi_model whole, so one longer than the contract is not cut.
 	long := model("other:Q4_K_M", "idle")
 	long["pi_model"] = "localmodels-library/" + strings.Repeat("x", 200)
-	badFamily := model("bad-family:Q4_K_M", "absent")
-	badFamily["family"] = "unknown_vendor"
-	badArch := model("bad-arch:Q4_K_M", "absent")
-	badArch["architecture"] = "ssm"
-	dupCap := model("dup-cap:Q4_K_M", "absent")
-	dupCap["capabilities"] = []string{"vision", "vision"}
-	badCap := model("bad-cap:Q4_K_M", "absent")
-	badCap["capabilities"] = []string{"audio"}
 	badURL := model("bad-url:Q4_K_M", "absent")
 	badURL["source_url"] = "http://huggingface.co/Qwen/Qwen3-4B"
 	badPromptSpeed := model("bad-speed:Q4_K_M", "loaded")
 	badPromptSpeed["prompt_tokens_per_second"] = -5.0
-	for _, entry := range []map[string]any{broken, long, badFamily, badArch, dupCap, badCap, badURL, badPromptSpeed} {
+	for _, entry := range []map[string]any{broken, long, badURL, badPromptSpeed} {
 		fake.write("status.json", status(entry))
 		snapshot := newLibrary(t, fake, &recorder{}, time.Second).Refresh(context.Background())
 		if snapshot.Available || snapshot.Reason.Code != CodeToolFailed || strings.Contains(snapshot.Reason.Detail, "warming") {
 			t.Fatalf("snapshot = %+v", snapshot)
 		}
+	}
+}
+
+func TestRefreshDegradesUnknownDisplayAndDiagnosticEnumsForwardCompatibly(t *testing.T) {
+	fake := newFakeTool(t)
+	future := model("future-model:Q4_K_M", "absent")
+	future["family"] = "unknown_vendor"
+	future["architecture"] = "ssm"
+	future["capabilities"] = []string{"vision", "vision", "audio"}
+	future["availability"] = map[string]any{
+		"downloadable": false,
+		"reason":       map[string]any{"code": "FUTURE_REASON", "need_bytes": 100},
+	}
+	failed := model("future-fail:Q4_K_M", "failed")
+	failed["error"] = map[string]any{"code": "FUTURE_ERROR", "detail": "new failure"}
+	idle := model("future-note:Q4_K_M", "idle")
+	idle["note"] = map[string]any{"code": "FUTURE_NOTE"}
+	doc := status(future, failed, idle)
+	doc["debug"] = map[string]any{"mode": "tiny", "source": "user_config", "config_path": "/tmp/debug.json"}
+	fake.write("status.json", doc)
+
+	snapshot := newLibrary(t, fake, &recorder{}, time.Second).Refresh(context.Background())
+	if !snapshot.Available {
+		t.Fatalf("snapshot should degrade forward-compatibly, got %+v", snapshot)
+	}
+	if snapshot.Debug == nil || snapshot.Debug.Mode != "tiny" || snapshot.Debug.Source != "user_config" || snapshot.Debug.ConfigPath != "/tmp/debug.json" {
+		t.Fatalf("debug = %+v", snapshot.Debug)
+	}
+	gotFuture := modelState(snapshot, "future-model:Q4_K_M")
+	if gotFuture == nil || gotFuture.Family != "other" || gotFuture.Architecture != "" ||
+		!slices.Equal(gotFuture.Capabilities, []string{"vision"}) ||
+		gotFuture.Availability.Reason == nil || gotFuture.Availability.Reason.Code != "UNAVAILABLE" {
+		t.Fatalf("future model = %+v", gotFuture)
+	}
+	gotFailed := modelState(snapshot, "future-fail:Q4_K_M")
+	if gotFailed == nil || gotFailed.Error == nil || gotFailed.Error.Code != "UNKNOWN_ERROR" {
+		t.Fatalf("failed model = %+v", gotFailed)
+	}
+	gotIdle := modelState(snapshot, "future-note:Q4_K_M")
+	if gotIdle == nil || gotIdle.Note != nil {
+		t.Fatalf("idle model = %+v", gotIdle)
 	}
 }
 
@@ -664,5 +697,87 @@ func TestAFailedLoadKeepsTheGatewayCauseOnItsRow(t *testing.T) {
 	waitFor(t, "the cause to clear", func() bool {
 		model := modelState(library.Refresh(context.Background()), testModel)
 		return model.Error != nil && model.Error.Cause == "" && model.Error.Path == ""
+	})
+}
+
+func TestLoadRotatesUnownedBifrostAddrOnlyOnCauseFreeGatewayFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		code    string
+		extra   string
+		rotates bool
+	}{
+		{name: "gateway registration", code: "GATEWAY_REGISTRATION_FAILED", rotates: true},
+		{name: "private home", code: "GATEWAY_REGISTRATION_FAILED", extra: `,"cause":"GATEWAY_HOME_NOT_PRIVATE","path":"/gateway-home"`},
+		{name: "unrecognized cause", code: "GATEWAY_REGISTRATION_FAILED", extra: `,"cause":"GATEWAY_OTHER_CAUSE"`},
+		{name: "other failure", code: "MODEL_UNKNOWN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeTool(t)
+			addr := seedFreeBifrostAddr(t, fake.state)
+			fake.write("status.json", status(model(testModel, "idle")))
+			fake.script("load", fakeScript{
+				Lines: []fakeLine{
+					{Line: progressLine(testModel, "load", 0, 2)},
+					{Line: errorLine(testModel, tc.code, tc.extra)},
+				},
+				Exit: 1,
+			})
+			record := &recorder{}
+			library := newLibrary(t, fake, record, time.Second)
+			if refusal, answered := library.Act(t.Context(), Action{Name: ActionLoad, Model: testModel}, soon()); !answered || refusal != nil {
+				t.Fatalf("load answered=%t, refusal=%+v, want accepted", answered, refusal)
+			}
+			waitFor(t, "the Runtime refresh after load exits", func() bool { return record.changes() > 0 })
+			assertBifrostAddrRotation(t, fake.state, addr, tc.rotates)
+		})
+	}
+}
+
+func TestDownloadPublishesDownloadingBeforeSlowPhaseStatusReturns(t *testing.T) {
+	fake := newFakeTool(t)
+	fake.write("status.json", status(model(testModel, "absent")))
+	lines := []fakeLine{
+		{Line: progressLine(testModel, "download", 0, 1000)},
+		{Line: progressLine(testModel, "download", 500, 1000), WaitFile: "download-hold"},
+		{Line: resultLine(testModel)},
+	}
+	loaded, _ := json.Marshal(status(model(testModel, "loaded")))
+	fake.script("download", fakeScript{Lines: lines, StatusAfter: loaded})
+	record := &recorder{}
+	library := newLibrary(t, fake, record, 50*time.Millisecond)
+	library.Refresh(context.Background())
+
+	statusGate := filepath.Join(fake.state, "status-wait")
+	downloadGate := filepath.Join(fake.state, "download-hold")
+	if err := os.WriteFile(statusGate, []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(downloadGate, []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(statusGate)
+		_ = os.Remove(downloadGate)
+	})
+
+	if refusal, answered := library.Act(context.Background(), Action{Name: ActionDownload, Model: testModel}, soon()); refusal != nil || !answered {
+		t.Fatalf("download refusal = %+v, answered = %v", refusal, answered)
+	}
+	waitFor(t, "status read to enter gate", func() bool {
+		_, err := os.Stat(filepath.Join(fake.state, "status-entered"))
+		return err == nil
+	})
+	// While library status is still blocked, the downloading state is already published.
+	waitFor(t, "immediate downloading snapshot", func() bool {
+		got := modelState(record.last(), testModel)
+		return got != nil && got.State == "downloading" && got.Download != nil && got.Download.TotalBytes == 1000
+	})
+
+	_ = os.Remove(statusGate)
+	_ = os.Remove(downloadGate)
+	waitFor(t, "the loaded snapshot", func() bool {
+		got := modelState(record.last(), testModel)
+		return got != nil && got.State == "loaded"
 	})
 }

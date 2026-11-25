@@ -10,8 +10,12 @@ import {
 } from "@/features/rooms/files/artifact-preview-loader";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type { TeamHubMemoryEntry } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT } from "@/i18n/use-translation";
 import { MeetingAudioPlayer } from "./meeting-audio-player";
-import { parseMeetingSummary } from "./meeting-overview";
+import { parseMeetingSummary, TODO_LIST_TITLE } from "./meeting-overview";
 import {
   MeetingKeywords,
   MeetingOutcomes,
@@ -19,6 +23,8 @@ import {
 } from "./meeting-overview-card";
 import { HideMeetingDialog } from "./hide-meeting-dialog";
 import { formatMeetingWhen, meetingWhen } from "./meetings-calendar";
+import { meetingsExtrasMessages } from "./meetings-extras.messages";
+import { meetingsMessages as m } from "./meetings.messages";
 
 const meetingSummaryHiddenSectionTitles = [
   "CRM Evidence Cache",
@@ -51,6 +57,7 @@ export function MeetingReader({
   resolveLink?: (reference: string) => string | null | undefined;
   tenantId: string;
 }) {
+  const t = useT();
   const meeting = entry.meeting!;
   const [deleting, setDeleting] = useState(false);
   const tab: MeetingTab =
@@ -73,33 +80,40 @@ export function MeetingReader({
   );
   const summaryDocument = (markdown: string) => (
     <ReadOnlyBlockNoteDocumentLoader
-      ariaLabel="Meeting summary document"
+      ariaLabel={t(m.summaryDocument)}
       hiddenSectionTitles={meetingSummaryHiddenSectionTitles}
       markdown={markdown}
       presentation="knowledge"
       resolveLink={resolveLink}
     />
   );
-  const tabs: Array<{ id: MeetingTab; label: string }> = [
-    { id: "summary", label: "Summary" },
-    { id: "transcript", label: "Transcript" },
+  const tabs: Array<{ id: MeetingTab; label: Message<string> }> = [
+    { id: "summary", label: m.summary },
+    { id: "transcript", label: m.transcript },
   ];
   return (
     <article
       className="meeting-document mx-auto w-full max-w-4xl px-5 py-7 md:px-10"
-      aria-label="Meeting"
+      aria-label={t(m.meeting)}
     >
       <header className="mb-4 flex items-start gap-3">
         <div className="min-w-0 flex-1">
           <h2 className="break-words text-xl text-app-ink">
             {when
-              ? `Meeting · ${formatMeetingWhen(when.date, when.time)}`
+              ? t(m.meetingHeading, {
+                  when: formatMeetingWhen(when.date, when.time, t),
+                })
               : entry.title}
           </h2>
-          <p className="mt-1 text-xs text-app-muted">Read only</p>
+          <p className="mt-1 text-xs text-app-muted">{t(m.readOnly)}</p>
         </div>
-        <Button onClick={() => setDeleting(true)} size="compact" tone="ghost">
-          Delete
+        <Button
+          data-voice-risk="never"
+          onClick={() => setDeleting(true)}
+          size="compact"
+          tone="ghost"
+        >
+          {t(commonMessages.delete)}
         </Button>
       </header>
       {deleting ? (
@@ -107,7 +121,9 @@ export function MeetingReader({
           captureId={meeting.capture_id}
           name={
             when
-              ? `Meeting ${formatMeetingWhen(when.date, when.time)}`
+              ? t(m.meetingNamed, {
+                  when: formatMeetingWhen(when.date, when.time, t),
+                })
               : entry.title
           }
           onClose={() => setDeleting(false)}
@@ -116,7 +132,7 @@ export function MeetingReader({
         />
       ) : null}
       <div
-        aria-label="Meeting views"
+        aria-label={t(m.views)}
         className="flex items-center gap-1 border-b border-app-border"
         role="tablist"
       >
@@ -135,7 +151,7 @@ export function MeetingReader({
             role="tab"
             type="button"
           >
-            {item.label}
+            {t(item.label)}
           </button>
         ))}
       </div>
@@ -162,13 +178,13 @@ export function MeetingReader({
                       )
                     }
                   >
-                    Download summary
+                    {t(m.downloadSummary)}
                   </Button>
                 </div>
                 {/* One reading surface: the table of contents reads every
                     heading inside it, the card's included. */}
                 <article
-                  aria-label="Meeting summary"
+                  aria-label={t(m.meetingSummary)}
                   className="[&>article:not(:first-child)]:pt-0 [&>article:not(:last-child)]:pb-0"
                   data-content-renderer="blocknote"
                   data-editable="false"
@@ -190,7 +206,11 @@ export function MeetingReader({
                       <MeetingOutcomes
                         key={index}
                         outcomes={block.outcomes}
-                        title={block.title}
+                        title={
+                          block.title === TODO_LIST_TITLE
+                            ? t(meetingsExtrasMessages.todoList)
+                            : block.title
+                        }
                       />
                     ),
                   )}
@@ -198,7 +218,7 @@ export function MeetingReader({
               </>
             ) : (
               <p className="text-sm text-app-muted" role="status">
-                The summary is still being written. The transcript is ready now.
+                {t(m.summaryPending)}
               </p>
             )}
             {/* The recording closes the summary, ready to replay a moment. */}
@@ -242,6 +262,7 @@ function MeetingVersionReader({
   variant: "player" | "document";
 }) {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const [preview, setPreview] = useState<LoadedArtifactPreview>();
   const [error, setError] = useState<string>();
   const [attempt, setAttempt] = useState(0);
@@ -283,7 +304,9 @@ function MeetingVersionReader({
           return;
         }
         setError(
-          failure instanceof Error ? failure.message : "File unavailable.",
+          failure instanceof Error
+            ? failure.message
+            : translate(m.fileUnavailable),
         );
       });
     return () => {
@@ -307,7 +330,9 @@ function MeetingVersionReader({
     } catch (failure) {
       if (!signal.aborted)
         setError(
-          failure instanceof Error ? failure.message : "Download failed.",
+          failure instanceof Error
+            ? failure.message
+            : translate(m.downloadFailed),
         );
     } finally {
       if (!signal.aborted) setDownloading(false);
@@ -316,13 +341,13 @@ function MeetingVersionReader({
   const header = (
     <div className="mb-3 flex justify-end">
       <Button
-        aria-label={`Download ${filename}`}
+        aria-label={t(m.downloadFile, { filename })}
         size="compact"
         tone="secondary"
         disabled={!preview || downloading}
         onClick={() => void download()}
       >
-        {variant === "player" ? "Download recording" : "Download transcript"}
+        {t(variant === "player" ? m.downloadRecording : m.downloadTranscript)}
       </Button>
     </div>
   );
@@ -334,17 +359,15 @@ function MeetingVersionReader({
         size="compact"
         tone="secondary"
       >
-        Retry
+        {t(commonMessages.retry)}
       </Button>
     </div>
   ) : !preview ? (
     <p className="text-sm text-app-muted" role="status">
-      {variant === "player" ? "Loading recording…" : "Loading transcript…"}
+      {t(variant === "player" ? m.loadingRecording : m.loadingTranscript)}
     </p>
   ) : preview.decision.kind === "download" ? (
-    <p className="text-sm text-app-muted">
-      Preview unavailable. Download the recording to open it.
-    </p>
+    <p className="text-sm text-app-muted">{t(m.previewUnavailable)}</p>
   ) : (
     <ArtifactContentRendererLoader
       kind={preview.decision.kind}
@@ -362,7 +385,7 @@ function MeetingVersionReader({
     if (error)
       return (
         <section
-          aria-label="Meeting recording"
+          aria-label={t(m.recording)}
           className="flex items-center gap-3 rounded-xl border border-app-border bg-app-surface px-3 py-2.5 text-sm"
         >
           <span className="min-w-0 flex-1 text-app-danger" role="alert">
@@ -373,7 +396,7 @@ function MeetingVersionReader({
             size="compact"
             tone="secondary"
           >
-            Retry
+            {t(commonMessages.retry)}
           </Button>
         </section>
       );
@@ -390,10 +413,10 @@ function MeetingVersionReader({
         src={playable ? preview.objectUrl : undefined}
         status={
           !preview
-            ? "Loading…"
+            ? t(commonMessages.loading)
             : playable
               ? undefined
-              : "Preview unavailable · download to listen"
+              : t(m.previewUnavailableListen)
         }
       />
     );

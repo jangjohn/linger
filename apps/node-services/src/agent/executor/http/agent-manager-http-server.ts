@@ -32,6 +32,7 @@ import {
   registerLocalComputerPermissionRoutes,
 } from "./local-computer-http.js";
 import {
+  readBodyWithLimit,
   startHttpHost,
   type HttpHost,
   type RoleReadiness,
@@ -425,7 +426,9 @@ const createAgentManagerHttpApp = <TRuntimeSettings>(
       if (
         !isRecord(body) ||
         !isRecord(body.arguments) ||
-        !["browser", "playground"].includes(String(body.server)) ||
+        !["browser", "playground", "feishu_mail"].includes(
+          String(body.server),
+        ) ||
         (body.deadline_ms !== undefined &&
           (!Number.isInteger(body.deadline_ms) ||
             Number(body.deadline_ms) < 1_000 ||
@@ -687,35 +690,9 @@ const readBody = async (
     throw payloadTooLarge(maxBodyBytes);
   }
 
-  const body = context.req.raw.body;
-  if (!body) {
-    return "";
-  }
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      size += value.byteLength;
-      if (size > maxBodyBytes) {
-        await reader.cancel();
-        throw payloadTooLarge(maxBodyBytes);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
+  const bytes = await readBodyWithLimit(context.req.raw, maxBodyBytes);
+  if (!bytes) {
+    throw payloadTooLarge(maxBodyBytes);
   }
   return new TextDecoder().decode(bytes);
 };

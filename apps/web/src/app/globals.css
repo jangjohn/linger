@@ -128,6 +128,11 @@
 
 :root[data-han-font="sc"] {
   --app-font-han: "PingFang SC", "Noto Sans SC Variable";
+  /* No Chinese slab face pairs with Roboto Slab, and Songti reads as a
+     different voice next to the sans interface, so Han text in slab headings
+     uses the same sans Han font as the rest of the interface. */
+  --app-font-slab:
+    "Roboto Slab Variable", Georgia, var(--app-font-han), sans-serif;
 }
 
 :root {
@@ -1432,6 +1437,24 @@ a[href][aria-disabled="true"],
   }
 }
 
+/* Live voice window: a new bubble and each newly arrived phrase fade in
+   whole, so the call does not pop in a packet at a time. */
+.voice-live-fade-in {
+  animation: voice-live-fade-in 200ms ease-out both;
+}
+
+@keyframes voice-live-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-live-fade-in {
+    animation: none;
+  }
+}
+
 /* Template cards settle in on open, staggered by their position in the grid so
    the shelf reads as one list arriving rather than a block appearing. */
 .template-card-enter {
@@ -1664,13 +1687,14 @@ a[href][aria-disabled="true"],
   :root[data-desktop-shell] .room-secondary-navigation-search:hover {
     background: rgb(0 0 0 / 8%);
   }
-  /* The rail and the list sit on the frame, as the bar along the top does. */
-  :root[data-desktop-shell] .app-navigation,
+  /* The list sits on the frame, as the bar along the top does. The rail
+     and the navigation around it stack above the page for the rail's
+     labels, so they let the frame show through rather than paint over the
+     shadow on the left edge of the card beside them. */
   :root[data-desktop-shell] .app-navigation .app-secondary-navigation {
     background: var(--app-sidebar);
   }
-  /* The rail stacks above the page for its labels, so it lets the frame
-     show through rather than paint over the card's edge beside it. */
+  :root[data-desktop-shell] .app-navigation,
   :root[data-desktop-shell] .app-primary-navigation {
     background: transparent;
   }
@@ -1907,8 +1931,10 @@ a[href][aria-disabled="true"],
     line-height: 1.25;
   }
 
-  /* Library: the browser layout, as one card under an empty bar. */
+  /* Library: the browser layout, as one card under an empty bar. The
+     layout leaves the card's shadow unclipped; the card clips its content. */
   :root[data-desktop-shell] .library-layout {
+    overflow: visible;
     background: transparent;
   }
   :root[data-desktop-shell] .library-layout-body {
@@ -2389,8 +2415,8 @@ a[href][aria-disabled="true"],
 
 /* A small gap sets the pinned rows apart from the rest, without a divider. */
 .room-secondary-navigation-list
-  .group:has([aria-label="Pinned"])
-  + .group:not(:has([aria-label="Pinned"])) {
+  .group:has(.room-pin-badge)
+  + .group:not(:has(.room-pin-badge)) {
   margin-top: 6px;
 }
 
@@ -4380,7 +4406,7 @@ button.question-choice:focus-visible {
     margin-right: -100%;
   }
 
-  .app-room-layout .panel-sidebar [aria-label="Resize sidebar"],
+  .app-room-layout .panel-sidebar [data-panel-resize-handle],
   .panel-maximize-control {
     display: none;
   }
@@ -5563,9 +5589,8 @@ button.question-choice:focus-visible {
   font-size: 12px;
   font-weight: 500;
 }
-/* The desktop app cannot float voice windows into picture-in-picture, so they
-   always stay in the page; there the bar takes the window's own surface
-   instead of a browser-style dark frame. */
+/* A voice window inside the desktop app's page takes the window's own surface
+   for its bar instead of a browser-style dark frame. */
 :root[data-desktop-shell] .voice-window-title {
   background-color: var(--app-canvas);
   color: var(--app-ink);

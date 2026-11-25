@@ -6,8 +6,11 @@ import { Link } from "react-router";
 import { secondaryNavigationHeaderClass } from "@/components/ui/secondary-navigation";
 import { useSecondaryNavigationWidth } from "@/components/ui/use-sidebar-width";
 import { MeetingsSidebarTree } from "@/features/wiki/knowledge-sidebar-trees";
+import { useT } from "@/i18n/use-translation";
 
 import { WikiDirectory } from "@/features/wiki/wiki-directory";
+
+import { libraryMessages as m } from "./library.messages";
 
 export type LibrarySection =
   | "my-documents"
@@ -38,9 +41,9 @@ export function LibrarySidebar({
   holdsOpenFile?: "wiki" | null;
   tenantId: string;
 }) {
+  const t = useT();
   const sidebarRef = useRef<HTMLElement>(null);
   const wikiOnly = active === "wiki" || holdsOpenFile === "wiki";
-  const sidebarLabel = wikiOnly ? "Wiki" : "Library";
   const scrollKey = `linger:${wikiOnly ? "wiki" : "library"}-sidebar-scroll:${tenantId}`;
   const navigationWidth = useSecondaryNavigationWidth(tenantId);
   useLayoutEffect(() => {
@@ -70,7 +73,10 @@ export function LibrarySidebar({
 
   const aside = (
     <aside
-      aria-label={`${sidebarLabel} sidebar`}
+      aria-label={t(wikiOnly ? m.wikiSidebar : m.librarySidebar)}
+      // The label follows the language, so code finds the sidebar by these.
+      data-library-sidebar={wikiOnly ? undefined : ""}
+      data-voice-area="sidebar"
       data-voice-scroll="sidebar"
       className={`workspace-scrollbar shrink-0 overflow-y-auto ${wikiOnly ? "overflow-x-hidden" : ""} bg-app-surface px-2 pb-3 sm:w-[calc(var(--sidebar-width)+20px)] sm:pl-[10px] sm:pr-[18px] ${
         mobileOpen
@@ -103,14 +109,15 @@ export function LibrarySidebar({
               to={`/t/${encodeURIComponent(tenantId)}/library`}
             >
               <Icon icon={ArrowLeft01Icon} className="shrink-0" size={16} />
-              <span className="truncate">Back to Library</span>
+              <span className="truncate">{t(m.backToLibrary)}</span>
             </Link>
             {mobileOpen && onMobileClose ? (
               <button
-                aria-label="Close Owned by Me"
+                data-voice-close
+                aria-label={t(m.closeOwnedByMe)}
                 className="flex size-8 shrink-0 items-center justify-center rounded-sm text-app-muted hover:bg-app-hover hover:text-app-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-focus sm:hidden"
                 onClick={onMobileClose}
-                title="Close Owned by Me"
+                title={t(m.closeOwnedByMe)}
                 type="button"
               >
                 <Icon icon={Cancel01Icon} size={16} />
@@ -136,7 +143,9 @@ export function LibrarySidebar({
       <div className="relative hidden w-px shrink-0 bg-border sm:block">
         <div
           {...navigationWidth.handleProps}
-          aria-label={`Resize ${sidebarLabel} sidebar`}
+          aria-label={t(
+            wikiOnly ? m.resizeWikiSidebar : m.resizeLibrarySidebar,
+          )}
         />
       </div>
     </>

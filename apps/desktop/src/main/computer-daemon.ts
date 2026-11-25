@@ -91,8 +91,8 @@ const BACKOFF_START_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 // A daemon that stayed up this long resets the backoff.
 const HEALTHY_AFTER_MS = 60_000;
-// This many exits in a row before a status line make the daemon failed: setup
-// stops waiting for it and shows the reason.
+// After this many consecutive attempts without a status line, setup stops
+// waiting for the daemon and shows the reason.
 export const FAILED_AFTER_EXITS = 3;
 // After stdin closes the daemon cancels its tasks and exits; this bounds it
 // below the module stop timeout.
@@ -203,6 +203,7 @@ export class ComputerDaemonModule implements Module {
   #state: RuntimeState = "stopped";
   #connection = "disconnected";
   #running = 0;
+  #modelInvokes = 0;
   #failures = 0;
   #startedAt = 0;
   #retry: NodeJS.Timeout | undefined;
@@ -211,7 +212,7 @@ export class ComputerDaemonModule implements Module {
   #restarting: Promise<void> = Promise.resolve();
   #env: Readonly<Record<string, string>> | undefined;
   #failure: string | undefined;
-  // Exits in a row of daemons that never reported a status.
+  // Consecutive launches that never reported a status.
   #startFailures = 0;
   readonly #unsubscribe: (() => void)[] = [];
 
@@ -228,13 +229,18 @@ export class ComputerDaemonModule implements Module {
     return this.#running;
   }
 
+  // One-shot background model invocations the daemon is executing right now.
+  modelInvokes(): number {
+    return this.#modelInvokes;
+  }
+
   // online, connecting, auth_failed, upgrade_required, or disconnected
   // while no daemon runs.
   connection(): string {
     return this.#connection;
   }
 
-  // Why the daemon keeps exiting before it reports a status, once it failed
+  // Why the daemon fails before it reports a status, once it failed
   // FAILED_AFTER_EXITS times in a row.
   failure(): string | undefined {
     return this.#failure;
@@ -320,39 +326,84 @@ export class ComputerDaemonModule implements Module {
 
   // Restarts never overlap: the next daemon starts after the previous exited.
   #restart(): void {
-    clearTimeout(this.#retry);
-    this.#restarting = this.#restarting.then(async () => {
-      await this.#terminate();
-      this.#launch();
-    });
+    this.#restarting = this.#restarting
+      .then(async () => {
+        // An earlier restart can arm a retry while this one is queued.
+        clearTimeout(this.#retry);
+        await this.#terminate();
+        this.#launch();
+      })
+      .catch((error: unknown) => {
+        // A cycle that threw must not leave the chain rejected, or every
+        // later restart would silently not run.
+        this.#ctx?.log.warn("computer_daemon.restart_failed", {
+          error: String(error),
+        });
+      });
+  }
+
+  #scheduleRetry(
+    startFailure: string | undefined,
+    log: (delay: number) => void,
+  ): void {
+    this.#failures += 1;
+    const delay = restartDelay(this.#failures);
+    this.#setState("crashed");
+    log(delay);
+    if (startFailure !== undefined) {
+      this.#startFailures += 1;
+      if (this.#startFailures >= FAILED_AFTER_EXITS)
+        this.#setFailure(startFailure);
+    }
+    this.#retry = setTimeout(() => this.#launch(), delay);
   }
 
   #launch(): void {
     const ctx = this.#ctx!;
     if (this.#stopping || this.#child || !this.#env) return;
-    const config = ctx.config.get();
-    if (!config.computerId || !config.tenantId) {
+    let child: DaemonChild;
+    try {
+      const config = ctx.config.get();
+      if (!config.computerId || !config.tenantId) {
+        this.#setConnection("disconnected");
+        this.#setState("stopped");
+        return;
+      }
+      const env = daemonEnvironment(this.#env, config.runtimeEnvironment);
+      const credential = this.#options.credentials.read();
+      if (credential?.computerId !== config.computerId) {
+        // Reconnecting this computer stores a new credential.
+        ctx.log.warn("computer_daemon.no_credential");
+        this.#setConnection("auth_failed");
+        this.#setState("stopped");
+        return;
+      }
+      const configFile = this.#writeConfig(config, credential, env);
+      this.#setState("starting");
+      this.#setConnection("connecting");
+      this.#startedAt = Date.now();
+      child = this.#options.spawn(configFile, {
+        ...env,
+        [TOKEN_ENV]: credential.token,
+      });
+    } catch (error) {
+      if (this.#stopping) return;
       this.#setConnection("disconnected");
-      this.#setState("stopped");
+      // Node's invalid argument message can include a credential from env.
+      const reason =
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ERR_INVALID_ARG_VALUE"
+          ? "Invalid daemon launch argument (ERR_INVALID_ARG_VALUE)"
+          : String(error);
+      this.#scheduleRetry(reason, (delay) =>
+        ctx.log.warn("computer_daemon.launch_failed", {
+          error: reason,
+          restart_in_ms: delay,
+        }),
+      );
       return;
     }
-    const credential = this.#options.credentials.read();
-    if (credential?.computerId !== config.computerId) {
-      // Reconnecting this computer stores a new credential.
-      ctx.log.warn("computer_daemon.no_credential");
-      this.#setConnection("auth_failed");
-      this.#setState("stopped");
-      return;
-    }
-    const env = daemonEnvironment(this.#env, config.runtimeEnvironment);
-    const configFile = this.#writeConfig(config, credential, env);
-    this.#setState("starting");
-    this.#setConnection("connecting");
-    this.#startedAt = Date.now();
-    const child = this.#options.spawn(configFile, {
-      ...env,
-      [TOKEN_ENV]: credential.token,
-    });
     this.#child = child;
     if (this.#options.permissions)
       this.#send(child, { type: "hello", features: DAEMON_FEATURES });
@@ -365,6 +416,7 @@ export class ComputerDaemonModule implements Module {
         permission?: unknown;
         gateway_state?: unknown;
         active_operations?: unknown;
+        active_model_invokes?: unknown;
       };
       try {
         status = JSON.parse(line) as typeof status;
@@ -388,27 +440,28 @@ export class ComputerDaemonModule implements Module {
         this.#setConnection(connectionState(status.gateway_state));
       if (typeof status.active_operations === "number")
         this.#setRunning(status.active_operations);
+      if (typeof status.active_model_invokes === "number")
+        this.#setModelInvokes(status.active_model_invokes);
     });
     child.onExit((code, reason) => {
       if (this.#child !== child) return;
       this.#child = undefined;
       this.#setRunning(0);
+      this.#setModelInvokes(0);
       this.#setConnection("disconnected");
       if (this.#stopping) return;
       if (Date.now() - this.#startedAt >= HEALTHY_AFTER_MS) this.#failures = 0;
-      this.#failures += 1;
-      const delay = restartDelay(this.#failures);
-      const started = this.#state === "ready";
-      this.#setState("crashed");
-      ctx.log.warn("computer_daemon.exited", {
-        code,
-        restart_in_ms: delay,
-        ...(reason ? { reason } : {}),
-      });
-      if (!started) this.#startFailures += 1;
-      if (this.#startFailures >= FAILED_AFTER_EXITS)
-        this.#setFailure(reason ?? `exit code ${String(code)}`);
-      this.#retry = setTimeout(() => this.#launch(), delay);
+      const startFailure =
+        this.#state === "ready"
+          ? undefined
+          : (reason ?? `exit code ${String(code)}`);
+      this.#scheduleRetry(startFailure, (delay) =>
+        ctx.log.warn("computer_daemon.exited", {
+          code,
+          restart_in_ms: delay,
+          ...(reason ? { reason } : {}),
+        }),
+      );
     });
   }
 
@@ -473,6 +526,7 @@ export class ComputerDaemonModule implements Module {
     if (!child) return;
     this.#child = undefined;
     this.#setRunning(0);
+    this.#setModelInvokes(0);
     this.#setConnection("disconnected");
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -530,6 +584,12 @@ export class ComputerDaemonModule implements Module {
     this.#ctx?.bus.emit("runtime.activity", running);
   }
 
+  #setModelInvokes(modelInvokes: number): void {
+    if (this.#modelInvokes === modelInvokes) return;
+    this.#modelInvokes = modelInvokes;
+    this.#ctx?.bus.emit("runtime.model_activity", modelInvokes);
+  }
+
   #setConnection(connection: string): void {
     if (this.#connection === connection) return;
     this.#connection = connection;
@@ -555,7 +615,6 @@ export const spawnDaemon =
   (executable: string, logFile: string): SpawnDaemon =>
   (configFile, env) => {
     mkdirSync(path.dirname(logFile), { recursive: true, mode: 0o700 });
-    const log = createWriteStream(logFile, { flags: "a", mode: 0o600 });
     const child = spawn(executable, ["--config", configFile], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -564,6 +623,7 @@ export const spawnDaemon =
       detached: process.platform !== "win32",
       windowsHide: true,
     });
+    const log = createWriteStream(logFile, { flags: "a", mode: 0o600 });
     const lines: ((line: string) => void)[] = [];
     const exits: ((code: number | null, reason?: string) => void)[] = [];
     let exiting = false;

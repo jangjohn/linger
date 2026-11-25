@@ -1,15 +1,18 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/linger/transport"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/localmodels"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/protocol"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider"
 )
@@ -50,6 +53,12 @@ func (f *fakeModelInvoker) calls() int {
 	return len(f.requests)
 }
 
+func (f *fakeModelInvoker) lastRequest() provider.ModelInvokeRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests[len(f.requests)-1]
+}
+
 func modelInvokeFixture(t *testing.T, invoker ModelInvoker) (*Daemon, *fakeStream) {
 	t.Helper()
 	stream := &fakeStream{}
@@ -61,6 +70,9 @@ func modelInvokeFixture(t *testing.T, invoker ModelInvoker) (*Daemon, *fakeStrea
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Tests never touch the real network; a failed call finds it reachable
+	// unless the test says otherwise.
+	d.dialNetwork = func(context.Context, string, string) error { return nil }
 	t.Cleanup(d.WaitForOperations)
 	return d, stream
 }
@@ -151,6 +163,47 @@ func TestModelInvokeRunsEveryCallItReceives(t *testing.T) {
 	}
 	if invoker.calls() != len(running) {
 		t.Fatalf("calls = %d", invoker.calls())
+	}
+}
+
+func TestActiveModelInvokeCountTracksInFlightCalls(t *testing.T) {
+	invoker := newFakeModelInvoker()
+	d, stream := modelInvokeFixture(t, invoker)
+	if got := d.ActiveModelInvokeCount(); got != 0 {
+		t.Fatalf("initial active model invokes = %d", got)
+	}
+	for _, id := range []string{"invoke-a", "invoke-b"} {
+		if err := d.handleModelInvoke(context.Background(), stream, modelInvokeCommand(id, nil)); err != nil {
+			t.Fatal(err)
+		}
+		<-invoker.started
+	}
+	if got := d.ActiveModelInvokeCount(); got != 2 {
+		t.Fatalf("in-flight active model invokes = %d", got)
+	}
+	if got := d.ActiveOperationCount(); got != 0 {
+		t.Fatalf("model invokes must not count as active operations, got %d", got)
+	}
+	cancel := protocol.Command{
+		Type: protocol.CommandModelInvokeCancel, CommandID: "cancel-invoke-a", RunnerID: "computer-1", ConnectionEpoch: 1,
+		Payload: mustJSON(map[string]any{"invoke_id": "invoke-a", "reason": "scheduler_yield"}),
+	}
+	if err := d.cancelModelInvoke(cancel); err != nil {
+		t.Fatal(err)
+	}
+	if payload := waitForModelInvoked(t, stream, "invoke-a"); payload["outcome"] != "canceled" {
+		t.Fatalf("payload = %v", payload)
+	}
+	if got := d.ActiveModelInvokeCount(); got != 1 {
+		t.Fatalf("remaining active model invokes = %d", got)
+	}
+	close(invoker.release)
+	if payload := waitForModelInvoked(t, stream, "invoke-b"); payload["outcome"] != "completed" {
+		t.Fatalf("payload = %v", payload)
+	}
+	d.WaitForOperations()
+	if got := d.ActiveModelInvokeCount(); got != 0 {
+		t.Fatalf("final active model invokes = %d", got)
 	}
 }
 
@@ -349,5 +402,374 @@ func TestModelInvokeCarriesTheCapAndWhatAStoppedCallStreamed(t *testing.T) {
 	payload := waitForModelInvoked(t, stream, "invoke-1")
 	if payload["outcome"] != "output_limited" || payload["text"] != `{"actions":[{"p` || payload["reason"] != "Model reply exceeded its output limit" || payload["usage"] != nil {
 		t.Fatalf("payload = %v", payload)
+	}
+}
+
+// failingModelInvoker answers every call as failed with a fixed reason.
+type failingModelInvoker struct{ reason string }
+
+func (f failingModelInvoker) Close() {}
+
+func (f failingModelInvoker) Invoke(context.Context, provider.ModelInvokeRequest) provider.ModelInvokeResult {
+	return provider.ModelInvokeResult{Outcome: provider.ModelInvokeFailed, Reason: f.reason}
+}
+
+// modelInvokeLogLines records the runner.model.invoke lines with the given phase.
+func modelInvokeLogLines(t *testing.T) func(phase string) []map[string]any {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	var mu sync.Mutex
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(lockedWriter{mu: &mu, w: buffer}, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return func(phase string) []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		var lines []map[string]any
+		for _, line := range strings.Split(strings.TrimSpace(buffer.String()), "\n") {
+			var record map[string]any
+			if json.Unmarshal([]byte(line), &record) == nil && record["msg"] == "runner.model.invoke" && record["phase"] == phase {
+				lines = append(lines, record)
+			}
+		}
+		return lines
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+func TestModelInvokeLogsARedactedTruncatedFailureReason(t *testing.T) {
+	secret := "sk-" + strings.Repeat("A", 40)
+	for name, test := range map[string]struct {
+		reason string
+		check  func(t *testing.T, logged string)
+	}{
+		"readable": {reason: "model_not_found: The model gpt-x does not exist", check: func(t *testing.T, logged string) {
+			if logged != "model_not_found: The model gpt-x does not exist" {
+				t.Fatalf("reason = %q", logged)
+			}
+		}},
+		"credentials": {reason: "upstream 401 with key " + secret + " and Authorization: Bearer fixture-token", check: func(t *testing.T, logged string) {
+			if strings.Contains(logged, secret) || strings.Contains(logged, "fixture-token") || !strings.Contains(logged, "[REDACTED]") {
+				t.Fatalf("reason = %q", logged)
+			}
+		}},
+		"long": {reason: strings.Repeat("é", 400), check: func(t *testing.T, logged string) {
+			if logged != strings.Repeat("é", 300) {
+				t.Fatalf("reason has %d runes", len([]rune(logged)))
+			}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lines := modelInvokeLogLines(t)
+			d, stream := modelInvokeFixture(t, failingModelInvoker{reason: test.reason})
+			if err := d.handleModelInvoke(context.Background(), stream, modelInvokeCommand("invoke-failed", nil)); err != nil {
+				t.Fatal(err)
+			}
+			waitForModelInvoked(t, stream, "invoke-failed")
+			failed := lines("failed")
+			if len(failed) != 1 || failed[0]["invoke_id"] != "invoke-failed" {
+				t.Fatalf("log lines = %v", failed)
+			}
+			logged, _ := failed[0]["reason"].(string)
+			test.check(t, logged)
+		})
+	}
+}
+
+func TestModelInvokeLogsNoReasonForACompletedCall(t *testing.T) {
+	lines := modelInvokeLogLines(t)
+	invoker := newFakeModelInvoker()
+	d, stream := modelInvokeFixture(t, invoker)
+	if err := d.handleModelInvoke(context.Background(), stream, modelInvokeCommand("invoke-ok", nil)); err != nil {
+		t.Fatal(err)
+	}
+	<-invoker.started
+	close(invoker.release)
+	waitForModelInvoked(t, stream, "invoke-ok")
+	completed := lines("completed")
+	if len(completed) != 1 {
+		t.Fatalf("log lines = %v", completed)
+	}
+	if _, ok := completed[0]["reason"]; ok {
+		t.Fatalf("completed line has a reason: %v", completed[0])
+	}
+}
+
+func TestModelInvokeNormalizesUnsupportedEffortForTargetModel(t *testing.T) {
+	tests := []struct {
+		name        string
+		runtimeType string
+		models      []provider.RuntimeModel
+		requested   string
+		want        string
+	}{
+		{
+			name:        "codex model clamps medium to declared high default",
+			runtimeType: "codex",
+			models: []provider.RuntimeModel{{
+				ID:                     "custom-model",
+				Label:                  "Custom Model",
+				AllowedReasoningEffort: []string{"low", "high"},
+				DefaultReasoningEffort: "high",
+				IsDefault:              true,
+			}},
+			requested: "medium",
+			want:      "high",
+		},
+		{
+			name:        "codex model clamps medium to declared low default on tie",
+			runtimeType: "codex",
+			models: []provider.RuntimeModel{{
+				ID:                     "custom-model",
+				Label:                  "Custom Model",
+				AllowedReasoningEffort: []string{"low", "high"},
+				DefaultReasoningEffort: "low",
+				IsDefault:              true,
+			}},
+			requested: "medium",
+			want:      "low",
+		},
+		{
+			name:        "codex model filters unsupported ultra effort from allowed list",
+			runtimeType: "codex",
+			models: []provider.RuntimeModel{{
+				ID:                     "custom-model",
+				Label:                  "Custom Model",
+				AllowedReasoningEffort: []string{"low", "ultra"},
+				IsDefault:              true,
+			}},
+			requested: "high",
+			want:      "low",
+		},
+		{
+			name:        "claude none-only model normalizes to none",
+			runtimeType: "claude",
+			models: []provider.RuntimeModel{{
+				ID:                     "claude-none",
+				Label:                  "Claude None",
+				AllowedReasoningEffort: []string{"none"},
+				IsDefault:              true,
+			}},
+			requested: "medium",
+			want:      "none",
+		},
+		{
+			name:        "pi passes requested effort through for live get_state clamping",
+			runtimeType: "pi",
+			models: []provider.RuntimeModel{{
+				ID:                     "localmodels/Spark-X2.6-4B-Q8_0",
+				Label:                  "Spark-X2.6-4B-Q8_0",
+				AllowedReasoningEffort: []string{"low", "high"},
+				DefaultReasoningEffort: "high",
+				IsDefault:              true,
+			}},
+			requested: "medium",
+			want:      "medium",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			invoker := newFakeModelInvoker()
+			stream := &fakeStream{}
+			diagnostics := mustJSON([]provider.RuntimeDiagnostic{{
+				Type:   tc.runtimeType,
+				Status: "ready",
+				Models: tc.models,
+			}})
+			d, err := newTestDaemon(t, Options{
+				ComputerID:         "computer-1",
+				ControlPlane:       fakeControlPlane{stream: stream},
+				IdentityStore:      fakeStore{},
+				OperationResolver:  prepareOperationResolver{workingDirectory: t.TempDir()},
+				ModelInvoker:       invoker,
+				Runtimes:           []string{tc.runtimeType},
+				RuntimeDiagnostics: diagnostics,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(d.WaitForOperations)
+
+			command := modelInvokeCommand("invoke-effort", map[string]any{"reasoning_effort": tc.requested})
+			command.RuntimeType = tc.runtimeType
+			if err := d.handleModelInvoke(context.Background(), stream, command); err != nil {
+				t.Fatal(err)
+			}
+			request := <-invoker.started
+			if request.ReasoningEffort != tc.want {
+				t.Fatalf("normalized ReasoningEffort = %q; want %q", request.ReasoningEffort, tc.want)
+			}
+			close(invoker.release)
+			if payload := waitForModelInvoked(t, stream, "invoke-effort"); payload["outcome"] != "completed" {
+				t.Fatalf("payload = %v", payload)
+			}
+		})
+	}
+}
+
+type fixedOutcomeModelInvoker struct {
+	result provider.ModelInvokeResult
+}
+
+func (f fixedOutcomeModelInvoker) Close() {}
+
+func (f fixedOutcomeModelInvoker) Invoke(context.Context, provider.ModelInvokeRequest) provider.ModelInvokeResult {
+	return f.result
+}
+
+func TestModelInvokeOutcomesFollowWelcomeServiceFeature(t *testing.T) {
+	cases := []struct {
+		name            string
+		result          provider.ModelInvokeResult
+		featureAccepted bool
+		wantOutcome     string
+	}{
+		{
+			name:            "context_too_long downgrades for legacy service",
+			result:          provider.ModelInvokeResult{Outcome: provider.ModelInvokeContextTooLong, Reason: "prompt too long"},
+			featureAccepted: false,
+			wantOutcome:     provider.ModelInvokeFailed,
+		},
+		{
+			name:            "context_too_long passes through when service accepts model_invoke_outcomes",
+			result:          provider.ModelInvokeResult{Outcome: provider.ModelInvokeContextTooLong, Reason: "prompt too long"},
+			featureAccepted: true,
+			wantOutcome:     provider.ModelInvokeContextTooLong,
+		},
+		{
+			name:            "unsupported downgrades for legacy service",
+			result:          provider.ModelInvokeResult{Outcome: provider.ModelInvokeUnsupported, Reason: "Pi background calls do not run file tools"},
+			featureAccepted: false,
+			wantOutcome:     provider.ModelInvokeRuntimeUnavailable,
+		},
+		{
+			name:            "unsupported passes through when service accepts model_invoke_outcomes",
+			result:          provider.ModelInvokeResult{Outcome: provider.ModelInvokeUnsupported, Reason: "Pi background calls do not run file tools"},
+			featureAccepted: true,
+			wantOutcome:     provider.ModelInvokeUnsupported,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, stream := modelInvokeFixture(t, fixedOutcomeModelInvoker{result: tc.result})
+			d.modelInvokeOutcomes.Store(tc.featureAccepted)
+			if err := d.handleModelInvoke(context.Background(), stream, modelInvokeCommand("invoke-outcome", nil)); err != nil {
+				t.Fatal(err)
+			}
+			payload := waitForModelInvoked(t, stream, "invoke-outcome")
+			if payload["outcome"] != tc.wantOutcome {
+				t.Fatalf("outcome = %v; want %q", payload["outcome"], tc.wantOutcome)
+			}
+		})
+	}
+}
+
+// Pi may list the Computer's downloaded local models with none loaded; a
+// model call, which names no model, is refused instead of starting Pi.
+func TestModelInvokeRefusesAPiWithNoLoadedModel(t *testing.T) {
+	invoker := newFakeModelInvoker()
+	d, stream := modelInvokeFixture(t, invoker)
+	d.modelInvokeUnready = func(runtimeType string) bool { return runtimeType == "pi" }
+	command := modelInvokeCommand("invoke-pi", nil)
+	command.RuntimeType = "pi"
+	if err := d.handleModelInvoke(context.Background(), stream, command); err != nil {
+		t.Fatal(err)
+	}
+	if payload := waitForModelInvoked(t, stream, "invoke-pi"); payload["outcome"] != "runtime_unavailable" {
+		t.Fatalf("payload = %v", payload)
+	}
+	if invoker.calls() != 0 {
+		t.Fatalf("invoker calls = %d", invoker.calls())
+	}
+	// Another Runtime is unaffected.
+	if err := d.handleModelInvoke(context.Background(), stream, modelInvokeCommand("invoke-codex", nil)); err != nil {
+		t.Fatal(err)
+	}
+	<-invoker.started
+	close(invoker.release)
+	if payload := waitForModelInvoked(t, stream, "invoke-codex"); payload["outcome"] != "completed" {
+		t.Fatalf("payload = %v", payload)
+	}
+}
+
+// A Pi model call that names its model loads it on demand through the local
+// model library, matching a Pi Run, even when no model was loaded yet.
+func TestModelInvokeLoadsNamedPiLocalModelOnDemand(t *testing.T) {
+	invoker := newFakeModelInvoker()
+	d, stream := modelInvokeFixture(t, invoker)
+	library := &fakeLocalModels{}
+	d.localModels = library
+	d.modelInvokeUnready = func(runtimeType string) bool { return runtimeType == "pi" }
+
+	command := modelInvokeCommand("invoke-pi-named", map[string]any{"model": localRunModel})
+	command.RuntimeType = "pi"
+	if err := d.handleModelInvoke(context.Background(), stream, command); err != nil {
+		t.Fatal(err)
+	}
+	<-invoker.started
+	close(invoker.release)
+	if payload := waitForModelInvoked(t, stream, "invoke-pi-named"); payload["outcome"] != "completed" {
+		t.Fatalf("payload = %v", payload)
+	}
+	if len(library.ensured) != 1 || library.ensured[0] != localRunModel {
+		t.Fatalf("EnsureLoaded calls = %v", library.ensured)
+	}
+	if got := invoker.lastRequest().Model; got != localRunModel {
+		t.Fatalf("invoked model = %q, want %q", got, localRunModel)
+	}
+
+	// A load refusal surfaces as runtime_unavailable without starting Pi.
+	library.ensureErr = &localmodels.LocalModelLoadError{Code: "LOAD_NO_ROOM", ModelID: "qwen3-4b:Q4_K_M"}
+	failedCommand := modelInvokeCommand("invoke-pi-oom", map[string]any{"model": localRunModel})
+	failedCommand.RuntimeType = "pi"
+	if err := d.handleModelInvoke(context.Background(), stream, failedCommand); err != nil {
+		t.Fatal(err)
+	}
+	payload := waitForModelInvoked(t, stream, "invoke-pi-oom")
+	if payload["outcome"] != "runtime_unavailable" || !strings.Contains(payload["reason"].(string), "LOAD_NO_ROOM") {
+		t.Fatalf("load failure payload = %v", payload)
+	}
+	if invoker.calls() != 1 {
+		t.Fatalf("invoker calls = %d, want 1", invoker.calls())
+	}
+}
+
+// Effort normalization clamps against the requested model's advertised levels
+// rather than the Runtime's default model.
+func TestModelInvokeNormalizesEffortForRequestedModel(t *testing.T) {
+	invoker := newFakeModelInvoker()
+	d, stream := modelInvokeFixture(t, invoker)
+	d.runtimeDiagnostics = mustJSON([]provider.RuntimeDiagnostic{{
+		Type: "codex", Status: "ready",
+		Models: []provider.RuntimeModel{
+			{ID: "gpt-default", IsDefault: true, AllowedReasoningEffort: []string{"low", "medium"}, DefaultReasoningEffort: "low"},
+			{ID: "gpt-high-only", AllowedReasoningEffort: []string{"high"}, DefaultReasoningEffort: "high"},
+		},
+	}})
+	if err := d.handleModelInvoke(context.Background(), stream, modelInvokeCommand("invoke-effort", map[string]any{
+		"model":            "gpt-high-only",
+		"reasoning_effort": "low",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	<-invoker.started
+	close(invoker.release)
+	if payload := waitForModelInvoked(t, stream, "invoke-effort"); payload["outcome"] != "completed" {
+		t.Fatalf("payload = %v", payload)
+	}
+	if got := invoker.lastRequest(); got.Model != "gpt-high-only" || got.ReasoningEffort != "high" {
+		t.Fatalf("request = %+v; want model gpt-high-only and effort high", got)
 	}
 }

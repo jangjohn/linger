@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,11 +14,13 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/computerconfig"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/linger/assignment"
+	lingercontext "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/linger/context"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/localmodels"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider"
 )
@@ -32,7 +37,7 @@ func TestRuntimeMonitorPreservesCodexRegistrationUntilFailureThreshold(t *testin
 			entry, original, replacement := filepath.Join(root, "codex"), filepath.Join(root, "codex-old"), filepath.Join(root, "codex-new")
 			stateFile := filepath.Join(root, "probe-state")
 			script := `#!/bin/sh
-if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.1'; exit 0; fi
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.171.0'; exit 0; fi
 read probe_state < "$PROBE_STATE"
 if [ "$probe_state" = "protocol" ]; then exit 2; fi
 read initialize
@@ -70,7 +75,7 @@ fi
 				}
 				output, err := command.CombinedOutput()
 				cancel()
-				if err != nil || strings.TrimSpace(string(output)) != "codex-cli 0.144.1" {
+				if err != nil || strings.TrimSpace(string(output)) != "codex-cli 0.171.0" {
 					t.Fatalf("prepare Codex fixture %s: %v, output=%q", executable, err, output)
 				}
 			}
@@ -219,7 +224,7 @@ func TestBoundComputerServiceCommandCannotSelectAnotherConfig(t *testing.T) {
 func TestProviderInstallationsPreserveTerminalExecutionPath(t *testing.T) {
 	environment := map[string]string{"PATH": "daemon-path", "HOME": "/home/user"}
 	discovered := provider.DiscoveryResult{Installations: map[string]provider.RuntimeDiagnostic{"pi": {Type: "pi", ExecutablePath: "/mise/pi", EntryPath: "/mise/latest/pi", ExecutionPath: "terminal-node:daemon-path"}}}
-	installations, _ := providerInstallations(discovered, environment)
+	installations, _ := providerInstallations(discovered, environment, "")
 	if installations["pi"].Environment["PATH"] != "terminal-node:daemon-path" || environment["PATH"] != "daemon-path" {
 		t.Fatalf("terminal execution environment was lost or caller mutated: %+v", installations["pi"])
 	}
@@ -230,9 +235,40 @@ func TestProviderInstallationsKeepDiscoveredContextWindows(t *testing.T) {
 		Type: "codex", ExecutablePath: "/bin/codex",
 		Models: []provider.RuntimeModel{{ID: "local", ContextWindow: 64896}, {ID: "unknown"}},
 	}}}
-	installations, _ := providerInstallations(discovered, nil)
+	installations, _ := providerInstallations(discovered, nil, "")
 	if windows := installations["codex"].ContextWindows; len(windows) != 1 || windows["local"] != 64896 {
 		t.Fatalf("context windows = %v", windows)
+	}
+	if installations["codex"].DefaultModel != "" {
+		t.Fatalf("default model = %q from a catalog that marks none", installations["codex"].DefaultModel)
+	}
+}
+
+func TestProviderInstallationsKeepTheCatalogDefaultModel(t *testing.T) {
+	discovered := provider.DiscoveryResult{Installations: map[string]provider.RuntimeDiagnostic{"codex": {
+		Type: "codex", ExecutablePath: "/bin/codex",
+		Models: []provider.RuntimeModel{{ID: "gpt-other"}, {ID: "gpt-account-default", IsDefault: true}},
+	}}}
+	installations, _ := providerInstallations(discovered, nil, "")
+	if model := installations["codex"].DefaultModel; model != "gpt-account-default" {
+		t.Fatalf("default model = %q", model)
+	}
+}
+
+func TestProviderInstallationsMarkTheAPILink(t *testing.T) {
+	discovered := provider.DiscoveryResult{Installations: map[string]provider.RuntimeDiagnostic{
+		"codex":  {Type: "codex", ExecutablePath: "/bin/codex", Models: []provider.RuntimeModel{{ID: "gpt", Link: "api"}}},
+		"claude": {Type: "claude", ExecutablePath: "/bin/claude", Models: []provider.RuntimeModel{{ID: "opus", Link: "subscription"}}},
+	}}
+	installations, _ := providerInstallations(discovered, nil, "")
+	if !installations["codex"].APILink || installations["claude"].APILink {
+		t.Fatalf("API links = codex %v, claude %v", installations["codex"].APILink, installations["claude"].APILink)
+	}
+	state := t.TempDir()
+	gateway := map[string]string{"CLAUDE_CONFIG_DIR": filepath.Join(state, "byok-home", ".claude")}
+	installations, _ = providerInstallations(discovered, gateway, state)
+	if claude := installations["claude"]; !claude.ModelGateway || !claude.APILink {
+		t.Fatalf("gateway Claude = %+v", claude)
 	}
 }
 
@@ -303,5 +339,438 @@ func TestWithPiProvisionStatusMarksNotInstalledPiAsErrorWhenFailed(t *testing.T)
 	readyPi := []provider.RuntimeDiagnostic{{Type: "pi", Status: "ready"}}
 	if got := withPiProvisionStatus(readyPi, true); got[0].Status != "ready" {
 		t.Fatalf("ready Pi overwritten: %+v", got[0])
+	}
+}
+
+func TestByokRuntimeCatalogsRepeatedShapingPreservesRouteAndDoesNotMutate(t *testing.T) {
+	input := []provider.RuntimeDiagnostic{
+		{
+			Type: "pi", Status: "ready", ExecutablePath: "/bin/pi",
+			Models: []provider.RuntimeModel{
+				{ID: "localmodels/localmodels-byok", Label: "localmodels-byok", AllowedReasoningEffort: []string{"low", "high"}, DefaultReasoningEffort: "high", ContextWindow: 1_048_576, Link: "api", IsDefault: true},
+				{ID: "builtin/model-001", Label: "Built-in 001", AllowedReasoningEffort: []string{}, Link: "subscription"},
+			},
+		},
+		{
+			Type: "codex", Status: "ready", ExecutablePath: "/bin/codex",
+			Models: []provider.RuntimeModel{{ID: "gpt-5", Label: "gpt-5", AllowedReasoningEffort: []string{}, IsDefault: true}},
+		},
+	}
+	snapshot := []provider.RuntimeDiagnostic{
+		{
+			Type: "pi", Status: "ready", ExecutablePath: "/bin/pi",
+			Models: append([]provider.RuntimeModel(nil), input[0].Models...),
+		},
+		{
+			Type: "codex", Status: "ready", ExecutablePath: "/bin/codex",
+			Models: append([]provider.RuntimeModel(nil), input[1].Models...),
+		},
+	}
+	overlay := &localmodels.OverlayState{
+		Mode:         "byok",
+		Runtime:      "pi",
+		RuntimeModel: "localmodels/localmodels-byok",
+		ModelLabel:   "vendor/custom-gateway-model",
+	}
+	wantPiModels := []provider.RuntimeModel{{
+		ID:                     "localmodels/localmodels-byok",
+		Label:                  "vendor/custom-gateway-model",
+		AllowedReasoningEffort: []string{"low", "high"},
+		DefaultReasoningEffort: "high",
+		ContextWindow:          1_048_576,
+		Link:                   "api",
+		IsDefault:              true,
+	}}
+
+	current := input
+	for pass := range 3 {
+		current = byokRuntimeCatalogs(current, overlay)
+		if !reflect.DeepEqual(current[0].Models, wantPiModels) {
+			t.Fatalf("pass %d Pi models = %+v, want %+v", pass+1, current[0].Models, wantPiModels)
+		}
+		if !reflect.DeepEqual(current[1].Models, snapshot[1].Models) {
+			t.Fatalf("pass %d non-BYOK runtime changed: %+v", pass+1, current[1].Models)
+		}
+		if !reflect.DeepEqual(input, snapshot) {
+			t.Fatalf("pass %d mutated input diagnostics: %+v", pass+1, input)
+		}
+	}
+}
+
+func TestShapeDiscoveredResultReappliesByokOverlayAcrossPeriodicRefreshes(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "localmodels")
+	piAgentDir := filepath.Join(stateDir, "byok-home", ".pi", "agent")
+	if err := os.MkdirAll(piAgentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeByokOverlayFile(t, stateDir, "pi", "localmodels/localmodels-byok", "vendor/custom-gateway-model", "http://127.0.0.1:18080", piAgentDir)
+
+	providerCatalog := lingercontext.NewProviderCatalog(nil)
+	controller := &controlController{}
+	inventory := &runtimeInventory{}
+	env := localmodels.OverlayEnvironment(map[string]string{"HOME": root}, stateDir)
+
+	wantModels := []provider.RuntimeModel{{
+		ID:                     "localmodels/localmodels-byok",
+		Label:                  "vendor/custom-gateway-model",
+		AllowedReasoningEffort: []string{},
+		ContextWindow:          1_048_576,
+		Link:                   "api",
+		IsDefault:              true,
+	}}
+	for refresh := range 3 {
+		nativeModels := make([]provider.RuntimeModel, 0, 100)
+		nativeModels = append(nativeModels, provider.RuntimeModel{
+			ID:                     "localmodels/localmodels-byok",
+			Label:                  "localmodels-byok",
+			AllowedReasoningEffort: []string{},
+			ContextWindow:          1_048_576,
+			Link:                   "api",
+			IsDefault:              true,
+		})
+		for i := 1; i < 100; i++ {
+			nativeModels = append(nativeModels, provider.RuntimeModel{
+				ID:                     fmt.Sprintf("builtin/model-%03d", i),
+				Label:                  fmt.Sprintf("Built-in %03d", i),
+				AllowedReasoningEffort: []string{},
+				Link:                   "subscription",
+			})
+		}
+		nativeSnapshot := append([]provider.RuntimeModel(nil), nativeModels...)
+		unshaped := provider.DiscoveryResult{
+			Diagnostics: []provider.RuntimeDiagnostic{{
+				Type:           "pi",
+				Status:         "ready",
+				Protocol:       "rpc",
+				ExecutablePath: filepath.Join(root, "pi"),
+				Models:         nativeModels,
+			}},
+		}
+		unshaped.Installations = provider.InstallationsFromDiagnostics(unshaped.Diagnostics)
+
+		shaped := shapeDiscoveredResult(unshaped, stateDir, false, nil, nil)
+		nextProviders, nextRuntimes := providerInstallations(shaped, env, stateDir)
+		providerCatalog.Replace(nextProviders)
+		controller.UpdateDiagnostics(shaped.Diagnostics)
+		if err := inventory.publish(t.Context(), nextRuntimes, shaped.Diagnostics); err != nil {
+			t.Fatalf("refresh %d publish failed: %v", refresh+1, err)
+		}
+		if !reflect.DeepEqual(unshaped.Diagnostics[0].Models, nativeSnapshot) {
+			t.Fatalf("refresh %d mutated caller diagnostics", refresh+1)
+		}
+		published, err := controller.Runtimes(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		controllerDiagnostics := published.([]provider.RuntimeDiagnostic)
+		if !reflect.DeepEqual(controllerDiagnostics[0].Models, wantModels) {
+			t.Fatalf("refresh %d controller models = %+v, want %+v", refresh+1, controllerDiagnostics[0].Models, wantModels)
+		}
+		if !reflect.DeepEqual(inventory.diagnostics[0].Models, wantModels) {
+			t.Fatalf("refresh %d inventory models = %+v, want %+v", refresh+1, inventory.diagnostics[0].Models, wantModels)
+		}
+		installed, ok, err := providerCatalog.Lookup(t.Context(), "pi")
+		if err != nil || !ok {
+			t.Fatalf("refresh %d provider catalog lookup failed: ok=%v err=%v", refresh+1, ok, err)
+		}
+		if installed.DefaultModel != "localmodels/localmodels-byok" ||
+			!installed.ModelGateway ||
+			!installed.APILink ||
+			!reflect.DeepEqual(installed.ContextWindows, map[string]int{"localmodels/localmodels-byok": 1_048_576}) {
+			t.Fatalf("refresh %d provider installation = %+v", refresh+1, installed)
+		}
+	}
+}
+
+func TestPeriodicMonitorPreservesPersistedByokOverlayAfterRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses a POSIX shell")
+	}
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "localmodels")
+	piAgentDir := filepath.Join(stateDir, "byok-home", ".pi", "agent")
+	if err := os.MkdirAll(piAgentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var gatewayRequests atomic.Int32
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		gatewayRequests.Add(1)
+		_, _ = w.Write([]byte(`{"data":[{"id":"localmodels-byok","context_window":1048576}]}`))
+	}))
+	defer gateway.Close()
+	if err := os.WriteFile(filepath.Join(piAgentDir, "models.json"), []byte(fmt.Sprintf(`{"providers":{"localmodels":{"baseUrl":"%s/v1","apiKey":"test-key"}}}`, gateway.URL)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeByokOverlayFile(t, stateDir, "pi", "localmodels/localmodels-byok", "vendor/custom-gateway-model", gateway.URL, piAgentDir)
+
+	var modelsJSON strings.Builder
+	modelsJSON.WriteString("[")
+	for i := range 470 {
+		if i > 0 {
+			modelsJSON.WriteByte(',')
+		}
+		if i == 465 {
+			modelsJSON.WriteString(`{"provider":"localmodels","id":"localmodels-byok","name":"localmodels-byok","contextWindow":1048576}`)
+		} else {
+			fmt.Fprintf(&modelsJSON, `{"provider":"builtin","id":"model-%03d","name":"Built-in %03d"}`, i+1, i+1)
+		}
+	}
+	modelsJSON.WriteString("]")
+	catalogFile := filepath.Join(root, "pi-models.json")
+	if err := os.WriteFile(catalogFile, []byte(modelsJSON.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authFile := filepath.Join(root, "pi-auth-status")
+	authCountFile := filepath.Join(root, "pi-auth-count")
+	piExecutable := filepath.Join(root, "pi")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo '1.2.0'; exit 0; fi
+if [ "$1" = "auth" ]; then
+  echo call >> "$PI_AUTH_COUNT_FILE"
+  IFS= read -r status < "$PI_AUTH_STATUS_FILE"
+  if [ "$status" = "ready" ]; then
+    echo '{"status":"ready"}'
+    exit 0
+  fi
+  echo '{"status":"not_ready"}'
+  exit 1
+fi
+while IFS= read -r line; do
+  case "$line" in
+  *linger-probe*) echo '{"type":"response","id":"linger-probe","command":"get_state","success":true,"data":{"isStreaming":false}}' ;;
+  *linger-state*) echo '{"type":"response","id":"linger-state","command":"get_state","success":true,"data":{"model":{"provider":"localmodels","id":"localmodels-byok"},"thinkingLevel":"off"}}' ;;
+  *linger-models*)
+    IFS= read -r models < "$PI_CATALOG_FILE"
+    printf '{"type":"response","id":"linger-models","command":"get_available_models","success":true,"data":{"models":%s}}\n' "$models" ;;
+  esac
+done
+`
+	if err := os.WriteFile(piExecutable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.CommandContext(t.Context(), piExecutable, "--version").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "1.2.0" {
+		t.Fatalf("warm Pi fixture: err=%v output=%q", err, out)
+	}
+	baseEnv := map[string]string{
+		"HOME": root, "PATH": root,
+		"PI_CATALOG_FILE":     catalogFile,
+		"PI_AUTH_STATUS_FILE": authFile,
+		"PI_AUTH_COUNT_FILE":  authCountFile,
+	}
+	currentEnv := func() map[string]string {
+		return localmodels.OverlayEnvironment(baseEnv, stateDir)
+	}
+	currentOptions := func() provider.DiscoveryOptions {
+		return provider.DiscoveryOptions{
+			ConfiguredPaths: map[string]string{"pi": piExecutable},
+			Runtimes:        []string{"pi"},
+			Environment:     currentEnv(),
+			Timeout:         10 * time.Second,
+		}
+	}
+	shape := func(result provider.DiscoveryResult) provider.DiscoveryResult {
+		return shapeDiscoveredResult(result, stateDir, false, nil, nil)
+	}
+	wantModels := []provider.RuntimeModel{{
+		ID:                     "localmodels/localmodels-byok",
+		Label:                  "vendor/custom-gateway-model",
+		AllowedReasoningEffort: []string{},
+		ContextWindow:          1_048_576,
+		Link:                   "api",
+		IsDefault:              true,
+	}}
+
+	t.Run("steady ready stays shaped across auth and full refreshes", func(t *testing.T) {
+		gatewayRequests.Store(0)
+		if err := os.WriteFile(authFile, []byte("ready\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(authCountFile)
+		initial, err := provider.Discover(t.Context(), currentOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		initial = shape(initial)
+		if !reflect.DeepEqual(initial.Diagnostics[0].Models, wantModels) {
+			t.Fatalf("initial shaped models = %+v, want %+v", initial.Diagnostics[0].Models, wantModels)
+		}
+		if !reflect.DeepEqual(initial.Installations["pi"].Models, wantModels) {
+			t.Fatalf("initial installation models = %+v, want %+v", initial.Installations["pi"].Models, wantModels)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		fullRefreshes := 0
+		onChangedCalls := 0
+		err = provider.MonitorRuntimeDiagnostics(ctx, provider.RuntimeMonitorOptions{
+			Initial:               initial,
+			Discovery:             currentOptions(),
+			ResolveDiscovery:      currentOptions,
+			RefreshInterval:       5 * time.Millisecond,
+			FullRefreshEveryTicks: 2,
+			Discover: func(ctx context.Context, options provider.DiscoveryOptions) (provider.DiscoveryResult, error) {
+				fullRefreshes++
+				result, discoverErr := provider.Discover(ctx, options)
+				if fullRefreshes >= 2 {
+					cancel()
+				}
+				return result, discoverErr
+			},
+			Shape: shape,
+			OnChanged: func(next provider.DiscoveryResult) error {
+				onChangedCalls++
+				t.Errorf("unexpected OnChanged during steady BYOK refresh: %+v", next.Diagnostics)
+				return nil
+			},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("monitor exited with %v, want context.Canceled", err)
+		}
+		if fullRefreshes < 2 || onChangedCalls != 0 {
+			t.Fatalf("fullRefreshes=%d onChangedCalls=%d", fullRefreshes, onChangedCalls)
+		}
+		// Auth-only ticks ran between full refreshes; verify at least 4 total
+		// auth checks happened (1 initial + auth tick 1 + full tick 2 + auth tick 3 + full tick 4).
+		rawCount, err := os.ReadFile(authCountFile)
+		if err != nil || strings.Count(string(rawCount), "call\n") < 4 {
+			t.Fatalf("auth probes = %q err=%v, want at least 4 across initial, auth, and full ticks", rawCount, err)
+		}
+		if got := int(gatewayRequests.Load()); got != 1+fullRefreshes {
+			t.Fatalf("gateway /v1/models requests = %d, want %d (1 initial + %d full refreshes)", got, 1+fullRefreshes, fullRefreshes)
+		}
+	})
+
+	t.Run("recovers on periodic auth refresh without user intervention", func(t *testing.T) {
+		if err := os.WriteFile(authFile, []byte("not_ready\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		initial, err := provider.Discover(t.Context(), currentOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		initial = shape(initial)
+		if initial.Diagnostics[0].Status != "authentication_required" {
+			t.Fatalf("initial status = %+v, want authentication_required", initial.Diagnostics[0])
+		}
+		if err := os.WriteFile(authFile, []byte("ready\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		providerCatalog := lingercontext.NewProviderCatalog(nil)
+		controller := &controlController{}
+		inventory := &runtimeInventory{}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		recovered := errors.New("recovered")
+		err = provider.MonitorRuntimeDiagnostics(ctx, provider.RuntimeMonitorOptions{
+			Initial:               initial,
+			Discovery:             currentOptions(),
+			ResolveDiscovery:      currentOptions,
+			RefreshInterval:       5 * time.Millisecond,
+			FullRefreshEveryTicks: 100,
+			Shape:                 shape,
+			OnChanged: func(next provider.DiscoveryResult) error {
+				nextProviders, nextRuntimes := providerInstallations(next, currentEnv(), stateDir)
+				providerCatalog.Replace(nextProviders)
+				controller.UpdateDiagnostics(next.Diagnostics)
+				if pubErr := inventory.publish(ctx, nextRuntimes, next.Diagnostics); pubErr != nil {
+					return pubErr
+				}
+				return recovered
+			},
+		})
+		if !errors.Is(err, recovered) {
+			t.Fatalf("monitor exited with %v, want recovered", err)
+		}
+		published, err := controller.Runtimes(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		controllerDiagnostics := published.([]provider.RuntimeDiagnostic)
+		if controllerDiagnostics[0].Status != "ready" || !reflect.DeepEqual(controllerDiagnostics[0].Models, wantModels) {
+			t.Fatalf("recovered controller diagnostic = %+v, want ready with %+v", controllerDiagnostics[0], wantModels)
+		}
+		if !reflect.DeepEqual(inventory.diagnostics[0].Models, wantModels) {
+			t.Fatalf("recovered inventory models = %+v, want %+v", inventory.diagnostics[0].Models, wantModels)
+		}
+		installed, ok, err := providerCatalog.Lookup(t.Context(), "pi")
+		if err != nil || !ok {
+			t.Fatalf("recovered provider catalog lookup failed: ok=%v err=%v", ok, err)
+		}
+		if installed.DefaultModel != "localmodels/localmodels-byok" ||
+			!installed.ModelGateway ||
+			!installed.APILink ||
+			!reflect.DeepEqual(installed.ContextWindows, map[string]int{"localmodels/localmodels-byok": 1_048_576}) {
+			t.Fatalf("recovered provider installation = %+v", installed)
+		}
+	})
+}
+
+func writeByokOverlayFile(t *testing.T, stateDir, runtimeType, runtimeModel, modelLabel, gatewayURL, piAgentDir string) {
+	t.Helper()
+	overlayDoc := map[string]any{
+		"schema":        "localmodels.model-source/v1",
+		"mode":          "byok",
+		"runtime":       runtimeType,
+		"runtime_model": runtimeModel,
+		"model_label":   modelLabel,
+		"gateway_url":   gatewayURL,
+		"environment":   map[string]string{"PI_CODING_AGENT_DIR": piAgentDir},
+	}
+	encodedOverlay, err := json.Marshal(overlayDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "model-source.json"), encodedOverlay, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeRefreshAllowedPausesInTerminalGatewayStates(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{
+		{state: "connecting", want: true},
+		{state: "connected", want: true},
+		{state: "upgrade-required", want: false},
+		{state: "authentication-failed", want: false},
+		{state: "identity-conflict", want: false},
+	} {
+		if got := runtimeRefreshAllowed(tc.state); got != tc.want {
+			t.Fatalf("runtimeRefreshAllowed(%q) = %v, want %v", tc.state, got, tc.want)
+		}
+	}
+}
+
+// The first discovery runs before the Library exists; the hello it feeds
+// still lists the local model a quit unloaded, from the remembered entries.
+func TestTheFirstDiscoveryListsRememberedLocalModels(t *testing.T) {
+	directory := t.TempDir()
+	piModel := "localmodels-library/localmodels-lib-qwen3-4b-q4-k-m/Qwen3-4B-Q4_K_M"
+	remembered := fmt.Sprintf(`{"schema":"linger.local-models-pi-catalog/v1","models":{%q:{"id":%q,"label":"Qwen3 4B","allowed_reasoning_effort":["high"],"default_reasoning_effort":"high"}}}`, piModel, piModel)
+	if err := os.WriteFile(filepath.Join(directory, "pi-catalog.json"), []byte(remembered), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw := provider.DiscoveryResult{Diagnostics: []provider.RuntimeDiagnostic{{
+		Type: "pi", Status: "authentication_required", Protocol: "rpc", ExecutablePath: filepath.Join(directory, "pi"),
+		Models: []provider.RuntimeModel{}, Error: &provider.DiagnosticError{Code: "RUNTIME_AUTHENTICATION_REQUIRED", Message: "sign in"},
+	}}}
+	shaped := shapeDiscoveredResult(raw, t.TempDir(), false, localmodels.NewPiCatalog(directory), nil)
+	pi := shaped.Diagnostics[0]
+	if pi.Status != "ready" || pi.Error != nil || len(pi.Models) != 1 || pi.Models[0].ID != piModel || pi.Models[0].DefaultReasoningEffort != "high" {
+		t.Fatalf("pi = %+v", pi)
+	}
+	if _, ok := shaped.Installations["pi"]; !ok {
+		t.Fatalf("installations = %+v", shaped.Installations)
+	}
+	if raw.Diagnostics[0].Status != "authentication_required" {
+		t.Fatal("shaping changed the raw result")
 	}
 }

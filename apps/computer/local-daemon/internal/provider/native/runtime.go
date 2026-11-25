@@ -5,12 +5,17 @@ package native
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
 )
+
+// ErrSessionNotFound reports that a retained native session cannot be resumed
+// on this Computer.
+var ErrSessionNotFound = errors.New("native session not found")
 
 // Kinds lists the Runtime kinds this package can open.
 var Kinds = []string{"claude", "codex", "pi", "antigravity"}
@@ -64,7 +69,6 @@ type Profile struct {
 	Env                 map[string]string
 	Logger              *slog.Logger
 	ToolVersion         string
-	CodexToolVersion    string
 	ComputerVersion     string
 	TaskID              string
 	RuntimeID           string
@@ -97,7 +101,7 @@ type RunSpec struct {
 	WarmMCP               bool
 	MCPReady              func(context.Context) error
 	Title                 string
-	AppendPrompt          string
+	SystemPrompt          string
 	BaseInstructions      *string
 	DeveloperInstructions *string
 	ComputerArgs          []string
@@ -106,13 +110,23 @@ type RunSpec struct {
 	Effort                string
 	HumanInteraction      *HumanInteractionBridge
 	PermissionReviewer    *permission.Reviewer
+	StopHook              StopHookFunc
 	CodexPermissionHook   *permission.CodexHook
 	RuntimeHome           string
 	SharedTaskLink        permission.CodexTaskLink
 	ClaudePolicy          *ClaudeToolPolicy
+	// ShellTextHook is the Daemon executable that Codex and the managed Pi
+	// extension run as shell-text-hook before a shell command, to refuse a
+	// TeamHub command whose text the shell would rewrite. Claude checks the
+	// same rule in its own tool policy. Empty runs no hook.
+	ShellTextHook string
 	// ContextWindow is the model's context length in tokens; zero when
 	// unknown.
 	ContextWindow int
+	// WithoutNativeWebTools turns off Codex's web_search and Claude's
+	// WebSearch and WebFetch: a model served through the localmodels gateway
+	// cannot run provider-hosted search, and the Agent uses teamhub web.
+	WithoutNativeWebTools bool
 	// Readiness counts the spawns, sessions and recycles of this Operation.
 	Readiness           *ReadinessCounters
 	ExposeTurnStarted   bool

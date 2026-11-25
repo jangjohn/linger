@@ -116,6 +116,28 @@ describe("Select", () => {
     ).toEqual({ left: 80, top: 196, width: 200 });
   });
 
+  it("supports custom widths and auto right-edge alignment clamped inside narrow viewports", () => {
+    // Trigger in right half of desktop viewport: aligns right edge to trigger.right.
+    expect(
+      selectPopupPosition(
+        { left: 960, top: 64, right: 1080, bottom: 92, width: 120 },
+        { width: 1280, height: 800 },
+        360,
+        { align: "auto", width: 320 },
+      ),
+    ).toEqual({ left: 760, top: 96, width: 320 });
+
+    // Trigger in left half of 375px mobile viewport: aligns left and stays inside 8px gutters.
+    const mobile = selectPopupPosition(
+      { left: 16, top: 232, right: 136, bottom: 260, width: 120 },
+      { width: 375, height: 812 },
+      360,
+      { align: "auto", width: 320 },
+    );
+    expect(mobile.left).toBe(16);
+    expect(mobile.left + mobile.width).toBeLessThanOrEqual(375 - 8);
+  });
+
   it("converts trigger coordinates into a dialog containing block", () => {
     expect(
       selectPopupFrame(
@@ -192,5 +214,72 @@ describe("Select", () => {
       "pointerdown",
       expect.any(Function),
     );
+  });
+
+  it("anchors wide option popups to the trigger right edge without overflowing the viewport", () => {
+    const triggerRef = createRef<HTMLButtonElement>();
+    const originalInnerWidth = window.innerWidth;
+    const originalInnerHeight = window.innerHeight;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 1280,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 860,
+    });
+    const offsetWidthSpy = vi
+      .spyOn(HTMLElement.prototype, "offsetWidth", "get")
+      .mockReturnValue(420);
+    try {
+      render(
+        <>
+          <button ref={triggerRef} type="button">
+            UD-Q4_K_XL
+          </button>
+          <SelectPopup
+            align="right"
+            id="wide-options"
+            onChoose={vi.fn()}
+            onClose={vi.fn()}
+            options={[
+              {
+                children:
+                  "UD-Q4_K_XL · PolyStrata · 17 GB · 21.1 GB VRAM + 5.7 GB RAM · Recommended",
+                value: "q4-poly",
+              },
+            ]}
+            triggerRef={triggerRef}
+            value="q4-poly"
+          />
+        </>,
+      );
+      vi.spyOn(triggerRef.current!, "getBoundingClientRect").mockReturnValue({
+        bottom: 400,
+        height: 28,
+        left: 960,
+        right: 1070,
+        toJSON: () => ({}),
+        top: 372,
+        width: 110,
+        x: 960,
+        y: 372,
+      });
+      fireEvent(window, new Event("resize"));
+      const portal = document.querySelector("[data-select-portal]")!;
+      expect((portal as HTMLElement).style.left).toBe("650px");
+      expect((portal as HTMLElement).style.minWidth).toBe("110px");
+      expect((portal as HTMLElement).style.maxWidth).toBe("1264px");
+    } finally {
+      offsetWidthSpy.mockRestore();
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        value: originalInnerHeight,
+      });
+    }
   });
 });

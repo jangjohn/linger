@@ -11,8 +11,10 @@ import type {
   TeamHubRoomListItem,
   TeamHubRoomPage,
 } from "@/features/teamhub/teamhub-types";
+import { useT } from "@/i18n/use-translation";
 
 import { canDeleteTenantAgent } from "./members/agent-permissions";
+import { roomListMessages } from "./room-list.messages";
 import {
   teamHubIdentityQueryOptions,
   tenantAgentsQueryOptions,
@@ -82,13 +84,16 @@ export function RoomPinButton({
   onToggle: () => void;
   pinned: boolean;
 }) {
-  const label = `${pinned ? "Unpin" : "Pin"} ${name}`;
+  const t = useT();
   return (
     <button
-      aria-label={label}
+      aria-label={t(
+        pinned ? roomListMessages.unpinChat : roomListMessages.pinChat,
+        { name },
+      )}
       className={roomNavActionClass}
       onClick={onToggle}
-      title={pinned ? "Unpin" : "Pin"}
+      title={t(pinned ? roomListMessages.unpin : roomListMessages.pin)}
       type="button"
     >
       {pinned ? (
@@ -115,6 +120,7 @@ export function AgentRowMenu({
   tenantId: string;
 }) {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const [deleting, setDeleting] = useState(false);
   const { data: identity } = useQuery(teamHubIdentityQueryOptions(client));
   const { data: agents } = useQuery({
@@ -139,19 +145,20 @@ export function AgentRowMenu({
             ) : (
               <Icon icon={PinIcon} size={14} />
             ),
-            label: pinned ? "Unpin" : "Pin",
+            label: t(pinned ? roomListMessages.unpin : roomListMessages.pin),
             onSelect: onTogglePin,
           },
           {
             danger: true,
             disabled: !canDelete,
             icon: <Icon icon={Delete02Icon} size={14} />,
-            label: "Delete",
+            voiceRisk: "never",
+            label: t(roomListMessages.delete),
             onSelect: () => setDeleting(true),
             separatorBefore: true,
           },
         ]}
-        label={`More actions for ${name}`}
+        label={t(roomListMessages.moreActions, { name })}
         placement="right-start"
       />
       {deleting && agentId && registration

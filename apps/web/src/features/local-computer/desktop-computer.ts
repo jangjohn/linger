@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { translate } from "@/i18n/language";
+
+import { computersMessages } from "./computers.messages";
+
 // The part of the desktop shell API (`window.lingerDesktop`, exposed by the
 // Electron preload) that the Agent creation flow uses. In a browser it is
 // absent and the CLI setup instructions are shown instead.
@@ -21,6 +25,58 @@ const desktopComputerApi = (): DesktopComputerApi | undefined =>
     ? undefined
     : (window as { lingerDesktop?: { computer?: DesktopComputerApi } })
         .lingerDesktop?.computer;
+
+interface DesktopLocalServerProbe {
+  owned?(): Promise<boolean>;
+}
+
+interface DesktopLocalAccountProbe {
+  available?(): Promise<boolean>;
+}
+
+const desktopLocalServerCheck = (): (() => Promise<boolean>) | undefined => {
+  if (typeof window === "undefined") return undefined;
+  const desktop = (
+    window as {
+      lingerDesktop?: {
+        localServer?: DesktopLocalServerProbe;
+        localAccount?: DesktopLocalAccountProbe;
+      };
+    }
+  ).lingerDesktop;
+  if (typeof desktop?.localServer?.owned === "function")
+    return () => desktop.localServer!.owned!();
+  if (typeof desktop?.localAccount?.available === "function")
+    return () => desktop.localAccount!.available!();
+  return undefined;
+};
+
+/**
+ * Whether the active server ships a downloadable CLI Computer release.
+ * The desktop app's own local server runs with its built-in Computer and
+ * serves no `/install/` release, so CLI install entry points stay hidden while
+ * the window shows it (and while that check is in flight so buttons never
+ * flash). Browsers and desktop windows pointed at a remote server return true.
+ */
+export function useCliInstallAvailable(): boolean {
+  const [check] = useState(desktopLocalServerCheck);
+  const [available, setAvailable] = useState(() => !check);
+
+  useEffect(() => {
+    if (!check) return;
+    let active = true;
+    void check()
+      .catch(() => false)
+      .then((isLocalServer) => {
+        if (active) setAvailable(!isLocalServer);
+      });
+    return () => {
+      active = false;
+    };
+  }, [check]);
+
+  return available;
+}
 
 export interface DesktopComputer {
   readonly status: DesktopComputerStatus | undefined;
@@ -65,7 +121,9 @@ export function useDesktopComputer(): DesktopComputer | undefined {
       )
       .catch((reason: unknown) =>
         setError(
-          reason instanceof Error ? reason.message : "Could not connect",
+          reason instanceof Error
+            ? reason.message
+            : translate(computersMessages.couldNotConnect),
         ),
       )
       .finally(() => setConnecting(false));

@@ -10,7 +10,7 @@ import (
 )
 
 var fixedAppToolkits = []struct{ key, toolkit string }{
-	{"gmail", "gmail"}, {"outlook", "outlook"}, {"googledrive", "googledrive"}, {"slack", "slack"},
+	{"gmail", "gmail"}, {"outlook", "outlook"}, {"feishu_mail", "feishu"}, {"googledrive", "googledrive"}, {"slack", "slack"},
 	{"discord", "discordbot"}, {"facebook", "facebook"}, {"github", "github"}, {"google_meet", "googlemeet"},
 	{"google_calendar", "googlecalendar"}, {"notion", "notion"}, {"linear", "linear"}, {"figma", "figma"}, {"canva", "canva"},
 	{"higgsfield", "higgsfield_mcp"}, {"fal_ai", "fal_ai"}, {"granola", "granola_mcp"}, {"calendly", "calendly"}, {"outlook_calendar", "outlook"},
@@ -25,8 +25,13 @@ func TestAppCatalogIsTheFixedListInDisplayOrder(t *testing.T) {
 	}
 	for index, want := range fixedAppToolkits {
 		app := apps[index]
-		if app.Key != want.key || toolkitForApp(app.Key) != want.toolkit || app.LogoURL != composioLogoBase+want.toolkit {
-			t.Errorf("app %d = %s (%s), want %s with logo %s", index, app.Key, app.LogoURL, want.key, composioLogoBase+want.toolkit)
+		logo := composioLogoBase + want.toolkit
+		if app.selfAuthorized {
+			// Composio serves no logo for an app it does not connect.
+			logo = ""
+		}
+		if app.Key != want.key || toolkitForApp(app.Key) != want.toolkit || app.LogoURL != logo {
+			t.Errorf("app %d = %s (%s), want %s with logo %s", index, app.Key, app.LogoURL, want.key, logo)
 		}
 	}
 }
@@ -55,7 +60,7 @@ func TestAppCatalogWithoutComposioOffersNothing(t *testing.T) {
 			t.Fatalf("got %d apps without Composio", len(apps))
 		}
 		for _, app := range apps {
-			if app.Availability != AppAvailabilityUnavailable || len(app.Capabilities) != 0 || app.SupportsReauthorization || app.LogoURL == "" {
+			if app.Availability != AppAvailabilityUnavailable || len(app.Capabilities) != 0 || app.SupportsReauthorization || app.LogoURL == "" && !app.selfAuthorized {
 				t.Errorf("app %s must be unavailable but branded without Composio: %+v", app.Key, app)
 			}
 			if service.SupportsAgentTools(app.Key) {
@@ -135,7 +140,7 @@ func TestAppCatalogRejectsKeysOutsideTheFixedList(t *testing.T) {
 func TestAppCatalogMarksProactiveReminderAppsOnlyWhenConnectable(t *testing.T) {
 	service := New(nil, &composio.Client{})
 	service.managed = configuredManagedCatalog(t)
-	for key, want := range map[string]bool{"gmail": true, "outlook": true, "notion": false, "linear": false} {
+	for key, want := range map[string]bool{"gmail": true, "outlook": true, "google_calendar": true, "outlook_calendar": true, "notion": false, "linear": false} {
 		app, ok := service.catalogApp(key)
 		if !ok {
 			t.Fatalf("missing app %s", key)
@@ -176,7 +181,8 @@ func TestUnconfiguredClientHidesManagedApps(t *testing.T) {
 		t.Fatalf("a saved key is not reported: %+v", service.ManagedKey())
 	}
 	for _, app := range service.ListApps() {
-		if app.Availability != AppAvailabilityAvailable {
+		// A self-authorized app waits for its own app, not a Composio key.
+		if app.Availability != AppAvailabilityAvailable && !app.selfAuthorized {
 			t.Fatalf("app %s is %s after a key is saved", app.Key, app.Availability)
 		}
 	}

@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/native"
 )
 
 func TestModelInvokerPi(t *testing.T) {
@@ -62,7 +65,7 @@ data: [DONE]
 			t.Fatal(err)
 		}
 	}
-	write("models.json", fmt.Sprintf(`{"providers":{"local-fixture":{"baseUrl":%q,"api":"openai-completions","apiKey":"fixture","models":[{"id":"fixture"}]}}}`, server.URL+"/v1"))
+	write("models.json", fmt.Sprintf(`{"providers":{"local-fixture":{"baseUrl":%q,"api":"openai-completions","apiKey":"fixture","models":[{"id":"fixture"},{"id":"fixture-alt"}]}}}`, server.URL+"/v1"))
 	write("settings.json", `{"defaultProvider":"local-fixture","defaultModel":"fixture"}`)
 	invoker := ModelInvoker{
 		TempBase: root,
@@ -93,9 +96,23 @@ data: [DONE]
 			}
 		})
 	}
+	t.Run("explicit model overrides Pi default", func(t *testing.T) {
+		request := ModelInvokeRequest{
+			RuntimeType: "pi", Model: "local-fixture/fixture-alt", Mode: ModelInvokeText,
+			ReasoningEffort: "low", Instructions: "Fixture instructions.", Input: "Fixture source.", Timeout: 15 * time.Second,
+		}
+		result := invoker.Invoke(t.Context(), request)
+		if result.Outcome != ModelInvokeCompleted || result.Text != textReply || result.Model != "local-fixture/fixture-alt" {
+			t.Fatalf("Pi explicit model invocation = %+v", result)
+		}
+		payload := <-payloads
+		if !strings.Contains(payload, `"model":"fixture-alt"`) {
+			t.Fatalf("unexpected request payload for explicit model: %s", payload)
+		}
+	})
 	t.Run("file tools are not enabled", func(t *testing.T) {
 		result := invoker.Invoke(t.Context(), ModelInvokeRequest{RuntimeType: "pi", Mode: ModelInvokeWorkspace, Input: "Must not be sent.", Timeout: 15 * time.Second})
-		if result.Outcome != ModelInvokeRuntimeUnavailable || !strings.Contains(result.Reason, "file tools") {
+		if result.Outcome != ModelInvokeUnsupported || !strings.Contains(result.Reason, "file tools") {
 			t.Fatalf("Pi invocation = %+v", result)
 		}
 		select {
@@ -104,4 +121,69 @@ data: [DONE]
 		default:
 		}
 	})
+}
+
+func TestClassifyPiModelInvokeFailureSanitizesAndDistinguishesCauses(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		answerError string
+		wantOutcome string
+		wantReason  string
+	}{
+		{
+			name:        "llama-server 65K context overflow",
+			answerError: `POST http://127.0.0.1:18100/v1/chat/completions Bearer sk-secret: {"error":{"type":"exceed_context_size_error","message":"request (70000 tokens) exceeds the available context size (65536 tokens)"}}`,
+			wantOutcome: ModelInvokeContextTooLong,
+			wantReason:  "Model invocation prompt exceeds the model context window",
+		},
+		{
+			name:        "local server POSIX ECONNREFUSED",
+			answerError: "fetch failed: connect ECONNREFUSED 127.0.0.1:18100",
+			wantOutcome: ModelInvokeRuntimeUnavailable,
+			wantReason:  "Pi background model service is unavailable",
+		},
+		{
+			name:        "structured JSON invalid_api_key",
+			answerError: `POST https://secret.example/v1/chat/completions: {"error":{"code":"invalid_api_key","message":"bad key sk-secret"}}`,
+			wantOutcome: ModelInvokeAuthRequired,
+			wantReason:  "Pi background authentication is required",
+		},
+		{
+			name:        "structured JSON model_not_loaded",
+			answerError: `POST http://127.0.0.1:18100/v1/chat/completions: {"error":{"code":"model_not_loaded","message":"loading"}}`,
+			wantOutcome: ModelInvokeRuntimeUnavailable,
+			wantReason:  "Pi background model service is unavailable",
+		},
+		{
+			name:        "typed unsupported effort sentinel",
+			err:         fmt.Errorf("%w: %q", native.ErrPiUnsupportedEffort, "ultra"),
+			wantOutcome: ModelInvokeFailed,
+			wantReason:  "Pi background reasoning effort is unsupported",
+		},
+		{
+			name:        "pi process launch failure",
+			err:         errors.New("Pi could not be started: executable file not found"),
+			wantOutcome: ModelInvokeRuntimeUnavailable,
+			wantReason:  "Pi background runtime failed to start",
+		},
+		{
+			name:        "generic per-request model failure stays sanitized",
+			answerError: "400 Bad Request: schema mismatch on https://secret.example/v1",
+			wantOutcome: ModelInvokeFailed,
+			wantReason:  "Pi background call did not complete",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyPiModelInvokeFailure(tc.err, native.Outcome{Status: "failed", Error: tc.answerError})
+			if got.Outcome != tc.wantOutcome || got.Reason != tc.wantReason {
+				t.Fatalf("got = %+v; want outcome=%q reason=%q", got, tc.wantOutcome, tc.wantReason)
+			}
+			if strings.Contains(got.Reason, "127.0.0.1") || strings.Contains(got.Reason, "sk-secret") || strings.Contains(got.Reason, "secret.example") {
+				t.Fatalf("reason leaked sensitive details: %q", got.Reason)
+			}
+		})
+	}
 }

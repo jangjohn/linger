@@ -2,13 +2,17 @@
 set -eu
 
 # >>> release pin
-STACK_VERSION='0.1.0.dev44'
-STACK_SOURCE_COMMIT='416f7b2938cf5f00333192a1015fb55c737c7a45'
-STACK_NPM_VERSION='0.1.0-dev.44'
-STACK_KIT_darwin_arm64='9e12715913a23ad869caa03c47b4141cd74665ba149130c4e4e8e9d92f63ed25'
-STACK_KIT_darwin_x64='7b6cac9647e23306d88c7169dd145c0db2fab5b89b378cecff77ee76cd128ecc'
-STACK_KIT_linux_arm64='a944b05fc5bb823a6a9d048404750a2039af2d6f28ff75d593efd7e0ae8fa25e'
-STACK_KIT_linux_x64='32d39989c7631a10d3cd912993b75c4c4e609cf0285398d3efe6f905e87af20f'
+STACK_VERSION='0.1.0.dev57'
+STACK_SOURCE_COMMIT='0aafada9017943d22a4b3cecb879ddc59f805a68'
+STACK_NPM_VERSION='0.1.0-dev.57'
+# shellcheck disable=SC2034
+STACK_RUNTIMES='claude=2.1.325 codex=0.171.0 pi=1.5.2'
+# shellcheck disable=SC2034
+STACK_RUNTIME_BASELINES='claude=2.1.282 codex=0.166.0 pi=1.2.0'
+STACK_KIT_darwin_arm64='ea12b65b4ec502e34f7928675c743e9fd8c2d5ae44810769a3716209e05c7265'
+STACK_KIT_darwin_x64='ab6a06ae0ef80ee12d6d08c7a9ae89e3e5b403b22bc414c008512c3157b052fe'
+STACK_KIT_linux_arm64='0989134b4a14cb51874cd1d25e631ebad040474532e4157573bd057d1ff1feb7'
+STACK_KIT_linux_x64='5fc58ea8f2f025d691df3f458abc5df06b2c5298b6aaed0838a1d9383ce10122'
 # <<< release pin
 
 die() {
@@ -46,10 +50,10 @@ esac
 manifest='' inventory='' bytes='' files='' entries='' python='' modules=''
 # >>> bootstrap targets
 case "$target" in
-  darwin-arm64) manifest='a1009ef2d09496feba2d91544ae2294053a4034322a6d940b1cdbd978ec61973'; inventory='07c6175dbcec4df0f9f8e31e688fd0e76e525816166e0dbb3c1997f313580b72'; bytes='14967824'; files='1370'; entries='1510'; python='python/bin/python3.12'; modules='modules' ;;
-  darwin-x64) manifest='39050dca49428b1bbb453e77d57ebbb0143df36ae35d6f0caf63d97f09a39dd5'; inventory='8a2198f2f5dfd4227519dc5bdbc05d868b5fd04636dddbc200f9198bb58d5ae1'; bytes='14800680'; files='1367'; entries='1506'; python='python/bin/python3.12'; modules='modules' ;;
-  linux-arm64) manifest='03f81b817b735416dfeeec2c09f0a51d980527667219b1a109f85317c034bc08'; inventory='e31f90359dc976b1d62c8f199f914b120ab4d1c90493708b5f0ef5264e927f9a'; bytes='17478315'; files='4241'; entries='4425'; python='python/bin/python3.12'; modules='modules' ;;
-  linux-x64) manifest='c19ae354443ea4f1201d0d747889e4c47da009809deee9859acd33b95d8d127c'; inventory='75c34503a4a9280af4f0926f1f3522840da28865bea5af416fa98d696b384811'; bytes='20806807'; files='4241'; entries='4425'; python='python/bin/python3.12'; modules='modules' ;;
+  darwin-arm64) manifest='55846c3f51f0e970927d08f834a1926cba3f5285a1e70c0f16107dbc3c9b2a40'; inventory='ad0e9fb4070719a2428c3652fd5d534e1115c500a84cebebf54cbfdcfaaef1a2'; bytes='15060383'; files='1384'; entries='1524'; python='python/bin/python3.12'; modules='modules' ;;
+  darwin-x64) manifest='990ffc25d00cfc9669dd39d95963394e67cf4a8ee362cb821382a9fc7cb65481'; inventory='5ac3ad9e53652f1139393d8b6d8807bc3ab816c5802b9a60733f84b5d5d52d53'; bytes='14892171'; files='1381'; entries='1520'; python='python/bin/python3.12'; modules='modules' ;;
+  linux-arm64) manifest='2941655ec75139be9d521698cc54782bd13d14072ff47324d0de18344fb4be4f'; inventory='a3ea4f35ecd6f4cae7a3c8f9e01d70e91c202bee541d21bc266c5ee968d6189a'; bytes='17570845'; files='4255'; entries='4439'; python='python/bin/python3.12'; modules='modules' ;;
+  linux-x64) manifest='27cb1838d811356b1e568725cb49f4a4073759d5dcdddee4de850258504161bc'; inventory='b25313f91b92bb00b6979aac65e9b78f1d9936ad1549e3979e4d62eb2614b003'; bytes='20898741'; files='4255'; entries='4439'; python='python/bin/python3.12'; modules='modules' ;;
   *) die 'release lacks bootstrap pins' ;;
 esac
 # <<< bootstrap targets
@@ -103,7 +107,7 @@ private_root() {
 verify_tree() (
   directory=$1
   [ -d "$directory" ] && [ ! -L "$directory" ] || exit 1
-  bad=$(find "$directory" \( ! -user "$owner" -o ! \( -type d -o -type f \) -o \( -type d ! -perm 0500 \) -o \( -type f ! \( -perm 0400 -o -perm 0500 \) \) -o \( -type f -links +1 \) \) -print) || exit 1
+  bad=$(find "$directory" \( ! -user "$owner" -o ! \( -type d -o -type f \) -o \( -type d ! -perm 0700 \) -o \( -type f ! \( -perm 0600 -o -perm 0700 \) \) -o \( -type f -links +1 \) \) -print) || exit 1
   [ -z "$bad" ] || exit 1
   [ -x "$directory/$python" ] || exit 1
   [ "$(find "$directory" -type f | wc -l | tr -d ' ')" = "$files" ] || exit 1
@@ -305,17 +309,15 @@ install_kit() {
   child=$!
   wait "$child" || die 'could not unpack kit'
   child=''
-  chmod 0755 "$staging/kit/$python" "$staging/kit/kit.py" 2>/dev/null || die 'could not restore executables'
-  find "$staging/kit" -type f -exec chmod a-w,go-rwx {} + 2>/dev/null || die 'could not seal kit files'
-  find "$staging/kit" -type d -exec chmod 0500 {} + 2>/dev/null || die 'could not seal kit directories'
+  chmod 0700 "$staging/kit/$python" "$staging/kit/kit.py" 2>/dev/null || die 'could not restore executables'
+  find "$staging/kit" -type f -exec chmod u+rw,go-rwx {} + 2>/dev/null || die 'could not protect kit files'
+  find "$staging/kit" -type d -exec chmod 0700 {} + 2>/dev/null || die 'could not protect kit directories'
   verify_tree "$staging/kit" || die 'downloaded kit failed verification'
   if [ -e "$final" ]; then
     chmod u+w "$final" 2>/dev/null || die 'could not reopen damaged kit'
     mv "$final" "$staging/invalid" 2>/dev/null || die 'could not quarantine damaged kit'
   fi
-  chmod 0700 "$staging/kit" 2>/dev/null || die 'could not prepare kit activation'
   mv "$staging/kit" "$final" 2>/dev/null || die 'could not activate kit'
-  chmod 0500 "$final" 2>/dev/null || die 'could not seal activated kit'
 }
 
 if ! private_root || ! verify_tree "$final"; then

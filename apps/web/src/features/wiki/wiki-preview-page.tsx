@@ -1,12 +1,14 @@
 import { Navigate, useParams, useSearchParams } from "react-router";
 import { ReadOnlyBlockNoteDocumentLoader } from "@/components/read-only-blocknote-document-loader";
 import { requireRoomRouteParam } from "@/features/rooms/room-route-params";
+import { useT } from "@/i18n/use-translation";
 
 import { useWikiDocuments } from "./knowledge-sidebar-trees";
 import { wikiPageKey, wikiPagePath } from "./wiki-display-state";
 import { resolveWikiPageReference } from "./wiki-document-links";
 import { wikiPreviewPages } from "./wiki-preview-pages";
 import { usePersonalWikiRefresh } from "./wiki-refresh";
+import { wikiMessages as m } from "./wiki.messages";
 import "@/features/rooms/documents/room-document-blocknote.css";
 import "./wiki-working-card.css";
 
@@ -23,6 +25,7 @@ export function wikiPreviewPath(tenantId: string, path: string) {
 export function WikiPreviewPage() {
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
   const [searchParams] = useSearchParams();
+  const t = useT();
   const path = searchParams.get("page") ?? "";
   const refresh = usePersonalWikiRefresh(tenantId);
   const documents = useWikiDocuments(tenantId);
@@ -64,9 +67,7 @@ export function WikiPreviewPage() {
     return (
       <main className="flex min-w-0 flex-1 items-start justify-center bg-app-surface p-10">
         <p className="text-sm text-app-muted" role="status">
-          {refresh.refreshing
-            ? "This page is not written yet."
-            : "This page was not published."}
+          {t(refresh.refreshing ? m.notWrittenYet : m.notPublished)}
         </p>
       </main>
     );
@@ -83,10 +84,10 @@ export function WikiPreviewPage() {
               </span>
               <span
                 className="room-document-header-updated inline-flex items-center gap-1.5"
-                title="Not published yet. This page may still change."
+                title={t(m.notPublishedHint)}
               >
                 <span aria-hidden="true" className="wiki-preview-dot" />
-                Generating
+                {t(m.generating)}
               </span>
             </div>
           </div>

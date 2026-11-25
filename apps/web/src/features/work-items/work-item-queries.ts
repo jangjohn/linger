@@ -1,9 +1,15 @@
+import type { components } from "@linger/wire-contracts/teamhub-public/types";
 import { queryOptions } from "@tanstack/react-query";
 
 import { collectTeamHubCursorPages } from "@/features/teamhub/teamhub-cursor-pages";
 import { TeamHubError } from "@/features/teamhub/teamhub-error";
-import { teamHubData } from "@/features/teamhub/teamhub-api";
+import { idempotencyHeader, teamHubData } from "@/features/teamhub/teamhub-api";
 import type { TeamHubClient } from "@/features/teamhub/teamhub-client";
+import { translate } from "@/i18n/language";
+
+import { workItemsMessages as m } from "./work-items.messages";
+
+export type TeamHubWorkItemComment = components["schemas"]["WorkItemComment"];
 
 export function tenantWorkItemTargetQueryKey(
   tenantId: string,
@@ -31,7 +37,8 @@ export function tenantWorkItemTargetQueryOptions(
       if (item.id !== workItemId || item.tenant_id !== tenantId) {
         throw new TeamHubError({
           code: "WORK_ITEM_NOT_FOUND",
-          message: "Work Item is unavailable in this Tenant.",
+          // Shown on the Dashboard, worded when the check fails.
+          message: translate(m.workItemUnavailable),
           status: 404,
         });
       }
@@ -72,9 +79,7 @@ export function tenantAgentWorkItemsQueryOptions(
         ),
       );
       if (page.items.some((item) => item.tenant_id !== tenantId)) {
-        throw new Error(
-          "Agent Work Item list does not match the active Tenant.",
-        );
+        throw new Error(translate(m.agentListTenantMismatch));
       }
       return {
         ...page,
@@ -108,9 +113,7 @@ export function tenantWorkItemsDashboardQueryOptions(
         ),
       );
       if (page.items.some((item) => item.tenant_id !== tenantId)) {
-        throw new Error(
-          "Work Item Dashboard does not match the active Tenant.",
-        );
+        throw new Error(translate(m.dashboardTenantMismatch));
       }
       return page;
     },
@@ -118,4 +121,55 @@ export function tenantWorkItemsDashboardQueryOptions(
     refetchOnWindowFocus: true,
     staleTime: 0,
   });
+}
+
+export function tenantWorkItemCommentsQueryKey(
+  tenantId: string,
+  workItemId: string,
+) {
+  return ["teamhub", tenantId, "work-items", "comments", workItemId] as const;
+}
+
+export function tenantWorkItemCommentsQueryOptions(
+  client: Pick<TeamHubClient, "api">,
+  tenantId: string,
+  workItemId: string,
+) {
+  return queryOptions({
+    queryFn: () =>
+      collectTeamHubCursorPages((pagination) =>
+        teamHubData(
+          client.api.GET("/v0/work-items/{workItemId}/comments", {
+            params: {
+              path: { workItemId },
+              query: pagination,
+            },
+          }),
+        ),
+      ),
+    queryKey: tenantWorkItemCommentsQueryKey(tenantId, workItemId),
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  });
+}
+
+export function createWorkItemComment(
+  client: Pick<TeamHubClient, "api">,
+  workItemId: string,
+  body: string,
+  idempotencyKey: string,
+) {
+  const content = body.trim();
+  return teamHubData(
+    client.api.POST("/v0/work-items/{workItemId}/comments", {
+      body: {
+        body: content,
+        segments: [{ content, type: "text" }],
+      },
+      params: {
+        header: idempotencyHeader(idempotencyKey),
+        path: { workItemId },
+      },
+    }),
+  );
 }

@@ -80,7 +80,8 @@ func TestInboxMessagesQueueRunsInTheirTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A running Run that does not read the Inbox is not steered.
+	// A chat steers the running Run whatever Inbox it reads; other targeted
+	// input steers only the Run that reads its Inbox.
 	if _, err := env.service.CancelLocalRun(t.Context(), agentruntimestate.CancelLocalRunInput{ContextKey: env.contextKey, Epoch: env.epoch, RunID: after.RunID}); err != nil {
 		t.Fatal(err)
 	}
@@ -90,24 +91,77 @@ func TestInboxMessagesQueueRunsInTheirTransaction(t *testing.T) {
 	if err != nil || other.Run == nil || other.Run.RunID != trusted.RunID || !other.Run.ContinuesContext {
 		t.Fatalf("claim trusted Run=%+v err=%v", other, err)
 	}
-	beside := queueRuntimeInboxMessage(t, env, "queue-beside", "6", "beside", true)
-	if beside.Status != "handled" || beside.RunID == "" || beside.RunID == trusted.RunID {
-		t.Fatalf("mention beside a Run that does not read the Inbox: %+v", beside)
+	chat := queueRuntimeInboxMessage(t, env, "queue-chat-beside", "6", "beside", true)
+	if chat.Status != "steering" || chat.SteerGroupID == "" {
+		t.Fatalf("chat beside a Run that does not read the Inbox did not steer: %+v", chat)
+	}
+	wake := queueRuntimeWakeMessage(t, env, "queue-wake-beside", "7", false)
+	if wake.Status != "handled" || wake.RunID == "" || wake.RunID == trusted.RunID {
+		t.Fatalf("targeted wake beside a Run that does not read the Inbox: %+v", wake)
 	}
 }
 
-// An Inbox input names each Message's kind and whether a Routine fired it, so
-// the Agent Service can tell a Routine from a proactive wake.
+// In a Meta Context a chat does not wait behind other queued work: it does
+// not join a queued Run that serves no chat, and the claim takes the Run that
+// serves a chat before older queued Runs.
+func TestMetaChatIsClaimedBeforeOlderQueuedWork(t *testing.T) {
+	allowParallelIntegrationTest(t)
+	env := newRuntimeStateTestEnv(t)
+	useAllActionableRuntimeAgent(t, env)
+
+	routine := queueRuntimeWakeMessage(t, env, "chat-first-routine", "1", false)
+	ambient := queueRuntimeInboxMessage(t, env, "chat-first-ambient", "2", "talk among Humans", false)
+	if routine.RunID == "" || ambient.RunID != routine.RunID {
+		t.Fatalf("same-Inbox non-chat input did not share its queued Run: routine=%+v ambient=%+v", routine, ambient)
+	}
+	chat := queueRuntimeInboxMessage(t, env, "chat-first-chat", "3", "a question", true)
+	if chat.Status != "handled" || chat.RunID == "" || chat.RunID == routine.RunID {
+		t.Fatalf("chat joined the queued Run that serves no chat: chat=%+v routine=%+v", chat, routine)
+	}
+	cardAnswer := queueRuntimeWakeMessage(t, env, "chat-first-card-answer", "4", true)
+	if cardAnswer.RunID != chat.RunID {
+		t.Fatalf("a hidden Message a Human waits on did not join the chat Run: %+v chat=%+v", cardAnswer, chat)
+	}
+
+	claimed, err := env.service.ClaimLocalRun(t.Context(), agentruntimestate.ClaimLocalRunInput{
+		ClaimID: "chat-first-claim", ContextKey: env.contextKey, Epoch: env.epoch,
+	})
+	if err != nil || claimed.Run == nil || claimed.Run.RunID != chat.RunID {
+		t.Fatalf("claim=%+v err=%v, want the chat Run %s before the older Run %s", claimed, err, chat.RunID, routine.RunID)
+	}
+}
+
+// queueRuntimeWakeMessage writes a hidden agent_runtime Message in the test
+// Room, a proactive wake or, when humanWaiting, a Human's card answer, and
+// queues it as targeting the Agent.
+func queueRuntimeWakeMessage(t *testing.T, env runtimeStateTestEnv, messageID, sequence string, humanWaiting bool) queuedRuntimeInboxInput {
+	t.Helper()
+	if _, err := env.pool.Exec(t.Context(), `
+		INSERT INTO messages(id,tenant_id,room_id,author_actor_id,body,segments,message_kind,human_waiting)
+		VALUES($1,'tenant_acme',$2,'actor_acme_alice','wake','[{"type":"text","content":"wake"}]'::jsonb,'agent_runtime',$3)`,
+		messageID, testRuntimeInboxRoom, humanWaiting); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.pool.Exec(t.Context(), `SELECT queue_agent_inbox_notification($1,$2,'tenant_acme',$3,$4::bigint,true)`,
+		env.contextKey, "room:"+testRuntimeInboxRoom, messageID, sequence); err != nil {
+		t.Fatalf("queue wake %s: %v", messageID, err)
+	}
+	return queuedRuntimeInbox(t, env.pool, env.contextKey, messageID)
+}
+
+// An Inbox input names each Message's kind, whether a Routine fired it and
+// whether a Human waits on it, so the Agent Service can tell a Routine from a
+// proactive wake and a Human's card answer from both.
 func TestInboxInputNamesWhatQueuedIt(t *testing.T) {
 	allowParallelIntegrationTest(t)
 	env := newRuntimeStateTestEnv(t)
-	payload := func(messageID string, firedRoutine bool) json.RawMessage {
+	payload := func(messageID string, firedRoutine, humanWaiting bool) json.RawMessage {
 		t.Helper()
 		if _, err := env.pool.Exec(t.Context(), `
-			INSERT INTO messages(id,tenant_id,room_id,author_actor_id,body,segments,message_kind,fired_routine_id,fired_routine_instruction)
+			INSERT INTO messages(id,tenant_id,room_id,author_actor_id,body,segments,message_kind,fired_routine_id,fired_routine_instruction,human_waiting)
 			VALUES($1,'tenant_acme',$2,'actor_acme_alice','wake','[{"type":"text","content":"wake"}]'::jsonb,'agent_runtime',
-				CASE WHEN $3 THEN 'routine-1' END,CASE WHEN $3 THEN 'check in' END)`,
-			messageID, testRuntimeInboxRoom, firedRoutine); err != nil {
+				CASE WHEN $3 THEN 'routine-1' END,CASE WHEN $3 THEN 'check in' END,$4)`,
+			messageID, testRuntimeInboxRoom, firedRoutine, humanWaiting); err != nil {
 			t.Fatal(err)
 		}
 		var payload json.RawMessage
@@ -124,20 +178,29 @@ func TestInboxInputNamesWhatQueuedIt(t *testing.T) {
 			Messages []struct {
 				MessageKind  string `json:"messageKind"`
 				FiredRoutine *bool  `json:"firedRoutine"`
+				HumanWaiting *bool  `json:"humanWaiting"`
 			} `json:"messages"`
 		} `json:"acceptedNotification"`
 	}
 	for _, test := range []struct {
-		messageID    string
-		firedRoutine bool
-	}{{"wake-routine", true}, {"wake-proactive", false}} {
+		messageID                  string
+		firedRoutine, humanWaiting bool
+	}{{"wake-routine", true, false}, {"wake-proactive", false, false}, {"wake-card-answer", false, true}} {
 		var got origin
-		raw := payload(test.messageID, test.firedRoutine)
+		raw := payload(test.messageID, test.firedRoutine, test.humanWaiting)
 		if err := json.Unmarshal(raw, &got); err != nil || len(got.Accepted.Messages) != 1 ||
 			got.Accepted.Messages[0].MessageKind != "agent_runtime" ||
-			(got.Accepted.Messages[0].FiredRoutine != nil) != test.firedRoutine {
+			(got.Accepted.Messages[0].FiredRoutine != nil) != test.firedRoutine ||
+			(got.Accepted.Messages[0].HumanWaiting != nil) != test.humanWaiting {
 			t.Fatalf("%s payload=%s err=%v", test.messageID, raw, err)
 		}
+	}
+	// Only a hidden agent_runtime Message carries the flag.
+	if _, err := env.pool.Exec(t.Context(), `
+		INSERT INTO messages(id,tenant_id,room_id,author_actor_id,body,segments,message_kind,human_waiting)
+		VALUES('chat-waiting','tenant_acme',$1,'actor_acme_alice','hi','[{"type":"text","content":"hi"}]'::jsonb,'conversation',true)`,
+		testRuntimeInboxRoom); err == nil {
+		t.Fatal("a conversation Message carried human_waiting")
 	}
 }
 

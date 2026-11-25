@@ -65,11 +65,12 @@ type codexProcess struct {
 	key        string
 	home       string
 	executable string
-	version    string
 	configArgs []string
-	dir        string
-	model      string
-	effort     string
+	// withoutWebTools records that web_search was launched disabled.
+	withoutWebTools bool
+	dir             string
+	model           string
+	effort          string
 	// authPrint and skillPrint are the account and the delivered Skills the
 	// app-server loaded at launch.
 	authPrint  string
@@ -174,9 +175,10 @@ func codexLaunch(profile Profile, spec RunSpec, executable, home, key string, at
 		stderr:    newErrorTail(nil, defaultStderrTail),
 		stdout:    stdoutR, stderrR: stderrR, release: release,
 		baseLog: logger,
-		key:     key, home: home, executable: executable, version: profile.CodexToolVersion,
-		configArgs: append([]string(nil), profile.CodexConfigArgs...),
-		dir:        spec.Dir, model: spec.Model, effort: spec.Effort,
+		key:     key, home: home, executable: executable,
+		configArgs:      append([]string(nil), profile.CodexConfigArgs...),
+		withoutWebTools: spec.WithoutNativeWebTools,
+		dir:             spec.Dir, model: spec.Model, effort: spec.Effort,
 		authPrint: authPrint, skillPrint: skillPrint,
 		stdoutDone: make(chan struct{}), waitDone: make(chan struct{}),
 		front: front,

@@ -1248,14 +1248,27 @@ func (LocalModelPoolHolder) FixedFields() map[string]string { return nil }
 // RequiredFields lists the keys a LocalModelPoolHolder must carry.
 func (LocalModelPoolHolder) RequiredFields() []string { return []string{"kind", "id", "name", "bytes"} }
 
+// LocalModelPoolExternalHolder mirrors the LocalModelPoolExternalHolder schema shape.
+type LocalModelPoolExternalHolder struct {
+	Name  string `json:"name"`
+	Bytes uint64 `json:"bytes"`
+}
+
+// FixedFields lists the keys whose value the schema fixes for a LocalModelPoolExternalHolder.
+func (LocalModelPoolExternalHolder) FixedFields() map[string]string { return nil }
+
+// RequiredFields lists the keys a LocalModelPoolExternalHolder must carry.
+func (LocalModelPoolExternalHolder) RequiredFields() []string { return []string{"name", "bytes"} }
+
 // LocalModelPool mirrors the LocalModelPool schema shape.
 type LocalModelPool struct {
-	ID         string                 `json:"id"`
-	Kind       string                 `json:"kind"`
-	GpuIndex   *uint64                `json:"gpu_index,omitempty"`
-	TotalBytes uint64                 `json:"total_bytes"`
-	UsedBytes  uint64                 `json:"used_bytes"`
-	Holders    []LocalModelPoolHolder `json:"holders"`
+	ID              string                         `json:"id"`
+	Kind            string                         `json:"kind"`
+	GpuIndex        *uint64                        `json:"gpu_index,omitempty"`
+	TotalBytes      uint64                         `json:"total_bytes"`
+	UsedBytes       uint64                         `json:"used_bytes"`
+	Holders         []LocalModelPoolHolder         `json:"holders"`
+	ExternalHolders []LocalModelPoolExternalHolder `json:"external_holders,omitzero"`
 }
 
 // FixedFields lists the keys whose value the schema fixes for a LocalModelPool.
@@ -1268,9 +1281,17 @@ func (LocalModelPool) RequiredFields() []string {
 
 // LocalModelAvailabilityReason mirrors the LocalModelAvailabilityReason schema shape.
 type LocalModelAvailabilityReason struct {
-	Code      string  `json:"code"`
-	NeedBytes *uint64 `json:"need_bytes,omitempty"`
-	HaveBytes *uint64 `json:"have_bytes,omitempty"`
+	Code             string   `json:"code"`
+	NeedBytes        *uint64  `json:"need_bytes,omitempty"`
+	HaveBytes        *uint64  `json:"have_bytes,omitempty"`
+	MemoryKind       string   `json:"memory_kind,omitempty"`
+	GpuVendor        string   `json:"gpu_vendor,omitempty"`
+	RequiredCuda     string   `json:"required_cuda,omitempty"`
+	DetectedCuda     string   `json:"detected_cuda,omitempty"`
+	DriverVersion    string   `json:"driver_version,omitempty"`
+	MissingLibraries []string `json:"missing_libraries,omitempty"`
+	RequiredGlibc    string   `json:"required_glibc,omitempty"`
+	DetectedGlibc    string   `json:"detected_glibc,omitempty"`
 }
 
 // FixedFields lists the keys whose value the schema fixes for a LocalModelAvailabilityReason.
@@ -1278,6 +1299,19 @@ func (LocalModelAvailabilityReason) FixedFields() map[string]string { return nil
 
 // RequiredFields lists the keys a LocalModelAvailabilityReason must carry.
 func (LocalModelAvailabilityReason) RequiredFields() []string { return []string{"code"} }
+
+// LocalModelsDebugInfo mirrors the LocalModelsDebugInfo schema shape.
+type LocalModelsDebugInfo struct {
+	Mode       string `json:"mode"`
+	Source     string `json:"source"`
+	ConfigPath string `json:"config_path,omitempty"`
+}
+
+// FixedFields lists the keys whose value the schema fixes for a LocalModelsDebugInfo.
+func (LocalModelsDebugInfo) FixedFields() map[string]string { return nil }
+
+// RequiredFields lists the keys a LocalModelsDebugInfo must carry.
+func (LocalModelsDebugInfo) RequiredFields() []string { return []string{"mode", "source"} }
 
 // LocalModelAvailability mirrors the LocalModelAvailability schema shape.
 type LocalModelAvailability struct {
@@ -1373,6 +1407,11 @@ type LocalModel struct {
 	License               string                      `json:"license,omitempty"`
 	SourceURL             string                      `json:"source_url,omitempty"`
 	PromptTokensPerSecond *float64                    `json:"prompt_tokens_per_second,omitempty"`
+	Engine                string                      `json:"engine,omitempty"`
+	EngineLabel           string                      `json:"engine_label,omitempty"`
+	Concurrency           *uint64                     `json:"concurrency,omitempty"`
+	ConcurrencyProbing    *bool                       `json:"concurrency_probing,omitempty"`
+	HostRamBytes          *uint64                     `json:"host_ram_bytes,omitempty"`
 }
 
 // FixedFields lists the keys whose value the schema fixes for a LocalModel.
@@ -1404,6 +1443,7 @@ type LocalModelsSnapshot struct {
 	Host        *LocalModelHost               `json:"host,omitempty"`
 	Pools       []LocalModelPool              `json:"pools"`
 	Models      []LocalModel                  `json:"models"`
+	Debug       *LocalModelsDebugInfo         `json:"debug,omitempty"`
 }
 
 // FixedFields lists the keys whose value the schema fixes for a LocalModelsSnapshot.
@@ -2034,6 +2074,7 @@ func (AgentInput) RequiredFields() []string { return []string{"type", "text"} }
 type ContextRunContext struct {
 	HumanInteractions *bool    `json:"human_interactions,omitempty"`
 	PermissionReview  *bool    `json:"permission_review,omitempty"`
+	StopHook          *bool    `json:"stop_hook,omitempty"`
 	ResumeAfterYield  *bool    `json:"resume_after_yield,omitempty"`
 	ExecutionRunRef   string   `json:"execution_run_ref"`
 	SourceInboxIDs    []string `json:"source_inbox_ids"`
@@ -2071,16 +2112,31 @@ func (CliRunContext) FixedFields() map[string]string { return nil }
 // RequiredFields lists the keys a CliRunContext must carry.
 func (CliRunContext) RequiredFields() []string { return nil }
 
+// PreviousRuntimeSession mirrors the PreviousRuntimeSession schema shape.
+type PreviousRuntimeSession struct {
+	ProviderType string `json:"provider_type"`
+	SessionID    string `json:"session_id"`
+}
+
+// FixedFields lists the keys whose value the schema fixes for a PreviousRuntimeSession.
+func (PreviousRuntimeSession) FixedFields() map[string]string { return nil }
+
+// RequiredFields lists the keys a PreviousRuntimeSession must carry.
+func (PreviousRuntimeSession) RequiredFields() []string {
+	return []string{"provider_type", "session_id"}
+}
+
 // ContextRunStartRequest mirrors the ContextRunStartRequest schema shape.
 type ContextRunStartRequest struct {
-	Kind           string            `json:"kind"`
-	Runtime        RuntimeConfig     `json:"runtime"`
-	SessionOptions SessionOptions    `json:"session_options"`
-	Session        json.RawMessage   `json:"session"`
-	Input          AgentInput        `json:"input"`
-	RunContext     ContextRunContext `json:"run_context"`
-	CLIRunContext  *CliRunContext    `json:"cli_run_context,omitempty"`
-	RunResources   LocalRunResources `json:"run_resources"`
+	Kind            string                  `json:"kind"`
+	Runtime         RuntimeConfig           `json:"runtime"`
+	SessionOptions  SessionOptions          `json:"session_options"`
+	Session         json.RawMessage         `json:"session"`
+	PreviousSession *PreviousRuntimeSession `json:"previous_session,omitempty"`
+	Input           AgentInput              `json:"input"`
+	RunContext      ContextRunContext       `json:"run_context"`
+	CLIRunContext   *CliRunContext          `json:"cli_run_context,omitempty"`
+	RunResources    LocalRunResources       `json:"run_resources"`
 }
 
 // FixedFields lists the keys whose value the schema fixes for a ContextRunStartRequest.
@@ -2152,6 +2208,7 @@ type OperationPrepare struct {
 	SessionOptions      SessionOptions            `json:"session_options"`
 	Session             json.RawMessage           `json:"session"`
 	PermissionReview    *bool                     `json:"permission_review,omitempty"`
+	StopHook            *bool                     `json:"stop_hook,omitempty"`
 	MCPRelays           []LocalMcpRelayDescriptor `json:"mcp_relays"`
 	Target              string                    `json:"target"`
 }
@@ -2418,6 +2475,7 @@ func (OperationPrepared) RequiredFields() []string {
 type ProviderPrepareRunContext struct {
 	HumanInteractions *bool `json:"human_interactions,omitempty"`
 	PermissionReview  *bool `json:"permission_review,omitempty"`
+	StopHook          *bool `json:"stop_hook,omitempty"`
 }
 
 // FixedFields lists the keys whose value the schema fixes for a ProviderPrepareRunContext.
@@ -2511,6 +2569,7 @@ type ModelInvoke struct {
 	OwnerActorID    string            `json:"owner_actor_id"`
 	AgentID         string            `json:"agent_id"`
 	RuntimeType     string            `json:"runtime_type"`
+	Model           string            `json:"model,omitempty"`
 	Mode            string            `json:"mode"`
 	ReasoningEffort string            `json:"reasoning_effort"`
 	Instructions    string            `json:"instructions,omitempty"`

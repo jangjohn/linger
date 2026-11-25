@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect } from "react";
 
 import { teamHubData } from "@/features/teamhub/teamhub-api";
 import type { TeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import type { TeamHubVoiceSession } from "@/features/teamhub/teamhub-types";
 
 import { describeError, isActiveCapture } from "./voice-control-helpers";
 import {
@@ -9,8 +10,10 @@ import {
   rememberVoiceListeningCapture,
   removeStorage,
 } from "./voice-control-storage";
-import { releaseVoiceSession } from "./voice-session-release";
+import { releaseVoiceSession, VoiceStopError } from "./voice-session-release";
 import type { VoiceControlState, VoiceTarget } from "./use-voice-control-state";
+import { translate } from "@/i18n/language";
+import { recordingMessages as m } from "./recording.messages";
 
 /**
  * Releases the VoiceSession when the page goes away and disconnects the bound
@@ -32,6 +35,7 @@ export function useVoiceSessionLifecycle(
     setListenerStatus,
     setPartialTranscript,
     setSelectedDeviceId,
+    setStopFailure,
     setTranscriptItems,
     setVoiceSessionId,
   } = state;
@@ -62,7 +66,10 @@ export function useVoiceSessionLifecycle(
       setVoiceSessionId(undefined);
       setListenerStatus("disabled");
       setPartialTranscript(undefined);
+      // Only a session to release sends Stop; without one the recording is
+      // not shown as saving, which nothing would end.
       if (
+        session &&
         capture &&
         (capture.status === "starting" || capture.status === "recording")
       ) {
@@ -73,16 +80,37 @@ export function useVoiceSessionLifecycle(
         setCapture(capture, { status: "finalizing", capture });
       }
     }
-    const released = session
-      ? releaseVoiceSession(runtime.client, session, capture, (stopped) => {
-          if (
-            refs.mountedRef.current &&
-            !refs.voiceSessionRef.current &&
-            refs.captureRef.current?.id === stopped.id
-          )
-            setCapture(stopped);
-        })
-      : Promise.resolve();
+    // A Stop that leaves the Capture recording offers one Retry, which runs
+    // the same release again.
+    const release = (voiceSession: TeamHubVoiceSession): Promise<void> =>
+      releaseVoiceSession(runtime.client, voiceSession, capture, (stopped) => {
+        if (
+          refs.mountedRef.current &&
+          !refs.voiceSessionRef.current &&
+          refs.captureRef.current?.id === stopped.id
+        )
+          setCapture(stopped);
+      }).catch((error: unknown) => {
+        if (
+          error instanceof VoiceStopError &&
+          capture &&
+          refs.mountedRef.current &&
+          refs.captureRef.current?.id === capture.id
+        ) {
+          let retried = false;
+          setStopFailure({
+            captureId: capture.id,
+            retry: () => {
+              if (retried) return Promise.resolve();
+              retried = true;
+              setStopFailure(undefined);
+              return release(voiceSession).catch(() => undefined);
+            },
+          });
+        }
+        throw error;
+      });
+    const released = session ? release(session) : Promise.resolve();
     const operation = Promise.all([
       released,
       Promise.allSettled([starting, enabling]),
@@ -103,6 +131,7 @@ export function useVoiceSessionLifecycle(
     setCapture,
     setListenerStatus,
     setPartialTranscript,
+    setStopFailure,
     setVoiceSessionId,
     tenantId,
   ]);
@@ -120,7 +149,7 @@ export function useVoiceSessionLifecycle(
 
   const disconnectDevice = useCallback(async () => {
     if (refs.captureRef.current && isActiveCapture(refs.captureRef.current)) {
-      throw new Error("Stop the recording before disconnecting the microphone");
+      throw new Error(translate(m.stopBeforeDisconnect));
     }
     const session = refs.voiceSessionRef.current;
     refs.startControllerRef.current?.abort();

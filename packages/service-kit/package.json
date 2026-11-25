@@ -17,6 +17,21 @@
       "linger-production": "./dist/byok-endpoint.js",
       "default": "./src/byok-endpoint.ts"
     },
+    "./featured-models": {
+      "types": "./src/featured-models.ts",
+      "linger-production": "./dist/featured-models.js",
+      "default": "./src/featured-models.ts"
+    },
+    "./messages": {
+      "types": "./src/messages.ts",
+      "linger-production": "./dist/messages.js",
+      "default": "./src/messages.ts"
+    },
+    "./nvidia-driver": {
+      "types": "./src/nvidia-driver.ts",
+      "linger-production": "./dist/nvidia-driver.js",
+      "default": "./src/nvidia-driver.ts"
+    },
     "./node": {
       "types": "./src/node.ts",
       "linger-production": "./dist/node.js",

@@ -482,6 +482,10 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 4096
+                method:
+                  type: string
+                  enum: [browser, device]
+                  description: Codex only. browser runs the localhost-callback login, finished in a browser on this computer; on Linux the runtime does not open its link, which is left to the caller, and elsewhere it opens the page itself. device runs the device-code login, finished in any browser. Defaults to browser on macOS and Windows and device elsewhere, with the runtime opening its own page.
       responses:
         "200":
           description: Owner-only ephemeral authentication state
@@ -1059,6 +1063,10 @@ components:
           type: boolean
         message:
           type: string
+        reason:
+          type: string
+          enum: [unavailable, timed_out, ended]
+          description: Why a failed sign-in ended. unavailable - this runtime has no native sign-in; timed_out - nobody finished it in time; ended - the login process stopped without a sign-in.
     InstallationJob:
       type: object
       additionalProperties: false
@@ -1074,6 +1082,9 @@ components:
         shareGpu:
           type: boolean
           description: Explicit consent to share currently free GPU memory with existing tasks; defaults to false and never stops other processes.
+        runtime:
+          $ref: "#/components/schemas/InstanceRuntime"
+          description: Runtime paths from this completed desktop installation, available when polling the live job.
         runtimeAuth:
           type: object
           additionalProperties: false
@@ -1118,6 +1129,13 @@ components:
         localModelsPlan:
           $ref: "#/components/schemas/LocalModelsPlan"
         errorCode: *a1
+        errorCauseCode:
+          type: string
+          description: Structured upstream cause code explaining why a local model plan or deployment step failed.
+        errorReasons:
+          type: array
+          items: *a1
+          description: Structured upstream reason codes explaining why a local model binding or setup step is not ready.
         cancelRequested: *a6
     InstallationEvent:
       type: object
@@ -1306,7 +1324,7 @@ components:
                 - ready
                 - blocked-now
                 - unavailable
-              description: Upstream stack.state. blocked-now means the hardware can run the plan, but installing now would stop until other programs free memory; a tool without stack.state reports that case as basis capacity or reason free-memory-required.
+              description: Upstream stack.state. blocked-now means the hardware can run the plan, but installing now would stop until a local blocker clears (such as freeing memory or updating the NVIDIA driver); a tool without stack.state reports memory blocks as basis capacity or reason free-memory-required.
             hardwareCapable:
               type:
                 - boolean
@@ -1351,6 +1369,18 @@ components:
                   requiredBytes:
                     type: number
                     description: The memory the install needs free, for the same resource as freeBytes.
+                  detectedCudaVersion:
+                    type: string
+                    pattern: '^\d+(?:\.\d+){0,2}$'
+                    description: On cuda-driver-update-required, the CUDA version the installed NVIDIA driver reports.
+                  requiredCudaVersion:
+                    type: string
+                    pattern: '^\d+(?:\.\d+){0,2}$'
+                    description: On cuda-driver-update-required and cuda-driver-version-unknown, the minimum CUDA version the pinned engine requires.
+                  driverVersion:
+                    type: string
+                    pattern: '^\d+(?:\.\d+){0,2}$'
+                    description: On CUDA driver reasons, the installed NVIDIA driver version when known.
             basis:
               type: string
               enum:

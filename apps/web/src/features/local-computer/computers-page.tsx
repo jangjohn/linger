@@ -1,11 +1,13 @@
 import {
   useMutation,
+  useQuery,
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
 
+import { modelSourceQueryOptions } from "@/features/local-models/model-source-queries";
 import {
   tenantRoomsQueryOptions,
   tenantAgentAvailabilityQueryOptions,
@@ -17,6 +19,7 @@ import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import { Add01Icon, ArrowLeft01Icon } from "@hugeicons/core-free-icons";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
+import { useT } from "@/i18n/use-translation";
 
 import { ComputerBrowserConnection } from "./browser-connection/computer-browser-connection";
 import { ComputerDetail } from "./computer-detail";
@@ -27,6 +30,9 @@ import {
   NoComputers,
   UnavailableComputer,
 } from "./computer-empty-states";
+import { computerSetupMessages } from "./computer-setup.messages";
+import { computersMessages } from "./computers.messages";
+import { useCliInstallAvailable } from "./desktop-computer";
 import {
   localComputersQueryKey,
   localComputersQueryOptions,
@@ -35,6 +41,7 @@ import { subscribeLocalComputerEnrollment } from "./local-computer-enrollment-ev
 import { RemoveComputerDialog } from "./remove-computer-dialog";
 
 export function ComputersPage() {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
@@ -60,6 +67,7 @@ export function ComputersPage() {
   });
 
   const [searchParams, setSearchParams] = useSearchParams();
+  const cliInstallAvailable = useCliInstallAvailable();
   const [setupOpen, setSetupOpen] = useState(false);
   const [expectedComputerId, setExpectedComputerId] = useState<string | null>(
     null,
@@ -98,6 +106,14 @@ export function ComputersPage() {
           agent.runtime.placement.computer_id === selectedComputer.computer_id,
       )
     : [];
+  const modelSource = useQuery({
+    ...modelSourceQueryOptions(
+      client,
+      tenantId,
+      selectedComputer?.computer_id ?? "",
+    ),
+    enabled: Boolean(selectedComputer && selectedComputer.status === "online"),
+  });
   const removeAgents = removeComputer
     ? agents.items.filter(
         (agent) =>
@@ -192,7 +208,7 @@ export function ComputersPage() {
           <h1 className="flex items-center gap-1 text-2xl text-foreground">
             {requestedComputerId && inventory.items.length > 1 ? (
               <Button
-                aria-label="All computers"
+                aria-label={t(computersMessages.allComputers)}
                 onClick={showDirectory}
                 size="icon"
                 tone="ghost"
@@ -200,16 +216,16 @@ export function ComputersPage() {
                 <Icon icon={ArrowLeft01Icon} size={16} />
               </Button>
             ) : null}
-            Computers
+            {t(computersMessages.pageTitle)}
           </h1>
-          {inventory.items.length ? (
+          {cliInstallAvailable && inventory.items.length ? (
             <Button
-              aria-label="Connect a Local Computer"
+              aria-label={t(computerSetupMessages.label)}
               onClick={openSetup}
               size="compact"
             >
               <Icon icon={Add01Icon} size={14} />
-              Connect
+              {t(computersMessages.connect)}
             </Button>
           ) : null}
         </header>
@@ -220,9 +236,12 @@ export function ComputersPage() {
             </p>
           ) : null}
           {inventory.items.length === 0 ? (
-            <NoComputers onConnect={openSetup} />
+            <NoComputers
+              onConnect={cliInstallAvailable ? openSetup : undefined}
+            />
           ) : selectedComputer ? (
             <ComputerDetail
+              activeRuntime={modelSource.data?.status?.runtime}
               agentAvailabilities={agentAvailabilities}
               agents={selectedAgents}
               browserConnection={(variant) => (
@@ -233,10 +252,11 @@ export function ComputersPage() {
                   variant={variant}
                 />
               )}
+              cliInstallAvailable={cliInstallAvailable}
               computer={selectedComputer}
               key={selectedComputer.computer_id}
               localModelsHref={`/t/${tenantId}/settings/models?computer=${encodeURIComponent(selectedComputer.computer_id)}`}
-              onConnect={openSetup}
+              onConnect={cliInstallAvailable ? openSetup : undefined}
               onOpenAgent={(actorId) => {
                 if (!openAgent.isPending) openAgent.mutate(actorId);
               }}
@@ -246,7 +266,10 @@ export function ComputersPage() {
               }}
             />
           ) : requestedComputerId ? (
-            <UnavailableComputer onBack={showDirectory} onConnect={openSetup} />
+            <UnavailableComputer
+              onBack={showDirectory}
+              onConnect={cliInstallAvailable ? openSetup : undefined}
+            />
           ) : (
             <ComputerDirectory
               agents={agents.items}
@@ -257,7 +280,7 @@ export function ComputersPage() {
         </div>
       </main>
 
-      {setupOpen ? (
+      {cliInstallAvailable && setupOpen ? (
         <ConnectComputerDialog
           tenantId={tenantId}
           connected={setupConnected}
@@ -273,10 +296,14 @@ export function ComputersPage() {
           error={removeMutation.error}
           onClose={() => setRemoveComputerId(null)}
           onConfirm={() => removeMutation.mutate(removeComputer.computer_id)}
-          onConnect={() => {
-            setRemoveComputerId(null);
-            openSetup();
-          }}
+          onConnect={
+            cliInstallAvailable
+              ? () => {
+                  setRemoveComputerId(null);
+                  openSetup();
+                }
+              : undefined
+          }
           pending={removeMutation.isPending}
           tenantId={tenantId}
         />

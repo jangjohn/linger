@@ -3264,6 +3264,20 @@ paths:
           $ref: '../components/common.yaml#/components/responses/PayloadTooLarge'
         '503':
           $ref: '../components/common.yaml#/components/responses/ServiceUnavailable'
+  /v0/url-preview/framing:
+    $ref: '../paths/teamhub-public-url-preview.yaml#/framing'
+  /v0/web-search/backends:
+    $ref: '../paths/teamhub-public-web-search.yaml#/backends'
+  /v0/web-search/backends/{backend}/key:
+    parameters:
+      - name: backend
+        in: path
+        required: true
+        schema:
+          $ref: '../components/web-search.yaml#/components/schemas/WebSearchKeyBackend'
+    $ref: '../paths/teamhub-public-web-search.yaml#/backendKey'
+  /v0/web-search/default:
+    $ref: '../paths/teamhub-public-web-search.yaml#/default'
   /v0/work-items/{workItemId}/documents/uploads:
     parameters:
       - $ref: '#/components/parameters/WorkItemId'
@@ -5141,6 +5155,17 @@ paths:
             application/json:
               schema: { $ref: '../components/external-sources.yaml#/components/schemas/ExternalAppList' }
         '401': { $ref: '../components/common.yaml#/components/responses/Unauthenticated' }
+  /v0/external-apps/feishu-mail/setup:
+    get:
+      tags: [External Sources]
+      operationId: checkFeishuMailSetup
+      summary: Check whether the signed-in account can start Feishu Mail authorization.
+      responses:
+        '204':
+          description: The Computer can start authorization.
+        '401': { $ref: '../components/common.yaml#/components/responses/Unauthenticated' }
+        '409': { $ref: '../components/common.yaml#/components/responses/Conflict' }
+        '503': { $ref: '../components/common.yaml#/components/responses/ServiceUnavailable' }
   /v0/external-apps/provider-key:
     put:
       tags: [External Sources]

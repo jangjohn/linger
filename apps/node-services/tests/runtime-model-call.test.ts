@@ -3,10 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMPUTER_OFFLINE_MESSAGE,
   createRuntimeModelCall,
+  createTeamHubBackgroundOutcomeReporter,
   isComputerOffline,
   ModelCallError,
   ModelBudgetSpentError,
   ModelRunBudget,
+  type BackgroundCallOutcome,
   type ModelPlacement,
   type RuntimeModelGateway,
   type RuntimeModelInfo,
@@ -60,6 +62,7 @@ function setup(
     lease?: ModelLease;
     callLog?: ModelCallLog;
     runtimeModels?: RuntimeModelGateway["runtimeModels"];
+    onBackgroundOutcome?: (outcome: BackgroundCallOutcome) => void;
   } = {},
 ) {
   const outcomes = [...(options.outcomes ?? [completed('{"answer":"yes"}')])];
@@ -92,6 +95,9 @@ function setup(
     placements,
     logger,
     ...(options.callLog ? { callLog: options.callLog } : {}),
+    ...(options.onBackgroundOutcome
+      ? { onBackgroundOutcome: options.onBackgroundOutcome }
+      : {}),
     now: () => time,
   });
   return {
@@ -1017,13 +1023,29 @@ describe("Model context window", () => {
   const catalogs: Record<string, Record<string, RuntimeModelInfo[]>> = {
     computer_alice: {
       codex: [
-        { id: "gpt-large", contextWindow: 400_000 },
-        { id: "gpt-default", contextWindow: 272_000, isDefault: true },
+        { id: "gpt-large", runtimeModel: "gpt-large", contextWindow: 400_000 },
+        {
+          id: "gpt-default",
+          runtimeModel: "gpt-default",
+          contextWindow: 272_000,
+          isDefault: true,
+        },
+        { id: "codex-default" },
       ],
-      claude: [{ id: "default", contextWindow: 65_536, isDefault: true }],
+      claude: [
+        {
+          id: "default",
+          runtimeModel: "default",
+          contextWindow: 65_536,
+          isDefault: true,
+        },
+      ],
     },
     computer_bob: {
-      claude: [{ id: "opus" }, { id: "default", isDefault: true }],
+      claude: [
+        { id: "opus", runtimeModel: "opus" },
+        { id: "default", runtimeModel: "default", isDefault: true },
+      ],
     },
   };
   const runtimeModels = (computerId: string, runtimeType: string) =>
@@ -1048,6 +1070,79 @@ describe("Model context window", () => {
     ).resolves.toBe(65_536);
   });
 
+  it("uses the placed Agent's configured model and its context window", async () => {
+    const aliceCustom: ModelPlacement = { ...alice, model: "gpt-large" };
+    const { modelCall, invokeModel } = setup({
+      placements: [aliceCustom],
+      runtimeModels,
+    });
+    await expect(
+      modelCall.contextWindow!({
+        anotherMe: {
+          tenantId: aliceCustom.tenantId,
+          agentActorId: "another_me_alice",
+        },
+      }),
+    ).resolves.toBe(400_000);
+    await modelCall.call({
+      ...ask,
+      owner: { tenantId: aliceCustom.tenantId, ownerActorId: "alice" },
+      input: "Question?",
+    });
+    expect(invokeModel).toHaveBeenCalledWith(
+      "computer_alice",
+      expect.objectContaining({
+        runtimeType: "codex",
+        model: "gpt-large",
+      }),
+    );
+
+    // Cross-Runtime fallback never leaks the source Runtime's model across a chain.
+    const fallback = setup({
+      placements: [aliceCustom],
+      runtimeModels,
+      ready: (_computer, runtime) => runtime === "claude",
+    });
+    await expect(
+      fallback.modelCall.contextWindow!({ placement: aliceCustom }),
+    ).resolves.toBe(65_536);
+    await fallback.modelCall.chain(
+      { kind: "wiki", key: "wiki:1", placement: aliceCustom },
+      (chain) =>
+        chain.call({
+          step: "plan",
+          schemaName: "answer",
+          outputSchema: schema,
+          input: "Plan?",
+        }),
+    );
+    expect(fallback.invokeModel).toHaveBeenCalledWith(
+      "computer_alice",
+      expect.objectContaining({
+        runtimeType: "claude",
+        model: "default",
+      }),
+    );
+
+    // Legacy default catalog entries (runtimeModel undefined) fall back to the Runtime's default.
+    const legacy = setup({
+      placements: [{ ...alice, model: "codex-default" }],
+      runtimeModels,
+    });
+    await legacy.modelCall.call({
+      ...ask,
+      owner: { tenantId: alice.tenantId, ownerActorId: "alice" },
+      input: "Legacy?",
+    });
+    expect(legacy.invokeModel).toHaveBeenCalledWith(
+      "computer_alice",
+      expect.objectContaining({
+        runtimeType: "codex",
+        model: "gpt-default",
+      }),
+    );
+  });
+
   it("is unknown without a window or a placement", async () => {
     const { modelCall } = setup({ runtimeModels });
     await expect(
@@ -1065,6 +1160,335 @@ describe("Model context window", () => {
     await expect(
       modelCall.contextWindow!({ placement: alice }),
     ).rejects.toMatchObject({ kind: "computer_offline" });
+  });
+});
+
+describe("Model call invocation log", () => {
+  function invokedLines(logger: { log: ReturnType<typeof vi.fn> }) {
+    return logger.log.mock.calls
+      .filter(([, event]) => event === "model_call.invoked")
+      .map(([level, , fields]) => ({
+        level: level as string,
+        fields: fields as Record<string, unknown>,
+      }));
+  }
+
+  it("carries a failed call's reason", async () => {
+    const { modelCall, logger } = setup({
+      placements: [alice],
+      invoke: async () => ({
+        outcome: "failed",
+        reason: "model_not_found: The model gpt-x does not exist",
+        duration_ms: 1,
+      }),
+    });
+    await expect(
+      modelCall.text({ kind: "approval", key: "r", input: "x" }),
+    ).rejects.toThrow(ModelCallError);
+    const [line] = invokedLines(logger);
+    expect(line).toMatchObject({
+      level: "warn",
+      fields: {
+        outcome: "failed",
+        reason:
+          "Model invocation failed: model_not_found: The model gpt-x does not exist",
+      },
+    });
+  });
+
+  it("redacts credentials in the reason and keeps 300 characters", async () => {
+    const secret = `sk-${"A".repeat(40)}`;
+    const { modelCall, logger } = setup({
+      placements: [alice],
+      invoke: async () => ({
+        outcome: "failed",
+        reason: `401 for key ${secret} with Authorization: Bearer fixture-token ${"é".repeat(400)}`,
+        duration_ms: 1,
+      }),
+    });
+    await expect(
+      modelCall.text({ kind: "approval", key: "r", input: "x" }),
+    ).rejects.toThrow(ModelCallError);
+    const reason = String(invokedLines(logger)[0]!.fields.reason);
+    expect(reason).not.toContain(secret);
+    expect(reason).not.toContain("fixture-token");
+    expect(reason).toContain("[Redacted]");
+    expect(Array.from(reason)).toHaveLength(300);
+  });
+
+  it("adds no reason to a completed call", async () => {
+    const { modelCall, logger } = setup({ placements: [alice] });
+    await modelCall.call({ ...ask, input: "x" });
+    const [line] = invokedLines(logger);
+    expect(line!.level).toBe("info");
+    expect(Object.keys(line!.fields).sort()).toEqual([
+      "attempt",
+      "computer_id",
+      "duration_ms",
+      "key",
+      "kind",
+      "mode",
+      "model",
+      "outcome",
+      "runtime_type",
+    ]);
+  });
+});
+
+describe("Background call outcomes", () => {
+  afterEach(() => vi.useRealTimers());
+
+  function reported(options: Parameters<typeof setup>[0] = {}) {
+    const onBackgroundOutcome =
+      vi.fn<(outcome: BackgroundCallOutcome) => void>();
+    return {
+      ...setup({ placements: [alice], ...options, onBackgroundOutcome }),
+      onBackgroundOutcome,
+    };
+  }
+
+  it("reports a completed background call once for every caller it served", async () => {
+    const { modelCall, onBackgroundOutcome } = reported({
+      outcomes: [completed("done")],
+    });
+    await Promise.all([
+      modelCall.text({ ...work, input: "x" }),
+      modelCall.text({ ...work, input: "x" }),
+    ]);
+    expect(onBackgroundOutcome.mock.calls).toEqual([
+      [
+        {
+          tenantId: "tenant_1",
+          agentActorId: "another_me_alice",
+          kind: "memory",
+        },
+      ],
+    ]);
+  });
+
+  it.each([
+    ["auth_required", "runtime_auth_required"],
+    ["runtime_incompatible", "runtime_incompatible"],
+    ["unsupported", "runtime_incompatible"],
+    ["runtime_unavailable", "runtime_unavailable"],
+  ] as const)(
+    "reports a Runtime that answers %s as %s",
+    async (outcome, failure) => {
+      const { modelCall, onBackgroundOutcome } = reported({
+        outcomes: [{ outcome, reason: "sk-secret", duration_ms: 0 }],
+      });
+      await expect(modelCall.text({ ...work, input: "x" })).rejects.toThrow();
+      expect(onBackgroundOutcome.mock.calls).toEqual([
+        [
+          {
+            tenantId: "tenant_1",
+            agentActorId: "another_me_alice",
+            kind: "memory",
+            failure,
+          },
+        ],
+      ]);
+    },
+  );
+
+  it("reports a call that fails every attempt once, with an unknown reason", async () => {
+    vi.useFakeTimers();
+    const { modelCall, invokeModel, onBackgroundOutcome } = reported({
+      outcomes: [
+        { outcome: "failed", duration_ms: 0 },
+        { outcome: "timed_out", duration_ms: 0 },
+        { outcome: "failed", duration_ms: 0 },
+      ],
+    });
+    const call = modelCall
+      .text({ ...work, input: "x" })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await call).toBeInstanceOf(ModelCallError);
+    expect(invokeModel).toHaveBeenCalledTimes(3);
+    expect(onBackgroundOutcome.mock.calls).toEqual([
+      [expect.objectContaining({ failure: "unknown" })],
+    ]);
+  });
+
+  it("does not report an offline Computer, a missing Another Me or a stopped call", async () => {
+    const offline = reported({
+      outcomes: [{ outcome: "unavailable", duration_ms: 0 }],
+    });
+    await expect(
+      offline.modelCall.text({ ...work, input: "x" }),
+    ).rejects.toMatchObject({ kind: "computer_offline" });
+
+    const unplaced = reported({ placements: [] });
+    await expect(
+      unplaced.modelCall.text({ ...work, input: "x" }),
+    ).rejects.toMatchObject({ kind: "owner_unresolved" });
+
+    const stopped = reported({ invoke: hanging });
+    const memory = stopped.modelCall
+      .text({ ...work, input: "x" })
+      .catch((error: unknown) => error);
+    await vi.waitFor(() => expect(stopped.invokeModel).toHaveBeenCalled());
+    stopped.modelCall.close();
+    await memory;
+
+    for (const { onBackgroundOutcome } of [offline, unplaced, stopped])
+      expect(onBackgroundOutcome).not.toHaveBeenCalled();
+  });
+
+  it("does not report a call the background backoff held back", async () => {
+    const { modelCall, invokeModel, onBackgroundOutcome } = reported({
+      invoke: async () => ({ outcome: "auth_required", duration_ms: 0 }),
+    });
+    for (const input of ["a", "b", "c"])
+      await expect(modelCall.text({ ...work, input })).rejects.toMatchObject({
+        kind: "runtime_unavailable",
+      });
+    expect(invokeModel).toHaveBeenCalledTimes(2);
+    expect(onBackgroundOutcome.mock.calls).toEqual([
+      [expect.objectContaining({ failure: "runtime_auth_required" })],
+      [expect.objectContaining({ failure: "runtime_auth_required" })],
+    ]);
+  });
+
+  it("does not report a call the Daemon canceled on every attempt", async () => {
+    vi.useFakeTimers();
+    const { modelCall, invokeModel, onBackgroundOutcome } = reported({
+      outcomes: [
+        { outcome: "canceled", duration_ms: 0 },
+        { outcome: "canceled", duration_ms: 0 },
+      ],
+    });
+    const call = modelCall
+      .text({ kind: "profile", key: "profile", input: "x" })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await call).toMatchObject({ kind: "failed", canceled: true });
+    expect(invokeModel).toHaveBeenCalledTimes(2);
+    expect(onBackgroundOutcome).not.toHaveBeenCalled();
+  });
+
+  it("does not report interactive calls or an Agent placed without its actor", async () => {
+    const { modelCall, onBackgroundOutcome } = reported({
+      outcomes: [
+        { outcome: "runtime_incompatible", duration_ms: 0 },
+        completed("done"),
+      ],
+    });
+    await expect(
+      modelCall.text({ kind: "approval", key: "r", input: "x" }),
+    ).rejects.toThrow();
+    const { agentActorId: _, ...placement } = alice;
+    await modelCall.text({ ...work, input: "x", placement });
+    expect(onBackgroundOutcome).not.toHaveBeenCalled();
+  });
+});
+
+describe("TeamHub background outcome reporter", () => {
+  function reporter(fetch: typeof globalThis.fetch) {
+    const logger = { log: vi.fn() };
+    const report = createTeamHubBackgroundOutcomeReporter({
+      baseUrl: "http://teamhub.test",
+      serviceToken: "service-token",
+      logger,
+      fetch,
+    });
+    return { report, logger };
+  }
+
+  it("posts a failed call's reason code for its Another Me", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(
+      async () => new Response(null, { status: 204 }),
+    );
+    const { report, logger } = reporter(fetch);
+    report({
+      tenantId: "tenant_1",
+      agentActorId: "another_me_alice",
+      kind: "wiki",
+      failure: "runtime_incompatible",
+    });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const [url, init] = fetch.mock.calls[0]!;
+    expect((url as URL).href).toBe(
+      "http://teamhub.test/v0/agent-runtime/another-me/background-calls",
+    );
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      tenant_id: "tenant_1",
+      agent_actor_id: "another_me_alice",
+      outcome: "failed",
+      reason: "runtime_incompatible",
+    });
+    await settled();
+    expect(logger.log).not.toHaveBeenCalled();
+  });
+
+  it("only warns when TeamHub predates the route or cannot be reached", async () => {
+    const answers = [
+      async () => new Response("{}", { status: 404 }),
+      async () => {
+        throw new TypeError("fetch failed");
+      },
+    ];
+    const fetch = vi.fn<typeof globalThis.fetch>(() => answers.shift()!());
+    const { report, logger } = reporter(fetch);
+    const outcome = {
+      tenantId: "tenant_1",
+      agentActorId: "another_me_alice",
+      kind: "memory",
+    } as const;
+    report(outcome);
+    report(outcome);
+    await vi.waitFor(() => expect(logger.log).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(fetch.mock.calls[0]![1]?.body as string)).toEqual({
+      tenant_id: "tenant_1",
+      agent_actor_id: "another_me_alice",
+      outcome: "completed",
+    });
+    expect(logger.log.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "warn",
+          "model_call.background_report_failed",
+          expect.objectContaining({ kind: "memory", status: 404 }),
+        ],
+        [
+          "warn",
+          "model_call.background_report_failed",
+          expect.objectContaining({ error: expect.any(TypeError) }),
+        ],
+      ]),
+    );
+  });
+
+  it("only warns when the refused answer's body has already errored", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const fetch = vi.fn<typeof globalThis.fetch>(async () => {
+        const body = new ReadableStream({
+          start: (controller) => controller.error(new Error("socket reset")),
+        });
+        return new Response(body, { status: 404 });
+      });
+      const { report, logger } = reporter(fetch);
+      report({
+        tenantId: "tenant_1",
+        agentActorId: "another_me_alice",
+        kind: "memory",
+      });
+      await vi.waitFor(() =>
+        expect(logger.log).toHaveBeenCalledWith(
+          "warn",
+          "model_call.background_report_failed",
+          expect.objectContaining({ status: 404 }),
+        ),
+      );
+      await settled();
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
   });
 });
 
@@ -1112,5 +1536,208 @@ describe("Runner Gateway model invocation adapter", () => {
       expect(
         (error as Error).message.startsWith(COMPUTER_OFFLINE_MESSAGE),
       ).toBe(true);
+  });
+});
+
+describe("Structured model invoke outcomes and interactive-isolated background breaker", () => {
+  it("maps structured context_too_long outcome to invalid_request without wasting retries", async () => {
+    const { modelCall, invokeModel } = setup({
+      placements: [alice],
+      outcomes: [
+        {
+          outcome: "context_too_long",
+          reason: "Model invocation prompt exceeds the model context window",
+          duration_ms: 12,
+        },
+      ],
+    });
+    await expect(
+      modelCall.text({
+        kind: "agent_memory",
+        key: "agent-memory:overflow",
+        placement: alice,
+        input: "huge prompt",
+      }),
+    ).rejects.toMatchObject({ kind: "invalid_request" });
+    expect(invokeModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("backs off repeated background runtime_unavailable failures while admitting interactive approval and voice_ask calls", async () => {
+    const { modelCall, invokeModel } = setup({
+      placements: [alice],
+      outcomes: [
+        {
+          outcome: "runtime_unavailable",
+          reason: "local server down",
+          duration_ms: 5,
+        },
+        {
+          outcome: "runtime_unavailable",
+          reason: "local server down",
+          duration_ms: 5,
+        },
+        {
+          outcome: "completed",
+          text: "voice answer",
+          model: "fixture",
+          duration_ms: 5,
+        },
+        {
+          outcome: "runtime_unavailable",
+          reason: "local server down",
+          duration_ms: 5,
+        },
+        {
+          outcome: "runtime_unavailable",
+          reason: "local server down",
+          duration_ms: 5,
+        },
+        {
+          outcome: "completed",
+          text: "approved",
+          model: "fixture",
+          duration_ms: 5,
+        },
+        {
+          outcome: "completed",
+          text: "extracted",
+          model: "fixture",
+          duration_ms: 5,
+        },
+      ],
+    });
+
+    // Two background runtime_unavailable failures open the background breaker.
+    await expect(
+      modelCall.text({
+        kind: "agent_memory",
+        key: "bg:1",
+        placement: alice,
+        input: "a",
+      }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    await expect(
+      modelCall.text({
+        kind: "wiki",
+        key: "bg:2",
+        placement: alice,
+        input: "b",
+      }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    expect(invokeModel).toHaveBeenCalledTimes(2);
+
+    // Follow-up background call is backed off immediately without invoking the Daemon.
+    await expect(
+      modelCall.text({
+        kind: "agent_memory",
+        key: "bg:3",
+        placement: alice,
+        input: "c",
+      }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    expect(invokeModel).toHaveBeenCalledTimes(2);
+
+    // Interactive voice_ask bypasses the open background breaker and succeeds.
+    const voice = await modelCall.text({
+      kind: "voice_ask",
+      key: "voice:1",
+      placement: alice,
+      input: "status",
+    });
+    expect(voice.output).toBe("voice answer");
+    expect(invokeModel).toHaveBeenCalledTimes(3);
+
+    // Re-open the background breaker and verify interactive approval is also admitted.
+    await expect(
+      modelCall.text({
+        kind: "agent_memory",
+        key: "bg:4",
+        placement: alice,
+        input: "d",
+      }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    await expect(
+      modelCall.text({
+        kind: "wiki",
+        key: "bg:5",
+        placement: alice,
+        input: "e",
+      }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    await expect(
+      modelCall.text({
+        kind: "agent_memory",
+        key: "bg:6",
+        placement: alice,
+        input: "f",
+      }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    expect(invokeModel).toHaveBeenCalledTimes(5);
+
+    const approval = await modelCall.text({
+      kind: "approval",
+      key: "approval:1",
+      placement: alice,
+      input: "check",
+    });
+    expect(approval.output).toBe("approved");
+    expect(invokeModel).toHaveBeenCalledTimes(6);
+
+    // A successful interactive call resets the background breaker immediately.
+    const bgAfterRecovery = await modelCall.text({
+      kind: "agent_memory",
+      key: "bg:7",
+      placement: alice,
+      input: "g",
+    });
+    expect(bgAfterRecovery.output).toBe("extracted");
+    expect(invokeModel).toHaveBeenCalledTimes(7);
+  });
+
+  it("does not trip background breaker on structured unsupported outcomes", async () => {
+    const piPlacement: ModelPlacement = { ...alice, runtimeType: "pi" };
+    const { modelCall, invokeModel } = setup({
+      placements: [piPlacement],
+      outcomes: [
+        {
+          outcome: "unsupported",
+          reason: "Pi background calls do not run file tools",
+          duration_ms: 1,
+        },
+        {
+          outcome: "unsupported",
+          reason: "Pi background calls do not run file tools",
+          duration_ms: 1,
+        },
+        {
+          outcome: "completed",
+          text: "ok",
+          model: "localmodels/spark",
+          duration_ms: 5,
+        },
+      ],
+    });
+    for (let i = 1; i <= 2; i += 1) {
+      await expect(
+        modelCall.workspace({
+          kind: "wiki",
+          key: `ws:${i}`,
+          placement: piPlacement,
+          input: "edit",
+          files: [],
+        }),
+      ).rejects.toMatchObject({
+        kind: "runtime_unavailable",
+        runtimeOutcome: "unsupported",
+      });
+    }
+    const textReply = await modelCall.text({
+      kind: "agent_memory",
+      key: "text:1",
+      placement: piPlacement,
+      input: "extract",
+    });
+    expect(textReply.output).toBe("ok");
+    expect(invokeModel).toHaveBeenCalledTimes(3);
   });
 });

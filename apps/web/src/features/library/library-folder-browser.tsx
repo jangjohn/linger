@@ -4,23 +4,28 @@ import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { ModalDialog } from "@/components/ui/modal-dialog";
+import { commonMessages } from "@/i18n/common.messages";
+import { useTranslation, useT } from "@/i18n/use-translation";
+import { formatLocale } from "@/i18n/language";
+import { dateTimeFormat } from "@/lib/date-format";
 import type {
   TeamHubDocumentPlacementNode,
   TeamHubDocumentTreeSummary,
 } from "@/features/teamhub/teamhub-types";
 
 import type { PendingDocumentUpload } from "./library-upload-queue";
+import { libraryMessages as m } from "./library.messages";
 
 export type LibraryFolder = Extract<
   TeamHubDocumentPlacementNode,
   { node_kind: "folder" }
 >;
 
-const folderDateFormatter = new Intl.DateTimeFormat("en-US", {
+const folderDateOptions = {
   day: "numeric",
   month: "short",
   year: "numeric",
-});
+} as const;
 
 /** Folders and Documents placed directly in one My pages folder (root when undefined). */
 export function folderChildren(
@@ -84,9 +89,10 @@ export function LibraryFolderBreadcrumb({
   rootLabel: string;
   trail: readonly LibraryFolder[];
 }) {
+  const t = useT();
   return (
     <nav
-      aria-label="Folder path"
+      aria-label={t(m.folderPath)}
       className="mb-3 flex flex-wrap items-center gap-1 text-sm"
     >
       <button
@@ -125,11 +131,12 @@ export function LibraryFolderRow({
   folder: LibraryFolder;
   onOpen: (folderId: string) => void;
 }) {
+  const { language, t } = useTranslation();
   const date = new Date(folder.updated_at);
   return (
     <div className="workspace-file-row">
       <button
-        aria-label={`Open folder ${folder.name}`}
+        aria-label={t(m.openFolder, { name: folder.name })}
         className="workspace-file-name text-left"
         onClick={() => onOpen(folder.id)}
         type="button"
@@ -139,14 +146,16 @@ export function LibraryFolderRow({
         </span>
         <span className="min-w-0">
           <strong>{folder.name}</strong>
-          <span className="workspace-file-context">Folder</span>
+          <span className="workspace-file-context">{t(m.folder)}</span>
         </span>
       </button>
       <div className="workspace-file-metadata">
         <time dateTime={folder.updated_at} title={folder.updated_at}>
           {Number.isNaN(date.valueOf())
             ? "—"
-            : folderDateFormatter.format(date)}
+            : dateTimeFormat(folderDateOptions, formatLocale(language)).format(
+                date,
+              )}
         </time>
       </div>
       <span aria-hidden="true" />
@@ -160,27 +169,28 @@ export function LibraryUploadSummary({
 }: {
   uploads: readonly PendingDocumentUpload[];
 }) {
+  const t = useT();
   if (uploads.length === 0) return null;
   const current = uploads.find((upload) => upload.status === "uploading");
   const percent = Math.round((current?.progress ?? 0) * 100);
   return (
     <div
-      aria-label="Upload progress"
+      aria-label={t(m.uploadProgress)}
       className="mb-2 rounded-lg border border-app-border px-3 py-2 text-xs text-app-muted"
       role="status"
     >
       <div className="flex items-center justify-between gap-3">
         <span className="truncate">
-          {current ? `Uploading ${current.filename}` : "Preparing upload…"}
+          {current
+            ? t(m.uploadingFile, { filename: current.filename })
+            : t(m.preparingUpload)}
         </span>
         <span className="shrink-0">
-          {uploads.length === 1
-            ? "1 file left"
-            : `${uploads.length} files left`}
+          {t(m.filesLeft, { count: uploads.length })}
         </span>
       </div>
       <div
-        aria-label="Current file upload"
+        aria-label={t(m.currentFileUpload)}
         aria-valuemax={100}
         aria-valuemin={0}
         aria-valuenow={percent}
@@ -205,6 +215,7 @@ export function NewFolderDialog({
   onCancel: () => void;
   onCreate: (name: string) => Promise<void>;
 }) {
+  const t = useT();
   const [name, setName] = useState(defaultName);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -221,7 +232,7 @@ export function NewFolderDialog({
       setError(
         createError instanceof Error
           ? createError.message
-          : "The folder could not be created.",
+          : t(m.folderNotCreated),
       );
       setPending(false);
     }
@@ -233,7 +244,7 @@ export function NewFolderDialog({
       footer={
         <>
           <Button disabled={pending} onClick={onCancel} tone="secondary">
-            Cancel
+            {t(commonMessages.cancel)}
           </Button>
           <Button
             disabled={!trimmed}
@@ -241,7 +252,7 @@ export function NewFolderDialog({
             onClick={() => void submit()}
             tone="primary"
           >
-            Create
+            {t(m.create)}
           </Button>
         </>
       }
@@ -249,13 +260,13 @@ export function NewFolderDialog({
         if (!pending) onCancel();
       }}
       size="sm"
-      title="New folder"
+      title={t(m.newFolder)}
     >
       <form className="px-5 py-4" onSubmit={(event) => void submit(event)}>
         <label className="block text-sm font-medium text-app-body">
-          Folder name
+          {t(m.folderName)}
           <input
-            aria-label="Folder name"
+            aria-label={t(m.folderName)}
             className="mt-1 h-9 w-full rounded-md border border-app-border bg-transparent px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             maxLength={255}
             onChange={(event) => setName(event.target.value)}

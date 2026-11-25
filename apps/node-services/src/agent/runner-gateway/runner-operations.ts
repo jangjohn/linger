@@ -7,13 +7,22 @@ import type {
 } from "@linger/wire-contracts/runner-gateway/types";
 import { isRecord } from "@linger/service-kit";
 import { isDeepStrictEqual } from "node:util";
-import { admissionLimit, runPriorities, softLimit } from "../../model-tasks.js";
+import {
+  admissionLimit,
+  INTERACTIVE_PRIORITY,
+  runPriorities,
+  RunPriority,
+  softLimit,
+} from "../../model-tasks.js";
 import { logAgentEvent } from "../observability/agent-log.js";
 import {
+  FIRST_PREVIOUS_SESSION_COMPUTER_VERSION,
+  FIRST_STOP_HOOK_COMPUTER_VERSION,
+  isComputerVersionAtLeast,
   LocalComputerOfflineError,
   resolveOperationModel,
 } from "./local-computer-management.js";
-import type { ModelEndpoint } from "./model-queue.js";
+import { INTERACTIVE_STALL_MS, type ModelEndpoint } from "./model-queue.js";
 import { isServingConnection } from "./runner-connections.js";
 import type {
   CapacitySignal,
@@ -131,12 +140,48 @@ export class RunnerOperations {
     signal: AbortSignal,
   ): Promise<RunnerCapacityPermit> {
     const source = target.priority ?? runPriorities.chat;
+    const known = typeof source === "number" || source instanceof RunPriority;
     const waiter = {
       ...target,
-      queuedAt:
-        typeof source === "number" ? performance.now() : source.queuedAt,
-      rank: typeof source === "number" ? source : undefined,
+      queuedAt: known ? performance.now() : source.queuedAt,
+      rank:
+        typeof source === "number"
+          ? source
+          : source instanceof RunPriority
+            ? source.value
+            : undefined,
     };
+    const unsubscribe =
+      source instanceof RunPriority
+        ? source.onRaise(() => {
+            waiter.rank = source.value;
+            this.wakeCapacityWaiters();
+          })
+        : undefined;
+    const waitStartedAt = Date.now();
+    let stall: ReturnType<typeof setTimeout> | undefined;
+    const watchStall = () => {
+      stall = setTimeout(() => {
+        if (waiter.rank === undefined || waiter.rank > INTERACTIVE_PRIORITY)
+          return watchStall();
+        logAgentEvent("warn", "runner.capacity.interactive_waiting", {
+          computer_id: target.runnerId,
+          execution_context_key: target.executionContextKey,
+          priority: waiter.rank,
+          waited_ms: Date.now() - waitStartedAt,
+          capacity:
+            this.owners.connections().getConnection(target.runnerId)?.hello
+              .capacity ?? null,
+          reservations: [...this.#capacityReservations.values()].filter(
+            (item) => item.target.runnerId === target.runnerId,
+          ).length,
+          holders: this.describeHolders(target.runnerId),
+        });
+      }, INTERACTIVE_STALL_MS);
+      stall.unref?.();
+    };
+    if (typeof source !== "number" || source <= INTERACTIVE_PRIORITY)
+      watchStall();
     this.#capacityWaiters.add(waiter);
     try {
       for (;;) {
@@ -182,7 +227,7 @@ export class RunnerOperations {
         if (
           hard !== undefined &&
           waiter.rank === undefined &&
-          typeof source !== "number" &&
+          !known &&
           (occupied.length >= soft || peers.length > 1)
         ) {
           waiter.rank = await source.resolve();
@@ -214,12 +259,14 @@ export class RunnerOperations {
         if (
           first === waiter &&
           waiter.rank !== undefined &&
-          rank <= runPriorities.chat
+          rank <= INTERACTIVE_PRIORITY
         )
           yieldLowerRun(active, rank);
         await waitForCapacityChange(changed, signal);
       }
     } finally {
+      clearTimeout(stall);
+      unsubscribe?.();
       this.#capacityWaiters.delete(waiter);
       // A leaving waiter may have held the FIFO position others wait behind.
       this.wakeCapacityWaiters();
@@ -230,16 +277,22 @@ export class RunnerOperations {
     target: RunnerOperationTarget,
   ): Promise<RunnerOperation> {
     // Readiness is checked once, after any capacity wait.
-    const priority = runPriorities[target.runKind ?? "chat"];
+    const priority =
+      target.priority ??
+      new RunPriority(runPriorities[target.runKind ?? "chat"]);
     let permit = target.capacityPermit;
     // The durable claim may select a different Run than the scheduling hint.
-    if (permit?.reservedForChat && priority > runPriorities.chat) {
+    if (permit?.reservedForChat && priority.value > INTERACTIVE_PRIORITY) {
       permit.release();
       permit = undefined;
     }
+    const signal = target.signal ?? new AbortController().signal;
+    const waitSignal = target.preemptSignal
+      ? AbortSignal.any([signal, target.preemptSignal])
+      : signal;
     permit ??= await this.acquireOperationCapacity(
       { ...target, priority },
-      target.signal ?? new AbortController().signal,
+      waitSignal,
     );
     try {
       // The whole Run is one unit of its endpoint's model queue. It waits
@@ -254,11 +307,11 @@ export class RunnerOperations {
           kind: target.runKind ?? "chat",
           key: target.request.run_context.execution_run_ref,
         },
-        target.signal ?? new AbortController().signal,
+        waitSignal,
       );
       try {
         if (target.beforeYieldResume) await target.beforeYieldResume();
-        target.signal?.throwIfAborted();
+        waitSignal.throwIfAborted();
         const reservation = this.#capacityReservations.get(permit.id);
         if (
           !reservation ||
@@ -274,7 +327,11 @@ export class RunnerOperations {
             "Operation capacity reservation is no longer valid",
           );
         }
-        return await this.#startReservedOperation(target, permit.id, lease);
+        return await this.#startReservedOperation(
+          { ...target, priority },
+          permit.id,
+          lease,
+        );
       } catch (error) {
         lease.release({ outcome: "not_sent" });
         throw error;
@@ -282,6 +339,27 @@ export class RunnerOperations {
     } finally {
       permit.release();
     }
+  }
+
+  /** The running Operations on a Computer, or one of its Runtimes, and why
+   * each cannot yield, for the log of a stalled interactive wait. */
+  describeHolders(
+    computerId: string,
+    runtimeType?: string,
+  ): Record<string, unknown>[] {
+    return this.activeOperations(computerId)
+      .filter(
+        (operation) =>
+          runtimeType === undefined ||
+          operation.start.runtime_type === runtimeType,
+      )
+      .map((operation) => ({
+        operation_id: operation.start.operation_id,
+        execution_context_key: operation.start.execution_context_key,
+        runtime_type: operation.start.runtime_type,
+        priority: operation.priority,
+        yield_blocker: operation.yieldBlocker ?? null,
+      }));
   }
 
   /** Interactive work waiting on the endpoint swaps out a lower Run there. */
@@ -345,13 +423,20 @@ export class RunnerOperations {
       throw new RunnerGatewayError(
         "Operation reservation was released before admission",
       );
-    const operation = new RunnerOperationState({
-      target: resolvedTarget,
+    const targetForDaemon = filterOperationTargetForDaemon(
+      resolvedTarget,
+      connection.hello.daemon_version,
+    );
+    const operation: RunnerOperationState = new RunnerOperationState({
+      target: targetForDaemon,
       connectionEpoch: connection.connectionEpoch,
       runnerRevision: desiredRunner.runnerRevision,
       createId: this.context.createId,
       send: (command) => this.owners.connections().sendToCurrentRunner(command),
       cancelTimeoutMs: this.context.operationCancelTimeoutMs,
+      yieldDeadlineMs: this.context.operationYieldDeadlineMs,
+      stoppedTaskGraceMs: this.context.stoppedTaskGraceMs,
+      onSchedulingChange: () => this.#schedulingChanged(operation),
       runtimeAssignment: {
         registrationId: desiredRunner.registrationId,
         assignmentRevision: desiredRunner.assignmentRevision,
@@ -572,6 +657,18 @@ export class RunnerOperations {
         operation.expireInputReceipts();
   }
 
+  /** A Run that has just become able to yield, or whose yield is overdue,
+   * lets the work waiting on its endpoint ask again. */
+  #recheckYields(operation: RunnerOperationState): void {
+    this.owners.queue().recheckInteractiveWait(operationEndpoint(operation));
+    this.wakeCapacityWaiters();
+  }
+
+  #schedulingChanged(operation: RunnerOperationState): void {
+    if (operation.terminal) this.#retireOperation(operation);
+    else this.#recheckYields(operation);
+  }
+
   #retireOperation(operation: RunnerOperationState): void {
     const operationId = operation.start.operation_id;
     if (this.#operations.get(operationId) !== operation) {
@@ -674,7 +771,7 @@ export class RunnerOperations {
         );
       return;
     }
-    const wasResumable = operation.resumable;
+    const wasYieldable = operation.yieldBlocker === undefined;
     const acknowledgement = await operation.receive(envelope);
     if (
       envelope.type === "operation.event" &&
@@ -692,12 +789,10 @@ export class RunnerOperations {
       this.#recordRunOperation(operation);
     if (
       !operation.terminal &&
-      operation.resumable &&
-      (!wasResumable || envelope.type === "operation.input_result")
-    ) {
-      this.owners.queue().recheckInteractiveWait(operationEndpoint(operation));
-      this.wakeCapacityWaiters();
-    }
+      !wasYieldable &&
+      operation.yieldBlocker === undefined
+    )
+      this.#recheckYields(operation);
     if (operation.terminal) this.#retireOperation(operation);
     if (acknowledgement)
       await this.owners.connections().send(connection, acknowledgement);
@@ -716,6 +811,11 @@ export class RunnerOperations {
       type: "latency",
       source: "run",
       latencyMs: response.first_item_at_unix_ms - response.started_at_unix_ms,
+      // The report arrives once the whole response is written.
+      endedMsAgo: Math.max(
+        0,
+        response.responded_at_unix_ms - response.first_item_at_unix_ms,
+      ),
       workTokens: response.usage.input,
     });
   }
@@ -838,4 +938,36 @@ function yieldLowerRun(
     .filter((operation) => operation.priority > priority)
     .sort((a, b) => b.priority - a.priority);
   for (const operation of lower) if (operation.requestYield()) return;
+}
+
+function filterOperationTargetForDaemon(
+  target: RunnerOperationTarget,
+  daemonVersion: string,
+): RunnerOperationTarget {
+  const stripStopHook =
+    !isComputerVersionAtLeast(
+      daemonVersion,
+      FIRST_STOP_HOOK_COMPUTER_VERSION,
+    ) && target.request.run_context.stop_hook !== undefined;
+  const stripPreviousSession =
+    !isComputerVersionAtLeast(
+      daemonVersion,
+      FIRST_PREVIOUS_SESSION_COMPUTER_VERSION,
+    ) && target.request.previous_session !== undefined;
+  if (!stripStopHook && !stripPreviousSession) {
+    return target;
+  }
+  const filteredRequest = { ...target.request };
+  if (stripStopHook) {
+    const filteredRunContext = { ...filteredRequest.run_context };
+    delete filteredRunContext.stop_hook;
+    filteredRequest.run_context = filteredRunContext;
+  }
+  if (stripPreviousSession) {
+    delete filteredRequest.previous_session;
+  }
+  return {
+    ...target,
+    request: filteredRequest,
+  };
 }

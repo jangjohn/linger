@@ -14,6 +14,7 @@ import (
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/process"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/native"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/redact"
 	localworkspace "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/workspace"
 )
 
@@ -35,23 +36,23 @@ type runtimeProbeOutcome struct {
 	catalog *native.ModelList
 }
 
-func probeRuntime(ctx context.Context, runtimeType, executable string, environment map[string]string, timeout time.Duration, version string, runtimeHomeRoot ...string) runtimeProbeOutcome {
+func probeRuntime(ctx context.Context, runtimeType, executable string, environment map[string]string, timeout time.Duration, runtimeHomeRoot ...string) runtimeProbeOutcome {
 	policy := runtimeDetectionPolicies[runtimeType]
 	authentication := runtimeProbeOutcome{Status: "ready"}
 	if policy.authenticationBeforeProtocol && policy.authenticationProbe != nil {
-		authentication = probeRuntimeAuthentication(ctx, runtimeType, executable, environment, timeout, version, runtimeHomeRoot...)
+		authentication = probeRuntimeAuthentication(ctx, runtimeType, executable, environment, timeout, runtimeHomeRoot...)
 		if authentication.Status != "ready" {
 			return authentication
 		}
 	}
-	if err := probeRuntimeProtocol(ctx, runtimeType, executable, environment, timeout, version); err != nil {
+	if err := probeRuntimeProtocol(ctx, runtimeType, executable, environment, timeout); err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return runtimeProbeOutcome{Status: "error", Code: "RUNTIME_DIAGNOSTIC_FAILED", Message: "Runtime protocol handshake could not be completed within its deadline"}
 		}
 		return runtimeProbeOutcome{Status: "incompatible", Code: "RUNTIME_INCOMPATIBLE", Message: "Runtime protocol handshake failed"}
 	}
 	if !policy.authenticationBeforeProtocol && policy.authenticationProbe != nil {
-		authentication = probeRuntimeAuthentication(ctx, runtimeType, executable, environment, timeout, version, runtimeHomeRoot...)
+		authentication = probeRuntimeAuthentication(ctx, runtimeType, executable, environment, timeout, runtimeHomeRoot...)
 	}
 	authentication.protocolVerified = true
 	return authentication
@@ -61,26 +62,31 @@ func probeRuntime(ctx context.Context, runtimeType, executable string, environme
 // consume the authentication budget before account/read runs, which the
 // Room reports as an unverified Codex login even when auth is already valid.
 // Conversation launches already pass the same flag.
-func codexProbeArgs(version string) []string {
-	return native.CodexAppServerArgs(version)
+func codexProbeArgs() []string {
+	return native.CodexAppServerArgs()
 }
 
-func probeRuntimeProtocol(ctx context.Context, runtimeType, executable string, environment map[string]string, timeout time.Duration, version string) error {
+func probeRuntimeProtocol(ctx context.Context, runtimeType, executable string, environment map[string]string, timeout time.Duration) error {
 	var args []string
 	var payload string
 	switch runtimeType {
 	case "pi":
-		args = append([]string{"--mode", "rpc", "--no-session"}, native.PiRPCResourceArgs()...)
+		args = append([]string{"--mode", "rpc", "--no-session"}, native.PiRPCResourceArgs("")...)
 		payload = `{"id":"linger-probe","type":"get_state"}` + "\n"
 	case "codex":
-		args = codexProbeArgs(version)
+		args = codexProbeArgs()
 		// Codex emits the initialize response before accepting the initialized
 		// notification. Sending both frames back-to-back can race startup and
 		// make the probe report a false protocol incompatibility.
 		payload = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"linger-computer-doctor","title":"Linger Computer Doctor","version":"1.0.0"},"capabilities":null}}` + "\n"
 
 	case "antigravity":
-		args = []string{"acp"}
+		probeArgs, release, err := native.PrepareAntigravityProtocolProbe()
+		if err != nil {
+			return err
+		}
+		defer release()
+		args = append([]string{"acp"}, probeArgs...)
 		payload = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}` + "\n"
 	case "claude":
 		args = []string{
@@ -89,34 +95,57 @@ func probeRuntimeProtocol(ctx context.Context, runtimeType, executable string, e
 			"--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--tools", "",
 		}
 		payload = `{"type":"control_request","request_id":"linger-computer-doctor","request":{"subtype":"initialize"}}` + "\n"
+		environment = native.ClaudeEnvironment(environment)
 	default:
 		return errors.New("unsupported Runtime protocol probe")
 	}
-	stdout, _, runErr := runBoundedProbe(ctx, executable, args, environment, payload, timeout)
+	stdout, stderr, runErr := runBoundedProbe(ctx, executable, args, environment, payload, timeout)
 	if errors.Is(runErr, errProbeOutputLimit) {
+		logProbeExit("runner.runtime_probe.handshake_failed", runtimeType, runErr, stderr)
 		return runErr
 	}
-	if runErr != nil && len(stdout) == 0 {
-		return runErr
-	}
-	if runErr != nil && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(runErr, context.Canceled) {
-		return runErr
-	}
-	matched := false
 	for _, line := range strings.Split(stdout, "\n") {
 		var response map[string]any
 		if json.Unmarshal([]byte(strings.TrimSpace(line)), &response) == nil && protocolProbeResponseMatches(runtimeType, response) {
-			matched = true
-			break
+			// The answer is what the handshake checks. How the Runtime exits
+			// once its input closes, or a descendant outliving it, says
+			// nothing about protocol compatibility, so it is only logged.
+			if runErr != nil && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(runErr, context.Canceled) {
+				logProbeExit("runner.runtime_probe.exit_after_handshake", runtimeType, runErr, stderr)
+			}
+			return nil
 		}
 	}
-	if !matched {
-		if runErr != nil {
-			return runErr
-		}
-		return errors.New("Runtime capability probe closed without initialize response")
+	if runErr == nil {
+		runErr = errors.New("Runtime capability probe closed without initialize response")
 	}
-	return nil
+	logProbeExit("runner.runtime_probe.handshake_failed", runtimeType, runErr, stderr)
+	return runErr
+}
+
+// maxProbeStderrTail bounds the stderr a probe log keeps; the end of stderr
+// carries the error a CLI exits with.
+const maxProbeStderrTail = 1024
+
+// logProbeExit records why a probe process ended as it did. The diagnostic
+// sent to TeamHub stays categorical; this local log keeps the exit status and
+// the redacted end of stderr, without which a failed handshake cannot be
+// explained from the field.
+func logProbeExit(event, runtimeType string, err error, stderr string) {
+	attributes := []any{"runtime_type", runtimeType, "error", redact.Text(err.Error())}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		attributes = append(attributes, "exit_code", exitErr.ExitCode())
+		if signal := process.ExitSignal(exitErr.ProcessState); signal != "" {
+			attributes = append(attributes, "signal", signal)
+		}
+	}
+	// Redact before cutting: a cut through a credential's name or prefix
+	// would leave its value unrecognizable to redact.Text.
+	if tail := []rune(strings.TrimSpace(redact.Text(stderr))); len(tail) > 0 {
+		attributes = append(attributes, "stderr_tail", string(tail[max(0, len(tail)-maxProbeStderrTail):]))
+	}
+	slog.Warn(event, attributes...)
 }
 
 func protocolProbeResponseMatches(runtimeType string, response map[string]any) bool {
@@ -141,15 +170,11 @@ func protocolProbeResponseMatches(runtimeType string, response map[string]any) b
 }
 
 func probeCodexAuthentication(ctx context.Context, executable string, environment map[string]string, timeout time.Duration) runtimeProbeOutcome {
-	return probeCodexAuthenticationVersion(ctx, executable, environment, timeout, "")
-}
-
-func probeCodexAuthenticationVersion(ctx context.Context, executable string, environment map[string]string, timeout time.Duration, version string) runtimeProbeOutcome {
 	initialize := `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"linger-computer-doctor","version":"1.0.0"},"capabilities":null}}` + "\n"
 	var accountResponse map[string]any
 	initialized := false
 	rpcFailed := false
-	_, _, err := runBoundedProbeExchange(ctx, executable, codexProbeArgs(version), environment, initialize, boundedAuthTimeout(timeout), func(response map[string]any) (string, bool) {
+	_, _, err := runBoundedProbeExchange(ctx, executable, codexProbeArgs(), environment, initialize, boundedAuthTimeout(timeout), func(response map[string]any) (string, bool) {
 		if response["id"] == float64(1) && !initialized {
 			rpcFailed = response["error"] != nil
 			if !protocolProbeResponseMatches("codex", response) || rpcFailed {
@@ -215,7 +240,7 @@ func probeClaudeAuthentication(ctx context.Context, executable string, environme
 }
 
 func probeClaudeAuthStatus(ctx context.Context, executable string, prepared map[string]string, timeout time.Duration) runtimeProbeOutcome {
-	stdout, _, err := runBoundedProbe(ctx, executable, []string{"auth", "status", "--json"}, prepared, "", boundedAuthTimeout(timeout))
+	stdout, _, err := runBoundedProbe(ctx, executable, []string{"auth", "status", "--json"}, native.ClaudeEnvironment(prepared), "", boundedAuthTimeout(timeout))
 	var status struct {
 		LoggedIn *bool `json:"loggedIn"`
 	}
@@ -343,9 +368,9 @@ func (b *boundedProbeBuffer) String() string {
 	return b.buffer.String()
 }
 
-func probeRuntimeAuthentication(ctx context.Context, runtimeType, executable string, environment map[string]string, timeout time.Duration, version string, runtimeHomeRoot ...string) runtimeProbeOutcome {
+func probeRuntimeAuthentication(ctx context.Context, runtimeType, executable string, environment map[string]string, timeout time.Duration, runtimeHomeRoot ...string) runtimeProbeOutcome {
 	if runtimeType == "codex" {
-		return probeCodexAuthenticationVersion(ctx, executable, environment, timeout, version)
+		return probeCodexAuthentication(ctx, executable, environment, timeout)
 	}
 	outcome := runtimeDetectionPolicies[runtimeType].authenticationProbe(ctx, executable, environment, timeout)
 	if runtimeType != "claude" || outcome.Status != "ready" || len(runtimeHomeRoot) == 0 {

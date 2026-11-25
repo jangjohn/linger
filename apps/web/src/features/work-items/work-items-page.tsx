@@ -1,4 +1,3 @@
-import { dateTimeFormat } from "@/lib/date-format";
 import { useQuery } from "@tanstack/react-query";
 import {
   ArrowDown01Icon,
@@ -6,6 +5,10 @@ import {
   CheckListIcon,
 } from "@hugeicons/core-free-icons";
 import { Icon } from "@/components/ui/icon";
+import { commonMessages } from "@/i18n/common.messages";
+import { formatLocale } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT, useTranslation } from "@/i18n/use-translation";
 import { useCallback, useState, type RefCallback } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 
@@ -23,29 +26,26 @@ import {
   tenantWorkItemTargetQueryOptions,
   tenantWorkItemsDashboardQueryOptions,
 } from "./work-item-queries";
+import { capitalize, formatWorkItemDate } from "./work-item-format";
+import { WorkItemDetailDrawer } from "./work-item-detail-drawer";
 import { dashboardWorkItemPath } from "./work-item-routes";
 import { createWorkItemRoomFilterModel } from "./work-item-room-filter";
+import { workItemsMessages as m } from "./work-items.messages";
 
 interface DashboardColumn {
   id: "todo" | "in-progress" | "done" | "closed";
-  label: "Todo" | "In progress" | "Done" | "Closed";
+  label: Message<string>;
 }
 
 const dashboardColumns: readonly DashboardColumn[] = [
-  { id: "todo", label: "Todo" },
-  { id: "in-progress", label: "In progress" },
-  { id: "done", label: "Done" },
-  { id: "closed", label: "Closed" },
+  { id: "todo", label: m.columnTodo },
+  { id: "in-progress", label: m.columnInProgress },
+  { id: "done", label: m.columnDone },
+  { id: "closed", label: m.columnClosed },
 ];
 
-const dashboardDateFormatter = dateTimeFormat({
-  day: "numeric",
-  month: "short",
-  timeZone: "UTC",
-  year: "numeric",
-});
-
 export function WorkItemsPage() {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const params = useParams();
   const tenantId = requireRoomRouteParam(params.tenantId, "Tenant");
@@ -57,6 +57,21 @@ export function WorkItemsPage() {
     [focusedWorkItemId],
   );
   const [searchParams, setSearchParams] = useSearchParams();
+  const roomId = searchParams.get("room")?.trim() ?? "";
+  const dashboardSearch = roomId
+    ? new URLSearchParams({ room: roomId }).toString()
+    : "";
+  const [dismissedWorkItemId, setDismissedWorkItemId] = useState<
+    string | undefined
+  >();
+  // The bare /dashboard route is not mounted; dismiss locally so closing the
+  // drawer on /dashboard/:workItemId stays on the work item URL instead of 404.
+  const closeDetail = useCallback(() => {
+    setDismissedWorkItemId(focusedWorkItemId);
+  }, [focusedWorkItemId]);
+  const openDetail = useCallback(() => {
+    setDismissedWorkItemId(undefined);
+  }, []);
   const workItemsQuery = useQuery(
     tenantWorkItemsDashboardQueryOptions(client, tenantId),
   );
@@ -70,10 +85,14 @@ export function WorkItemsPage() {
   });
   const roomsQuery = useQuery(tenantRoomsQueryOptions(client, tenantId));
 
+  const hasFocusedInBoard = Boolean(
+    focusedWorkItemId &&
+    workItemsQuery.data?.items.some((item) => item.id === focusedWorkItemId),
+  );
   if (
     workItemsQuery.isPending ||
     roomsQuery.isPending ||
-    (focusedWorkItemId && focusedWorkItemQuery.isPending)
+    (focusedWorkItemId && !hasFocusedInBoard && focusedWorkItemQuery.isPending)
   ) {
     return <WorkItemsLoading />;
   }
@@ -101,11 +120,14 @@ export function WorkItemsPage() {
   const rooms = roomsQuery.data;
   if (!data || !rooms) return <WorkItemsLoading />;
   const items = mergeFocusedWorkItem(data.items, focusedWorkItemQuery.data);
-  const roomFilter = createWorkItemRoomFilterModel(rooms.items, items);
-  const roomId = searchParams.get("room")?.trim() ?? "";
-  const dashboardSearch = roomId
-    ? new URLSearchParams({ room: roomId }).toString()
-    : "";
+  const focusedWorkItem = focusedWorkItemId
+    ? items.find((item) => item.id === focusedWorkItemId)
+    : undefined;
+  const detailWorkItem =
+    focusedWorkItem && dismissedWorkItemId !== focusedWorkItem.id
+      ? focusedWorkItem
+      : undefined;
+  const roomFilter = createWorkItemRoomFilterModel(rooms.items, items, t);
   const filteredItems = items.filter((item) =>
     roomFilter.matches(item, roomId),
   );
@@ -122,16 +144,19 @@ export function WorkItemsPage() {
       <header className="work-items-header shrink-0 border-b border-app-border px-5 py-3 sm:px-8">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h1 className="text-2xl text-foreground">Dashboard</h1>
+            <h1 className="text-2xl text-foreground">{t(m.dashboard)}</h1>
             <p className="mt-0.5 text-sm text-muted-foreground">
               {filteredItems.length === items.length
-                ? itemCount(items.length)
-                : `${filteredItems.length} of ${items.length} items`}
+                ? t(m.itemCount, { count: items.length })
+                : t(m.filteredCount, {
+                    count: items.length,
+                    shown: filteredItems.length,
+                  })}
             </p>
           </div>
           {items.length ? (
             <div
-              aria-label="Work Item filters"
+              aria-label={t(m.filters)}
               className="w-[240px] max-w-full"
               role="group"
             >
@@ -146,23 +171,38 @@ export function WorkItemsPage() {
       </header>
 
       {items.length ? (
-        <div className="work-items-board workspace-scrollbar min-h-0 flex-1 overflow-x-auto overflow-y-hidden p-4 sm:p-5">
-          <div className="grid h-full min-w-[1180px] grid-cols-5 gap-3">
-            {dashboardColumns.map((column) => (
-              <WorkItemColumn
-                column={column}
-                focusedCardRef={focusedCardRef}
-                focusedWorkItemId={focusedWorkItemId}
-                items={filteredItems.filter(
-                  (item) => dashboardColumnFor(item) === column.id,
-                )}
-                key={column.id}
-                originRoomLabel={roomFilter.originLabel}
-                search={dashboardSearch}
-                tenantId={tenantId}
-              />
-            ))}
+        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
+          <div className="work-items-board workspace-scrollbar min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden p-4 sm:p-5">
+            <div className="grid h-full min-w-[960px] grid-cols-4 gap-3">
+              {dashboardColumns.map((column) => (
+                <WorkItemColumn
+                  column={column}
+                  focusedCardRef={focusedCardRef}
+                  focusedWorkItemId={focusedWorkItemId}
+                  items={filteredItems.filter(
+                    (item) => dashboardColumnFor(item) === column.id,
+                  )}
+                  key={column.id}
+                  onSelectWorkItem={openDetail}
+                  originRoomLabel={roomFilter.originLabel}
+                  search={dashboardSearch}
+                  tenantId={tenantId}
+                />
+              ))}
+            </div>
           </div>
+          {detailWorkItem ? (
+            <WorkItemDetailDrawer
+              item={detailWorkItem}
+              onClose={closeDetail}
+              originRoomLabel={roomFilter.originLabel(detailWorkItem)}
+              rooms={rooms.items}
+              statusBadge={
+                <WorkItemStatus status={dashboardColumnFor(detailWorkItem)} />
+              }
+              tenantId={tenantId}
+            />
+          ) : null}
         </div>
       ) : (
         <section className="flex min-h-0 flex-1 items-center justify-center px-6 py-12 text-center">
@@ -171,7 +211,7 @@ export function WorkItemsPage() {
               <Icon icon={CheckListIcon} size={16} />
             </span>
             <h2 className="mt-3 text-sm font-semibold text-app-ink">
-              No Work Items yet
+              {t(m.noWorkItems)}
             </h2>
           </div>
         </section>
@@ -193,10 +233,6 @@ function mergeFocusedWorkItem(
   );
 }
 
-function itemCount(count: number) {
-  return `${count} ${count === 1 ? "item" : "items"}`;
-}
-
 function WorkItemsLoading() {
   return <AuthenticatedRouteLoading pathname="/dashboard" rooms={[]} />;
 }
@@ -210,22 +246,23 @@ function WorkItemsError({
   isRetrying: boolean;
   onRetry: () => void;
 }) {
+  const t = useT();
   const forbidden = error instanceof TeamHubError && error.status === 403;
   return (
     <main
-      aria-label="Dashboard error"
+      aria-label={t(m.dashboardError)}
       className="work-items-surface flex min-h-0 flex-1 items-center justify-center bg-app-surface px-6 py-12 text-center"
       role="alert"
     >
       <div className="max-w-md">
         <h1 className="text-lg text-app-ink">
-          {forbidden ? "Access denied" : "Dashboard unavailable"}
+          {t(forbidden ? m.accessDenied : m.dashboardUnavailable)}
         </h1>
         <p className="mt-2 text-sm leading-6 text-app-muted">
-          {error.message || "TeamHub could not load Work Items."}
+          {error.message || t(m.loadFailed)}
         </p>
         <Button className="mt-5" disabled={isRetrying} onClick={onRetry}>
-          {isRetrying ? "Trying again…" : "Try again"}
+          {isRetrying ? t(m.tryingAgain) : t(commonMessages.tryAgain)}
         </Button>
       </div>
     </main>
@@ -241,16 +278,17 @@ function RoomFilter({
   options: Array<{ id: string; label: string }>;
   value: string;
 }) {
+  const t = useT();
   return (
     <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
-      Room
+      {t(m.room)}
       <Select
-        aria-label="Room"
+        aria-label={t(m.room)}
         className="h-8 w-full min-w-0 rounded-md border border-border bg-card px-2 text-sm text-foreground outline-none transition-colors hover:border-border-hover focus-visible:border-foreground focus-visible:ring-2 focus-visible:ring-ring"
         onValueChange={onChange}
         value={value}
       >
-        <SelectItem value="">All rooms</SelectItem>
+        <SelectItem value="">{t(m.allRooms)}</SelectItem>
         {options.map((option) => (
           <SelectItem key={option.id} value={option.id}>
             {option.label}
@@ -266,6 +304,7 @@ function WorkItemColumn({
   focusedCardRef,
   focusedWorkItemId,
   items,
+  onSelectWorkItem,
   originRoomLabel,
   search,
   tenantId,
@@ -274,16 +313,19 @@ function WorkItemColumn({
   focusedCardRef: RefCallback<HTMLAnchorElement>;
   focusedWorkItemId?: string;
   items: TeamHubWorkItem[];
+  onSelectWorkItem: () => void;
   originRoomLabel: (item: TeamHubWorkItem) => string;
   search: string;
   tenantId: string;
 }) {
+  const { language, t } = useTranslation();
+  const locale = formatLocale(language);
   const [closedExpanded, setClosedExpanded] = useState(true);
   const isClosed = column.id === "closed";
 
   return (
     <section
-      aria-label={column.label}
+      aria-label={t(column.label)}
       className="work-item-column flex min-h-0 min-w-0 flex-col"
     >
       <header className="flex h-11 shrink-0 items-center justify-between px-2">
@@ -299,10 +341,10 @@ function WorkItemColumn({
           <Button
             aria-controls="work-item-column-closed-items"
             aria-expanded={closedExpanded}
-            aria-label={closedExpanded ? "Collapse closed" : "Expand closed"}
+            aria-label={t(closedExpanded ? m.collapseClosed : m.expandClosed)}
             onClick={() => setClosedExpanded((expanded) => !expanded)}
             size="compactIcon"
-            title={closedExpanded ? "Collapse closed" : "Expand closed"}
+            title={t(closedExpanded ? m.collapseClosed : m.expandClosed)}
             tone="ghost"
           >
             {closedExpanded ? (
@@ -325,6 +367,7 @@ function WorkItemColumn({
                   item.id === focusedWorkItemId ? "location" : undefined
                 }
                 className="work-item-card block px-3 py-2.5 text-app-ink outline-none focus-visible:ring-2 focus-visible:ring-app-focus"
+                onClick={onSelectWorkItem}
                 ref={item.id === focusedWorkItemId ? focusedCardRef : undefined}
                 to={{
                   pathname: dashboardWorkItemPath(tenantId, item.id),
@@ -356,7 +399,11 @@ function WorkItemColumn({
                   </span>
                   {item.assignees.length ? (
                     <span
-                      aria-label={`Assigned to ${item.assignees.map(({ actor }) => actor.display_name).join(", ")}`}
+                      aria-label={t(m.assignedTo, {
+                        names: item.assignees
+                          .map(({ actor }) => actor.display_name)
+                          .join(", "),
+                      })}
                       className="flex shrink-0 -space-x-1"
                       role="group"
                     >
@@ -383,13 +430,15 @@ function WorkItemColumn({
                     </span>
                     <span aria-hidden="true">·</span>
                     <span className="shrink-0">
-                      {item.kind === "issue" ? "Issue" : "Task"} #{item.number}
+                      {t(item.kind === "issue" ? m.issueNumber : m.taskNumber, {
+                        number: String(item.number),
+                      })}
                     </span>
                   </span>
                   <span className="flex shrink-0 items-center gap-2">
                     <WorkItemStatus compact status={column.id} />
                     <time dateTime={item.updated_at}>
-                      {formatDashboardDate(item.updated_at)}
+                      {formatWorkItemDate(item.updated_at, locale)}
                     </time>
                   </span>
                 </span>
@@ -409,6 +458,7 @@ function WorkItemStatus({
   compact?: boolean;
   status: DashboardColumn["id"];
 }) {
+  const t = useT();
   const column = dashboardColumns.find((candidate) => candidate.id === status)!;
 
   return (
@@ -417,7 +467,7 @@ function WorkItemStatus({
       data-compact={compact ? "true" : "false"}
       data-status={status}
     >
-      <span>{column.label}</span>
+      <span>{t(column.label)}</span>
     </span>
   );
 }
@@ -426,12 +476,4 @@ function dashboardColumnFor(item: TeamHubWorkItem): DashboardColumn["id"] {
   if (item.state === "open") return "todo";
   if (item.state === "in_progress") return "in-progress";
   return item.resolution === "completed" ? "done" : "closed";
-}
-
-function capitalize(value: string) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-function formatDashboardDate(value: string) {
-  return dashboardDateFormatter.format(new Date(value));
 }

@@ -32,7 +32,15 @@ export type PositiveInteger = number;
 /**
  * An optional Runner behavior the Agent Service accepts. An older service rejects its frames as a protocol violation.
  */
-export type ServiceFeature = "local_models" | "byok_endpoint";
+export type ServiceFeature =
+  | "local_models"
+  | "byok_endpoint"
+  | "local_models_diagnostics"
+  | "model_invoke_outcomes"
+  | "local_models_engine"
+  | "local_models_concurrency_probe"
+  | "local_model_unavailable"
+  | "local_models_external_holders";
 export type JsonValue =
   | null
   | boolean
@@ -137,6 +145,7 @@ export type OperationPrepare = OperationIdentity & {
   session_options: SessionOptions;
   session: OpaqueObject;
   permission_review?: true;
+  stop_hook?: true;
   /**
    * @maxItems 64
    */
@@ -325,7 +334,7 @@ export type LocalModelsUnavailableCode = "TOOL_NOT_INSTALLED" | "TOOL_FAILED";
  */
 export type LocalModelPoolId = string;
 /**
- * Closed localmodels library error set. Extend it only together with the localmodels library contract.
+ * Closed localmodels library error set. Extend it only together with the localmodels library contract; UNKNOWN_ERROR preserves forward compatibility with newer localmodels releases.
  */
 export type LocalModelErrorCode =
   | "MODEL_UNKNOWN"
@@ -334,6 +343,9 @@ export type LocalModelErrorCode =
   | "MEMORY_INSUFFICIENT"
   | "DISK_INSUFFICIENT"
   | "PLATFORM_UNSUPPORTED"
+  | "GPU_UNSUPPORTED"
+  | "DRIVER_UPDATE_REQUIRED"
+  | "RUNTIME_DEPENDENCY_MISSING"
   | "LOAD_NO_ROOM"
   | "DOWNLOAD_FAILED"
   | "CHECKSUM_MISMATCH"
@@ -343,7 +355,8 @@ export type LocalModelErrorCode =
   | "OUT_OF_MEMORY"
   | "MODEL_FILES_MISSING"
   | "GATEWAY_REGISTRATION_FAILED"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "UNKNOWN_ERROR";
 /**
  * Model family for brand presentation; never inferred from name.
  */
@@ -489,6 +502,9 @@ export type LocalModelActionRefusalCode =
   | "MEMORY_INSUFFICIENT"
   | "DISK_INSUFFICIENT"
   | "PLATFORM_UNSUPPORTED"
+  | "GPU_UNSUPPORTED"
+  | "DRIVER_UPDATE_REQUIRED"
+  | "RUNTIME_DEPENDENCY_MISSING"
   | "LOAD_NO_ROOM"
   | "DOWNLOAD_FAILED"
   | "CHECKSUM_MISMATCH"
@@ -499,6 +515,7 @@ export type LocalModelActionRefusalCode =
   | "MODEL_FILES_MISSING"
   | "GATEWAY_REGISTRATION_FAILED"
   | "CANCELLED"
+  | "UNKNOWN_ERROR"
   | "TOOL_NOT_INSTALLED"
   | "TOOL_FAILED";
 export type CapabilityModelSourceSucceeded = LocalSkillCommandIdentity & {
@@ -1006,6 +1023,7 @@ export interface ProviderPrepare {
 export interface ProviderPrepareRunContext {
   human_interactions?: boolean;
   permission_review?: boolean;
+  stop_hook?: boolean;
 }
 /**
  * Compacts the native session of the process parked for this Context with the Runtime's own compaction. It never starts a process; without a parked process the answer is no_process.
@@ -1037,6 +1055,10 @@ export interface ModelInvoke {
   owner_actor_id: Id;
   agent_id: Id;
   runtime_type: "codex" | "claude" | "pi";
+  /**
+   * Explicit provider model to run on this Runtime. Omitted leaves selection to the Runtime's own default; sent only to a Computer release that decodes it.
+   */
+  model?: string;
   mode: "structured" | "text" | "workspace";
   reasoning_effort: "low" | "medium" | "high";
   instructions?: string;
@@ -1066,10 +1088,18 @@ export interface ContextRunStartRequest {
   runtime: RuntimeConfig;
   session_options: SessionOptions;
   session: OpaqueObject;
+  previous_session?: PreviousRuntimeSession;
   input: AgentInput;
   run_context: ContextRunContext;
   cli_run_context?: CliRunContext;
   run_resources: LocalRunResources;
+}
+/**
+ * Identifies the superseded native session of this Context so a fresh run.start can export its local transcript into ./playground/.previous-context.md.
+ */
+export interface PreviousRuntimeSession {
+  provider_type: "codex" | "claude" | "pi" | "antigravity";
+  session_id: string;
 }
 export interface AgentInput {
   type: "text";
@@ -1085,6 +1115,10 @@ export interface ContextRunContext {
    * The Daemon sends Runtime permission prompts as human_interaction.requested with kind permission_review; Agent Service answers each with an operation.input runtime_response.
    */
   permission_review?: boolean;
+  /**
+   * The Daemon sends Runtime stop-hook checks as human_interaction.requested with kind runtime_hook (hook: stop); Agent Service answers each with an operation.input runtime_response.
+   */
+  stop_hook?: boolean;
   /**
    * Continue the exact native session of this Run after a confirmed scheduler cancellation.
    */
@@ -1131,7 +1165,7 @@ export interface ComputerToolCall {
   owner_actor_id: Id;
   agent_id: Id;
   tool_session_id: Id;
-  server: "browser" | "playground";
+  server: "browser" | "playground" | "feishu_mail";
   tool_name: string;
   arguments: OpaqueObject;
   deadline_ms: number;
@@ -1307,6 +1341,7 @@ export interface LocalModelsSnapshot {
    * @maxItems 256
    */
   models: LocalModel[];
+  debug?: LocalModelsDebugInfo;
 }
 /**
  * Present only when available is false.
@@ -1362,6 +1397,13 @@ export interface LocalModelPool {
    * @maxItems 256
    */
   holders: LocalModelPoolHolder[];
+  /**
+   * Closeable desktop applications holding this pool's memory, as localmodels reports them. [] means localmodels looked and found none; an absent field means not reported. Sent only when service_features declares local_models_external_holders.
+   *
+   * @minItems 0
+   * @maxItems 256
+   */
+  external_holders?: LocalModelPoolExternalHolder[];
 }
 /**
  * Something holding pool memory. A component is a foundation service (embedding, reranker, speech) that is never a model row.
@@ -1369,6 +1411,13 @@ export interface LocalModelPool {
 export interface LocalModelPoolHolder {
   kind: "model" | "component";
   id: string;
+  name: string;
+  bytes: NonNegativeInteger;
+}
+/**
+ * A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close.
+ */
+export interface LocalModelPoolExternalHolder {
   name: string;
   bytes: NonNegativeInteger;
 }
@@ -1443,6 +1492,26 @@ export interface LocalModel {
    * Warm prompt-processing speed in tokens/s measured at the last load; absent when unknown.
    */
   prompt_tokens_per_second?: number;
+  /**
+   * Inference engine family for this model. Sent only when runner.welcome service_features names local_models_engine.
+   */
+  engine?: "llama.cpp" | "polystrata" | "strata";
+  /**
+   * Display-only engine version and backend for this model. Sent only when runner.welcome service_features names local_models_engine.
+   */
+  engine_label?: string;
+  /**
+   * Maximum concurrent request slots configured or probed for this model when loaded. Sent only when runner.welcome service_features names local_models_engine.
+   */
+  concurrency?: number;
+  /**
+   * True while a model is running its post-load max-concurrency probe before reporting loaded. Sent only when runner.welcome service_features names local_models_concurrency_probe.
+   */
+  concurrency_probing?: boolean;
+  /**
+   * Additional host system RAM used alongside GPU VRAM for hybrid offload engines. Sent only when runner.welcome service_features names local_models_engine.
+   */
+  host_ram_bytes?: number;
 }
 export interface LocalModelAvailability {
   downloadable: boolean;
@@ -1452,9 +1521,165 @@ export interface LocalModelAvailability {
  * Present only when downloadable is false.
  */
 export interface LocalModelAvailabilityReason {
-  code: "MEMORY_INSUFFICIENT" | "DISK_INSUFFICIENT" | "PLATFORM_UNSUPPORTED";
+  code:
+    | "MEMORY_INSUFFICIENT"
+    | "DISK_INSUFFICIENT"
+    | "PLATFORM_UNSUPPORTED"
+    | "GPU_UNSUPPORTED"
+    | "DRIVER_UPDATE_REQUIRED"
+    | "RUNTIME_DEPENDENCY_MISSING"
+    | "UNAVAILABLE";
   need_bytes?: NonNegativeInteger;
   have_bytes?: NonNegativeInteger;
+  /**
+   * With MEMORY_INSUFFICIENT: which memory space was short.
+   */
+  memory_kind?: "vram" | "ram" | "unified";
+  /**
+   * With GPU_UNSUPPORTED: detected GPU vendor class on this Computer.
+   */
+  gpu_vendor?: "amd" | "intel" | "none" | "unknown";
+  /**
+   * With DRIVER_UPDATE_REQUIRED: minimum CUDA version required by the pinned engine.
+   */
+  required_cuda?: string;
+  /**
+   * With DRIVER_UPDATE_REQUIRED: CUDA version reported by the installed driver.
+   */
+  detected_cuda?: string;
+  /**
+   * With DRIVER_UPDATE_REQUIRED: installed NVIDIA driver version.
+   */
+  driver_version?: string;
+  /**
+   * With RUNTIME_DEPENDENCY_MISSING: missing shared libraries such as libgomp.so.1.
+   *
+   * @minItems 1
+   * @maxItems 16
+   */
+  missing_libraries?:
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ];
+  /**
+   * With RUNTIME_DEPENDENCY_MISSING: minimum glibc version required by the engine.
+   */
+  required_glibc?: string;
+  /**
+   * With RUNTIME_DEPENDENCY_MISSING: glibc version detected on this Computer.
+   */
+  detected_glibc?: string;
 }
 /**
  * Present only while downloading.
@@ -1494,6 +1719,17 @@ export interface LocalModelError {
  */
 export interface LocalModelNote {
   code: "NO_ROOM_TO_LOAD";
+}
+/**
+ * Present only when localmodels debug mode is active and the Agent Service declared local_models_diagnostics.
+ */
+export interface LocalModelsDebugInfo {
+  mode: "tiny" | "simulate";
+  source: "env" | "state_config" | "user_config";
+  /**
+   * Local config file path when source is state_config or user_config; stripped for non-owners in the public view.
+   */
+  config_path?: string;
 }
 export interface RuntimeRegistrationObserved {
   type: "runtime.registration.observed";
@@ -1987,6 +2223,9 @@ export interface ModelInvoked {
   command_id: Id;
   runner_id: Id;
   invoke_id: Id;
+  /**
+   * context_too_long and unsupported are sent only after a runner.welcome whose service_features names model_invoke_outcomes; otherwise the Daemon downgrades them to failed and runtime_unavailable.
+   */
   outcome:
     | "completed"
     | "timed_out"
@@ -1996,6 +2235,8 @@ export interface ModelInvoked {
     | "runtime_unavailable"
     | "auth_required"
     | "runtime_incompatible"
+    | "context_too_long"
+    | "unsupported"
     | "failed";
   /**
    * The reply of a completed call. For a session call that timed_out, was output_limited or canceled, what the model had streamed so far, when anything.
@@ -2048,6 +2289,7 @@ export interface RuntimeExecutionFailure {
     | "network_error"
     | "rate_limited"
     | "model_unavailable"
+    | "local_model_unavailable"
     | "context_too_long"
     | "model_service_error"
     | "timeout"

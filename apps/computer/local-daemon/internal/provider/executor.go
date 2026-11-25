@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/protocol"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/native"
@@ -37,6 +36,8 @@ type OperationSpec struct {
 	// PermissionReview sends the Runtime's own permission prompts to the
 	// Runtime permission review (Agent Service declares it per Run).
 	PermissionReview bool
+	// StopHook asks Agent Service before a Runtime finishes a turn.
+	StopHook bool
 	// TeamHubCLIBin is the bundled TeamHub CLI directory; its command manifest
 	// names the TeamHub commands that run without review.
 	TeamHubCLIBin        string
@@ -48,6 +49,7 @@ type OperationSpec struct {
 	Model                string
 	Prompt               string
 	ResumeSessionID      string
+	PreviousSession      *PreviousSession
 	Timeout              time.Duration
 	Environment          map[string]string
 	ExtraArgs            []string
@@ -78,11 +80,14 @@ type OperationSpec struct {
 	RegistrationID          string
 	DaemonVersion           string
 	CodexVersion            string
-	TenantID                string
-	OwnerActorID            string
-	AgentID                 string
-	ComputerID              string
-	ScopeID                 string
+	// WithoutNativeWebTools turns off the Runtime's own web search and page
+	// fetch, which a model served through the localmodels gateway cannot run.
+	WithoutNativeWebTools bool
+	TenantID              string
+	OwnerActorID          string
+	AgentID               string
+	ComputerID            string
+	ScopeID               string
 	// ContextWindow is the selected model's context length in tokens as
 	// Runtime discovery resolved it; zero when unknown.
 	ContextWindow int
@@ -114,11 +119,18 @@ type Executor struct {
 	// of a models cache for a Context's new home.
 	CodexModelSessionHome string
 	PiMCPExtension        string
+	// ShellTextHook is the Daemon's own executable, which Runs start as
+	// shell-text-hook before a shell command; empty runs no hook.
+	ShellTextHook string
 }
 
 type Result struct {
-	Diagnostics        native.RuntimeFailureDiagnostics
-	FailureCode        string
+	Diagnostics native.RuntimeFailureDiagnostics
+	FailureCode string
+	// ModelLoadFailed says the Daemon could not load a local model before
+	// the Runtime started. The cause is this Computer's resources, not a
+	// provider refusing the model, so the model is not rejected.
+	ModelLoadFailed    bool
 	NativeResume       *native.NativeResumeMeasurement
 	LastUsage          map[string]native.TokenCount
 	CompactionCount    *int64
@@ -151,14 +163,14 @@ type SteerError struct {
 	Message      string
 }
 
-// PrepareProvider is the run.start of spec without input: it parks a Codex
-// or Claude process for the spec's session without submitting a turn. The
+// PrepareProvider is the run.start of spec without input: it parks a Codex,
+// Claude, or Pi process for the spec's session without submitting a turn. The
 // Run's attachments, its MCP servers and prompt, are connected when the Run
 // adopts the process, so a prepare carries none. A compatible resident is
 // left parked as it is.
 func (e Executor) PrepareProvider(ctx context.Context, spec OperationSpec) (Result, error) {
-	if spec.Provider != "codex" && spec.Provider != "claude" {
-		return Result{}, errors.New("provider prepare is supported only for Codex and Claude")
+	if spec.Provider != "codex" && spec.Provider != "claude" && spec.Provider != "pi" {
+		return Result{}, errors.New("provider prepare is supported only for Codex, Claude, and Pi")
 	}
 	spec.OperationKind = operationProviderPrepareKind
 	spec.Prompt = ""
@@ -416,14 +428,12 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			codexConfigDigest = runtimeHome.ConfigDigest
 			skills := sha256.Sum256([]byte(runtimeHome.SkillDigest + "\x00" + spec.ContextSkillDigest))
 			residentSkillDigest = hex.EncodeToString(skills[:])
-			if native.CodexSupportsDirectTools(spec.CodexVersion) {
-				mcpConfig, capabilityErr = codexDirectLocalTools(mcpConfig, spec.TrustedLocalMCPTools)
-			}
-			// A prepare binds the thread its reviewed Run reuses, so it carries the
-			// same hook as that Run; the binding fingerprint covers the hook. The
+			mcpConfig, capabilityErr = codexDirectLocalTools(mcpConfig, spec.TrustedLocalMCPTools)
+			// A prepare binds the thread its Run reuses, so it carries the same
+			// managed hooks as that Run; the binding fingerprint covers them. The
 			// Run's MCP servers are attached when it adopts the process.
-			if capabilityErr == nil && authorization.ReviewsPermissions() && native.CodexSupportsPermissionHook(spec.CodexVersion) {
-				codexHook, mcpConfig, capabilityErr = prepareCodexPermissionReview(runtimeHome.Path, teamhubCommands, mcpConfig)
+			if capabilityErr == nil && (authorization.ReviewsPermissions() || authorization.UsesStopHook()) {
+				codexHook, mcpConfig, capabilityErr = prepareCodexHooks(runtimeHome.Path, teamhubCommands, mcpConfig, authorization.ReviewsPermissions(), authorization.UsesStopHook())
 			}
 
 		case "claude":
@@ -466,7 +476,6 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 		TaskID:              spec.TaskID,
 		RuntimeID:           spec.RegistrationID,
 		ComputerVersion:     spec.DaemonVersion,
-		CodexToolVersion:    spec.CodexVersion,
 		CodexConfigArgs:     codexConfigArgs,
 		CodexConfigDigest:   codexConfigDigest,
 		PiConfigDigest:      piConfigDigest,
@@ -506,7 +515,7 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			resultCh <- result
 		}
 		var bridge *native.HumanInteractionBridge
-		if (spec.HumanInteractions || spec.PermissionReview) && spec.OperationKind == "run.start" {
+		if (spec.HumanInteractions || spec.PermissionReview || spec.StopHook) && spec.OperationKind == "run.start" {
 			bridge = native.NewHumanInteractionBridge(func(message native.Event) {
 				payload, err := json.Marshal(map[string]any{"type": "human_interaction.requested", "request": message.Input})
 				if err == nil {
@@ -521,8 +530,9 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			execution.mu.Unlock()
 			defer bridge.Close()
 		}
-		// The bridge carries both Room questions and permission reviews, but
-		// only a Context with Room questions posts Codex's native questions.
+		// The bridge carries Room questions, permission reviews, and runtime
+		// hooks, but only a Context with Room questions posts Codex's native
+		// questions.
 		var questions *native.HumanInteractionBridge
 		if spec.HumanInteractions {
 			questions = bridge
@@ -532,6 +542,10 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			reviewer = &permission.Reviewer{Requester: bridge, TeamHubCommands: teamhubCommands, ScriptScope: permission.ScriptScope(spec.AgentID, spec.ScopeID), LocalEvidence: spec.LocalEvidence, LocalAllowed: spec.LocalAllowed, Environment: permission.Environment{
 				RuntimeVersion: spec.CodexVersion, Platform: runtime.GOOS, Workspace: spec.WorkingDirectory,
 			}}
+		}
+		var stopHook native.StopHookFunc
+		if spec.UsesStopHook() {
+			stopHook = native.NewBridgeStopHook(bridge, spec.Provider, logger)
 		}
 		if spec.RegisterToolReviewer != nil {
 			release, err := spec.RegisterToolReviewer(reviewer)
@@ -548,7 +562,9 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 		runSpec := native.RunSpec{
 			HumanInteraction:      questions,
 			PermissionReviewer:    reviewer,
+			StopHook:              stopHook,
 			CodexPermissionHook:   codexHook,
+			ShellTextHook:         e.ShellTextHook,
 			RuntimeHome:           runtimeHomePath,
 			Dir:                   spec.WorkingDirectory,
 			SharedTaskLink:        permission.CodexTaskLink{Path: spec.SharedTask.WritableTaskLink, Target: spec.SharedTask.WritableTaskRoot},
@@ -565,21 +581,35 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			MCPServers:            mcpConfig,
 			Effort:                spec.ThinkingLevel,
 			ContextWindow:         spec.ContextWindow,
+			WithoutNativeWebTools: spec.WithoutNativeWebTools,
 			Title:                 spec.ThreadName,
-			AppendPrompt:          spec.SystemPrompt,
+			SystemPrompt:          spec.SystemPrompt,
 			BaseInstructions:      spec.BaseInstructions,
 			DeveloperInstructions: spec.DeveloperInstructions,
 			ExposeTurnStarted:     spec.OperationKind == "run.start",
 			ClaudePolicy:          claudePolicy,
 			Readiness:             readiness,
 		}
-		session, err := backend.Start(executionCtx, spec.Prompt, runSpec)
+		prompt := spec.Prompt
+		if spec.PreviousSession != nil && spec.ResumeSessionID == "" && spec.OperationKind == "run.start" {
+			exportCtx, cancelExport := context.WithTimeout(executionCtx, previousContextExportTimeout)
+			relPath, exported := exportPreviousContext(exportCtx, e.RuntimeHomeRoot, spec)
+			cancelExport()
+			if exported {
+				prompt = injectPreviousContextHint(prompt, relPath)
+			}
+		}
+		session, err := backend.Start(executionCtx, prompt, runSpec)
 		if err != nil {
 			execution.mu.Lock()
 			execution.done = true
 			execution.mu.Unlock()
 			close(execution.ready)
-			finish(Result{Status: "failed", Error: err.Error()})
+			failureCode := ""
+			if errors.Is(err, native.ErrSessionNotFound) {
+				failureCode = "session_not_found"
+			}
+			finish(Result{Status: "failed", FailureCode: failureCode, Error: err.Error()})
 			return
 		}
 		execution.mu.Lock()
@@ -587,9 +617,6 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 		execution.mu.Unlock()
 		close(execution.ready)
 		var executionFailure string
-		var providerResult native.Outcome
-		var ok bool
-		freshSession := false
 		if spec.OperationKind == "run.start" && spec.Provider != "codex" && spec.Provider != "claude" && spec.Provider != "pi" && spec.Provider != "antigravity" {
 			payload, marshalErr := json.Marshal(map[string]any{
 				"type": "run.started", "turn_id": stableEventID("turn", spec.TaskID),
@@ -604,64 +631,34 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 		}
 		emittedResponseText := false
 		projection := eventProjection{operationID: spec.TaskID, canYield: spec.OperationKind == "run.start"}
-		for {
-			emittedEvent := false
-			for message := range session.Events {
-				if executionFailure != "" {
+		for message := range session.Events {
+			if executionFailure != "" {
+				continue
+			}
+			if spec.OperationKind == "run.start" && message.Kind == native.EventStatus && message.Status == "running" && message.TurnID == "" {
+				continue
+			}
+			if message.Kind == native.EventText && (message.Body != "" || message.Output != "") {
+				emittedResponseText = true
+			}
+			for _, projected := range projection.project(message) {
+				payload, marshalErr := json.Marshal(projected)
+				if marshalErr != nil {
+					executionFailure = fmt.Sprintf("marshal provider event: %v", marshalErr)
+					cancelExecution()
 					continue
 				}
-				if spec.OperationKind == "run.start" && message.Kind == native.EventStatus && message.Status == "running" && message.TurnID == "" {
-					continue
-				}
-				if message.Kind == native.EventText && (message.Body != "" || message.Output != "") {
-					emittedResponseText = true
-				}
-				for _, projected := range projection.project(message) {
-					emittedEvent = true
-					payload, marshalErr := json.Marshal(projected)
-					if marshalErr != nil {
-						executionFailure = fmt.Sprintf("marshal provider event: %v", marshalErr)
-						cancelExecution()
-						continue
-					}
-					if emitErr := emit(ctx, protocol.Event{
-						Type:    protocol.EventOperationEvent,
-						SentAt:  time.Now().UTC(),
-						Payload: payload,
-					}); emitErr != nil {
-						executionFailure = fmt.Sprintf("emit provider event: %v", emitErr)
-						cancelExecution()
-					}
+				if emitErr := emit(ctx, protocol.Event{
+					Type:    protocol.EventOperationEvent,
+					SentAt:  time.Now().UTC(),
+					Payload: payload,
+				}); emitErr != nil {
+					executionFailure = fmt.Sprintf("emit provider event: %v", emitErr)
+					cancelExecution()
 				}
 			}
-			providerResult, ok = <-session.Outcome
-			if !ok || freshSession || emittedEvent || executionFailure != "" || executionCtx.Err() != nil ||
-				!startsFreshSession(spec, providerResult) {
-				break
-			}
-			// The retained session is not in this Computer's runtime home, for
-			// example one an earlier Local Computer created elsewhere. Nothing
-			// reached the Room yet, so the Run continues in a new session once;
-			// its terminal result carries the new identity the server keeps.
-			freshSession = true
-			runSpec.ResumeID, runSpec.ResumeRequired, runSpec.AssignSessionID = "", false, ""
-			if spec.Provider == "claude" || spec.Provider == "pi" {
-				runSpec.AssignSessionID = uuid.NewString()
-			}
-			logger.Warn("runtime.session.fresh_start", "provider", spec.Provider, "reason", providerResult.FailureCode)
-			slog.Warn("runner.operation.fresh_session", "operation_id", spec.TaskID, "provider", spec.Provider,
-				"agent_id", spec.AgentID, "reason", providerResult.FailureCode)
-			if session, err = backend.Start(executionCtx, spec.Prompt, runSpec); err != nil {
-				execution.mu.Lock()
-				execution.done = true
-				execution.mu.Unlock()
-				finish(Result{Status: "failed", Error: err.Error()})
-				return
-			}
-			execution.mu.Lock()
-			execution.session = session
-			execution.mu.Unlock()
 		}
+		providerResult, ok := <-session.Outcome
 		execution.mu.Lock()
 		execution.done = true
 		execution.mu.Unlock()
@@ -722,7 +719,9 @@ func normalizeMessage(message native.Event, operationID string) any {
 	if callID == "" {
 		callID = stableEventID("call", operationID+"\x00"+message.ToolName+"\x00"+message.Body)
 	}
-	toolName := message.ToolName
+	// The Runner Gateway caps a tool name at 200 characters and fails the
+	// Operation on a longer one; a Runtime may name a tool by its arguments.
+	toolName := clip(message.ToolName, 200)
 	if toolName == "" {
 		toolName = "provider_tool"
 	}
@@ -819,27 +818,34 @@ func codexDirectLocalTools(mcpConfig json.RawMessage, localTools []string) (json
 	return json.Marshal(parsed)
 }
 
-// prepareCodexPermissionReview readies a Context's CODEX_HOME for a reviewed
-// Run: the execpolicy rules that allow read-only and TeamHub commands, managed
-// MCP tools that always ask, and the PermissionRequest hook that reaches this
-// Daemon. Without the hook a reviewed Run cannot start.
-func prepareCodexPermissionReview(codexHome string, teamhubCommands []permission.TeamHubCommand, mcpConfig json.RawMessage) (*permission.CodexHook, json.RawMessage, error) {
-	if err := permission.CodexWriteRules(codexHome, permission.CodexRules(teamhubCommands)); err != nil {
-		return nil, nil, fmt.Errorf("write Codex permission rules: %w", err)
-	}
-	mcpConfig, err := permission.CodexPromptMCPTools(mcpConfig)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Codex MCP configuration is invalid: %w", err)
+// prepareCodexHooks readies a Context's CODEX_HOME for managed Codex hooks:
+// when review is enabled, execpolicy rules and MCP prompt overrides; for either
+// review or stop hooks, the loopback Daemon hook endpoint and config.
+func prepareCodexHooks(codexHome string, teamhubCommands []permission.TeamHubCommand, mcpConfig json.RawMessage, review, stop bool) (*permission.CodexHook, json.RawMessage, error) {
+	if review {
+		if err := permission.CodexWriteRules(codexHome, permission.CodexRules(teamhubCommands)); err != nil {
+			return nil, nil, fmt.Errorf("write Codex permission rules: %w", err)
+		}
+		var err error
+		mcpConfig, err = permission.CodexPromptMCPTools(mcpConfig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Codex MCP configuration is invalid: %w", err)
+		}
 	}
 	endpoint, err := permission.CodexSharedEndpoint()
 	if err != nil {
-		return nil, nil, fmt.Errorf("start Codex permission hook endpoint: %w", err)
+		return nil, nil, fmt.Errorf("start Codex hook endpoint: %w", err)
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return nil, nil, fmt.Errorf("locate the Daemon for the Codex permission hook: %w", err)
+		return nil, nil, fmt.Errorf("locate the Daemon for the Codex hook: %w", err)
 	}
-	return &permission.CodexHook{Endpoint: endpoint, Config: endpoint.HooksConfig(executable)}, mcpConfig, nil
+	return &permission.CodexHook{
+		Endpoint:          endpoint,
+		Config:            endpoint.HooksConfigFor(executable, review, stop),
+		ReviewPermissions: review,
+		StopHook:          stop,
+	}, mcpConfig, nil
 }
 
 // ReviewsPermissions reports whether this Operation answers the Runtime's own
@@ -849,9 +855,8 @@ func (spec OperationSpec) ReviewsPermissions() bool {
 	return spec.PermissionReview && spec.OperationKind == "run.start"
 }
 
-// startsFreshSession reports whether a Run whose retained native session the
-// Runtime refused may continue in a new session instead of failing.
-func startsFreshSession(spec OperationSpec, result native.Outcome) bool {
-	return !spec.ResumeAfterYield && spec.OperationKind == "run.start" && spec.ResumeSessionID != "" &&
-		result.Status != "completed" && result.FailureCode == "session_not_found"
+// UsesStopHook reports whether this Operation asks Agent Service before a
+// Runtime finishes its turn.
+func (spec OperationSpec) UsesStopHook() bool {
+	return spec.StopHook && spec.OperationKind == "run.start"
 }

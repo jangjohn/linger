@@ -12,12 +12,18 @@ import { MessageMarkdown } from "../chat/message-markdown";
 import { ActorAvatar } from "../members/actor-avatar";
 import { avatarKeyFromSeed } from "../members/agent-avatar";
 import { formatBytes } from "@/lib/format-bytes";
+import { commonMessages } from "@/i18n/common.messages";
+import { formatLocale } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
+
+import { sharedConversationMessages } from "./shared-conversation.messages";
 
 export function SharedRoomHistoryPage() {
   const token = useLocation().hash.slice(1);
   return <SharedHistory key={token} token={token} />;
 }
 function SharedHistory({ token }: { token: string }) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const valid = /^room_share_[A-Za-z0-9_-]{43}$/.test(token);
   const query = useInfiniteQuery({
@@ -37,33 +43,37 @@ function SharedHistory({ token }: { token: string }) {
       <header className="border-b border-app-border px-6 py-5">
         <div className="mx-auto max-w-3xl">
           <h1 className="text-lg">
-            {share?.room_name ?? "Shared conversation"}
+            {share?.room_name ?? t(sharedConversationMessages.title)}
           </h1>
           <p className="mt-1 text-xs text-app-muted">
-            Read-only snapshot
-            {share ? ` · ${formatDateTime(share.created_at)}` : ""}
+            {share
+              ? t(sharedConversationMessages.snapshotFrom, {
+                  date: formatDateTime(
+                    share.created_at,
+                    undefined,
+                    formatLocale(),
+                  ),
+                })
+              : t(sharedConversationMessages.snapshot)}
           </p>
         </div>
       </header>
       <div className="mx-auto max-w-3xl px-6 py-6">
         {!valid || query.error ? (
-          <p role="alert">
-            This shared conversation is unavailable or has been revoked. Ask the
-            person who shared it for a new link.
-          </p>
+          <p role="alert">{t(sharedConversationMessages.unavailable)}</p>
         ) : query.isPending ? (
           <p
             className="flex items-center gap-2 text-sm text-app-muted"
             role="status"
           >
             <Spinner size={16} />
-            Loading conversation…
+            {t(sharedConversationMessages.loading)}
           </p>
         ) : (
           <>
             {share?.message_count === 0 ? (
               <p className="text-sm text-app-muted">
-                No messages had been sent when this snapshot was created.
+                {t(sharedConversationMessages.empty)}
               </p>
             ) : null}
             <div className="space-y-7">
@@ -83,7 +93,7 @@ function SharedHistory({ token }: { token: string }) {
                 loading={query.isFetchingNextPage}
                 onClick={() => void query.fetchNextPage()}
               >
-                Load more messages
+                {t(sharedConversationMessages.loadMore)}
               </Button>
             ) : null}
           </>
@@ -99,14 +109,17 @@ function SnapshotMessage({
   message: RoomHistoryMessage;
   token: string;
 }) {
+  const t = useT();
   return (
     <article
       className="flex gap-3"
-      aria-label={`Message from ${message.author.display_name}`}
+      aria-label={t(sharedConversationMessages.messageFrom, {
+        name: message.author.display_name,
+      })}
     >
       {message.avatar_image ? (
         <img
-          alt={`${message.author.display_name} avatar`}
+          alt={t(commonMessages.avatar, { name: message.author.display_name })}
           src={message.avatar_image}
           className="size-8 shrink-0 rounded-full object-cover"
         />
@@ -128,7 +141,7 @@ function SnapshotMessage({
             className="text-xs text-app-muted"
             dateTime={message.created_at}
           >
-            {formatDateTime(message.created_at)}
+            {formatDateTime(message.created_at, undefined, formatLocale())}
           </time>
         </header>
         <div className="break-words text-sm leading-6">
@@ -191,6 +204,7 @@ function SnapshotImage({
   assetId: string;
   filename: string;
 }) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const [url, setUrl] = useState("");
   const [failed, setFailed] = useState(false);
@@ -220,7 +234,9 @@ function SnapshotImage({
     />
   ) : (
     <p className="text-xs text-app-muted">
-      {failed ? `Image unavailable: ${filename}` : "Loading image..."}
+      {failed
+        ? t(sharedConversationMessages.imageUnavailable, { filename })
+        : t(sharedConversationMessages.loadingImage)}
     </p>
   );
 }

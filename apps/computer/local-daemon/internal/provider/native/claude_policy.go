@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -34,12 +35,28 @@ type ClaudeToolPolicy struct {
 // Without it every request carries every MCP tool definition.
 var claudeBuiltinTools = []string{"Read", "Glob", "Grep", "Write", "Edit", "Bash", "TodoWrite", "Skill", "Agent", "WebSearch", "WebFetch", "ToolSearch"}
 
+// claudeWebTools are left out of --tools for a model served through the
+// localmodels gateway, which cannot run Anthropic's server-side web search.
+var claudeWebTools = []string{"WebSearch", "WebFetch"}
+
+// claudeLaunchTools is the --tools list of one launch.
+func claudeLaunchTools(withoutWebTools bool) []string {
+	if !withoutWebTools {
+		return claudeBuiltinTools
+	}
+	return slices.DeleteFunc(slices.Clone(claudeBuiltinTools), func(name string) bool {
+		return slices.Contains(claudeWebTools, name)
+	})
+}
+
 const (
 	claudeInitializeRequestID = "linger-session-restore"
 	claudeHookCallbackID      = "hook_0"
 	// claudeSteerHookID answers the main agent's tool results, which carry
 	// steered input.
 	claudeSteerHookID = "hook_steer"
+	// claudeStopHookID answers Claude's Stop hook before a turn ends.
+	claudeStopHookID = "hook_stop"
 )
 
 // authorizedTools is the built-in list followed by qualifying MCP tools in
@@ -76,6 +93,9 @@ func (p *ClaudeToolPolicy) denyReason(tool string, input map[string]any, agentID
 	}
 	if (tool == "Agent" || tool == "Bash") && (input["run_in_background"] == true || input["background"] == true) {
 		return "background execution disabled"
+	}
+	if command, _ := input["command"].(string); tool == "Bash" && permission.ShellTextRewritten(command) {
+		return permission.ShellTextMessage
 	}
 	if tool == "Skill" {
 		name, _ := input["skill"].(string)
@@ -130,12 +150,15 @@ func claudeSettings(contextWindow int) string {
 	// The project setting source loads the Context's own Skills, but it also
 	// loads every CLAUDE.md and AGENTS.md from the workspace up to the root,
 	// which reaches the user's home. Agent instructions come only from the
-	// appended system prompt, so no CLAUDE.md is read.
+	// system prompt, so no CLAUDE.md is read. An empty attribution stops
+	// Claude from telling the model to sign commits and PRs as Claude Code,
+	// which is wrong for an Agent and for any non-Claude model.
 	settingsEnv := map[string]string{"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1"}
 	settings := map[string]any{
 		"disableBundledSkills": true, "syncClaudeAiSkills": false, "syncClaudeAiPlugins": false,
 		"disableAgentView": true, "disableRemoteControl": true, "autoMemoryEnabled": false,
 		"cleanupPeriodDays": 36500, "autoCompactWindow": 200000, "env": settingsEnv,
+		"attribution": map[string]string{"commit": "", "pr": ""},
 	}
 	if contextWindow > 0 {
 		// Claude takes a model it does not know for a 200k one and a [1m]
@@ -176,7 +199,7 @@ func claudeBuildArgv(logger *slog.Logger, spec RunSpec) (shaped, launch []string
 		"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
 		"--permission-mode", "acceptEdits", "--disallowedTools", "AskUserQuestion", "--replay-user-messages",
 		"--permission-prompt-tool", "stdio",
-		"--tools", strings.Join(claudeBuiltinTools, ","),
+		"--tools", strings.Join(claudeLaunchTools(spec.WithoutNativeWebTools), ","),
 		"--strict-mcp-config",
 		"--setting-sources", "project,user",
 		"--managed-settings", claudeManagedSettings(policy),
@@ -206,9 +229,19 @@ func claudeBuildArgv(logger *slog.Logger, spec RunSpec) (shaped, launch []string
 }
 
 // claudeInitializeFrame is the first frame of every spawned process. Its
-// exact bytes are part of the resident shape.
+// exact bytes are part of the resident shape. systemPrompt replaces Claude
+// Code's own prompt, which describes a Claude coding assistant and lists
+// Claude model IDs, so a non-Claude model would take it for its identity.
+// Claude still sends its one-line SDK preamble ahead of it. The prompt ends
+// with the working directory, as Pi's does: Claude 2.1.322 also sends it in
+// a separate environment message, but an older supported release may give
+// it only inside the prompt this replaces.
 func claudeInitializeFrame(spec RunSpec) []byte {
 	skills := append([]string{}, spec.ClaudePolicy.SkillNames...)
+	systemPrompt := spec.SystemPrompt
+	if spec.Dir != "" {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\nCurrent working directory: " + spec.Dir)
+	}
 	encoded, _ := json.Marshal(map[string]any{
 		"type":       "control_request",
 		"request_id": claudeInitializeRequestID,
@@ -219,8 +252,9 @@ func claudeInitializeFrame(spec RunSpec) []byte {
 				"PreToolUse":         []any{map[string]any{"hookCallbackIds": []string{claudeHookCallbackID}}},
 				"PostToolUse":        []any{map[string]any{"hookCallbackIds": []string{claudeSteerHookID}}},
 				"PostToolUseFailure": []any{map[string]any{"hookCallbackIds": []string{claudeSteerHookID}}},
+				"Stop":               []any{map[string]any{"hookCallbackIds": []string{claudeStopHookID}}},
 			},
-			"appendSystemPrompt":   spec.AppendPrompt,
+			"systemPrompt":         systemPrompt,
 			"systemPromptSnapshot": false,
 		},
 	})
@@ -264,10 +298,11 @@ type claudeControlRequest struct {
 }
 
 type claudeHookInput struct {
-	HookEventName string          `json:"hook_event_name"`
-	ToolName      string          `json:"tool_name"`
-	ToolInput     json.RawMessage `json:"tool_input"`
-	AgentID       string          `json:"agent_id"`
+	HookEventName  string          `json:"hook_event_name"`
+	ToolName       string          `json:"tool_name"`
+	ToolInput      json.RawMessage `json:"tool_input"`
+	AgentID        string          `json:"agent_id"`
+	StopHookActive bool            `json:"stop_hook_active"`
 }
 
 // claudeObject decodes a JSON object; null, absent and non-objects fail.

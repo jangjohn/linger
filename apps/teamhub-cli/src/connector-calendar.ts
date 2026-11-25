@@ -5,6 +5,7 @@ import {
   option,
   values,
 } from "./command-input.js";
+import { conflictingFlags } from "./input-issues.js";
 import {
   booleanSchema,
   email,
@@ -28,7 +29,7 @@ import {
   type ConnectorRuntime,
   type Json,
 } from "./connector-runtime.js";
-import { ConnectorError as CliError } from "./errors.js";
+import { CliError } from "./errors.js";
 import {
   array,
   calendarWriteSchema,
@@ -294,7 +295,7 @@ export const calendarCommandDefinitions: CommandDefinition[] = (
         if (action === "create") {
           input.start = rfc3339(start, "--start");
           if (end !== undefined && duration !== undefined)
-            usage("Choose --end or --duration.");
+            throw conflictingFlags(["--end", "--duration"]);
           input.end =
             end === undefined
               ? new Date(
@@ -505,7 +506,15 @@ export function commonFreeSlots(
         busy.push([Math.max(a, start), Math.min(b, end)]);
     }
   }
-  busy.sort((x, y) => x[0] - y[0]);
+  return freeSlotsFromBusy(busy, start, end, minutes);
+}
+export function freeSlotsFromBusy(
+  busy: readonly [number, number][],
+  start: number,
+  end: number,
+  minutes: number,
+): Json[] {
+  const sorted = [...busy].sort((x, y) => x[0] - y[0]);
   const slots: Json[] = [];
   const add = (a: number, b: number) => {
     if (b - a >= minutes * 60000)
@@ -516,15 +525,17 @@ export function commonFreeSlots(
       });
   };
   let position = start;
-  for (const [a, b] of busy) {
+  for (const [a, b] of sorted) {
     if (a > position) add(position, a);
     position = Math.max(position, b);
   }
   add(position, end);
   return slots;
 }
-const utc = (ms: number) => new Date(ms).toISOString().replace(".000Z", "Z");
-function validDate(v: string): boolean {
+export function utc(ms: number): string {
+  return new Date(ms).toISOString().replace(".000Z", "Z");
+}
+export function validDate(v: string): boolean {
   const date = new Date(v + "T00:00:00Z");
   return (
     /^\d{4}-\d{2}-\d{2}$/u.test(v) &&
@@ -532,7 +543,7 @@ function validDate(v: string): boolean {
     date.toISOString().slice(0, 10) === v
   );
 }
-function timeWindow(from: unknown, to: unknown, days: number): Json {
+export function timeWindow(from: unknown, to: unknown, days: number): Json {
   const start = rfc3339(from, "--from"),
     end = rfc3339(to, "--to");
   const duration = Date.parse(end) - Date.parse(start);
@@ -540,14 +551,14 @@ function timeWindow(from: unknown, to: unknown, days: number): Json {
     usage(`The time window must be positive and no longer than ${days} days.`);
   return { from: start, to: end };
 }
-function validateTimeZone(zone: string): void {
+export function validateTimeZone(zone: string): void {
   try {
     new Intl.DateTimeFormat("en", { timeZone: zone }).format();
   } catch {
     usage("--timezone requires a valid IANA time zone.");
   }
 }
-function dateInZone(instant: Date, zone: string): string {
+export function dateInZone(instant: Date, zone: string): string {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: zone,
     year: "numeric",
@@ -555,8 +566,12 @@ function dateInZone(instant: Date, zone: string): string {
     day: "2-digit",
   }).format(instant);
 }
-function midnight(date: string, zone: string): string {
-  const target = Date.parse(date + "T00:00:00Z");
+export function wallTimeToInstant(
+  localIso: string,
+  zone: string,
+): number | undefined {
+  const target = Date.parse(`${localIso}Z`);
+  if (!Number.isFinite(target)) return undefined;
   let guess = target;
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: zone,
@@ -575,13 +590,19 @@ function midnight(date: string, zone: string): string {
     const wall = Date.parse(
       `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}Z`,
     );
-    if (wall === target) return new Date(guess).toISOString();
+    if (wall === target) return guess;
     guess += target - wall;
   }
-  throw new CliError(
-    "unsupported_combination",
-    "This local date has no representable midnight; use an explicit time window.",
-  );
+  return undefined;
+}
+export function midnight(date: string, zone: string): string {
+  const instant = wallTimeToInstant(`${date}T00:00:00`, zone);
+  if (instant === undefined)
+    throw new CliError(
+      "unsupported_combination",
+      "This local date has no representable midnight; use an explicit time window.",
+    );
+  return new Date(instant).toISOString();
 }
 async function executeCalendar(
   action: Action,

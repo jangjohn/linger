@@ -29,9 +29,26 @@ import {
   closeAbandonedVoiceSession,
   closeVoiceSessionQuietly,
   observeAudioLevel,
+  sessionReadinessFailure,
 } from "./voice-media-room";
 import { asError } from "@linger/service-kit";
 import { VoiceModeDisconnectedError } from "./voice-mode-errors";
+import { translate } from "@/i18n/language";
+import { voiceSessionMessages as m } from "./voice-session.messages";
+
+/**
+ * The person's next step for the Runtime's failure code. A Runtime that
+ * predates the code, or a code without a step of its own, keeps the generic
+ * message.
+ */
+function runtimeFailureMessage(code: string | undefined) {
+  if (code === "asr_auth_rejected") return m.runtimeKeyRejected;
+  if (code === "asr_permission_denied") return m.runtimeKeyNotPermitted;
+  if (code === "asr_balance_exhausted") return m.runtimeBalanceExhausted;
+  if (code?.startsWith("network_") || code === "asr_connect_timeout")
+    return m.runtimeUnreachable;
+  return m.runtimeStopped;
+}
 
 export async function openVoiceMode(input: {
   client: TeamHubClient;
@@ -90,7 +107,7 @@ export async function openVoiceMode(input: {
   try {
     signal.throwIfAborted();
     const events = input.events;
-    if (!events) throw new Error("Voice transcription is unavailable.");
+    if (!events) throw new Error(translate(m.transcriptionUnavailable));
     const creating = teamHubData(
       client.api.POST("/v0/rooms/{roomId}/voice-sessions", {
         params: { path: { roomId: input.roomId } },
@@ -117,7 +134,7 @@ export async function openVoiceMode(input: {
     session = await bounded(creating, 5_000, signal);
     signal.throwIfAborted();
     if (session.purpose !== "chat_dictation")
-      throw new Error("The server did not confirm a chat-only voice session.");
+      throw new Error(translate(m.dictationNotConfirmed));
     const sessionId = session.id;
     const media = await publishVoiceMicrophone({
       livekit,
@@ -130,9 +147,7 @@ export async function openVoiceMode(input: {
         created.on(RoomEvent.Disconnected, () => {
           if (!closed && !stopping)
             input.fail(
-              new VoiceModeDisconnectedError(
-                "Voice connection was lost. Your unsent text is kept.",
-              ),
+              new VoiceModeDisconnectedError(translate(m.connectionLost)),
             );
         });
         created.on(RoomEvent.MediaDevicesError, (error) => {
@@ -165,7 +180,11 @@ export async function openVoiceMode(input: {
             if (participant.identity !== runtimeIdentity) return;
             if (!closed && !stopping && failureForCurrentGeneration) {
               readinessFailure = new Error(
-                "Voice Runtime stopped before readiness. Check the configured ASR provider and try again.",
+                translate(
+                  runtimeFailureMessage(
+                    currentAttributes["linger.voice_dictation_failure_code"],
+                  ),
+                ),
               );
               input.fail(readinessFailure);
             }
@@ -175,7 +194,7 @@ export async function openVoiceMode(input: {
           if (!closed && !stopping && runtimeIdentity === participant.identity)
             input.fail(
               new VoiceModeDisconnectedError(
-                "Voice recognition disconnected. Your unsent text is kept.",
+                translate(m.recognitionDisconnected),
               ),
             );
         });
@@ -184,7 +203,7 @@ export async function openVoiceMode(input: {
         if (!closed && !stopping)
           input.fail(
             new VoiceModeDisconnectedError(
-              "Microphone disconnected. Your unsent text is kept.",
+              translate(m.microphoneDisconnectedKept),
             ),
           );
       },
@@ -258,9 +277,7 @@ export async function openVoiceMode(input: {
       onMode() {},
       onAccessLost() {
         if (!closed && !stopping)
-          input.fail(
-            new Error("Voice access was lost. Your unsent text is kept."),
-          );
+          input.fail(new Error(translate(m.accessLost)));
       },
     });
     const readyDeadline = Date.now() + 15_000;
@@ -277,12 +294,11 @@ export async function openVoiceMode(input: {
         signal,
       );
       if (current.purpose !== "chat_dictation")
-        throw new Error("Voice Mode authorization changed.");
+        throw new Error(translate(m.authorizationChanged));
       inputStartedOffsetMs = current.input_started_offset_ms;
-      if (current.last_failure_code)
-        throw new Error(
-          `Voice Runtime is unavailable (${current.last_failure_code}). Check the ASR provider and try again.`,
-        );
+      const failure = sessionReadinessFailure(current);
+      if (failure)
+        throw new Error(translate(m.runtimeUnavailable, { code: failure }));
       if (current.input_ready_generation === credential.generation) {
         for (const participant of media.room.remoteParticipants.values())
           if (
@@ -300,9 +316,7 @@ export async function openVoiceMode(input: {
       }
       if (feedActivity) break;
       if (Date.now() >= readyDeadline)
-        throw new Error(
-          "Voice Runtime did not become ready within 15 seconds. Check that the Voice Runtime and ASR provider are running, then try again.",
-        );
+        throw new Error(translate(m.runtimeNotReady, { seconds: 15 }));
       await waitForVoiceDelay(200, signal);
       signal.throwIfAborted();
     }
@@ -312,7 +326,7 @@ export async function openVoiceMode(input: {
         `voice-commit-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const accepted = acknowledgement(
         15_000,
-        "Final voice text did not arrive. Your draft is kept; try again.",
+        translate(m.finalTextMissing),
         feedAbort.signal,
       );
       // Register before POST: a fast Runtime may publish its final before the
@@ -351,11 +365,7 @@ export async function openVoiceMode(input: {
           let failure: unknown;
           const drain = new AbortController();
           const drainTimer = setTimeout(() => {
-            drain.abort(
-              new Error(
-                "Voice shutdown could not confirm the last words. Your draft is kept.",
-              ),
-            );
+            drain.abort(new Error(translate(m.shutdownUnconfirmed)));
           }, 15_000);
           const drainSignal = AbortSignal.any([feedAbort.signal, drain.signal]);
           try {
@@ -376,9 +386,7 @@ export async function openVoiceMode(input: {
                 current.purpose !== "chat_dictation" ||
                 current.credential_generation !== credential.generation
               )
-                throw new Error(
-                  "Voice input identity changed during shutdown. Your draft is kept.",
-                );
+                throw new Error(translate(m.identityChanged));
               const started = current.input_started_offset_ms;
               const ended = current.input_ended_offset_ms;
               if (
@@ -389,9 +397,7 @@ export async function openVoiceMode(input: {
               )
                 break;
               if (current.last_failure_code || current.status === "closed")
-                throw new Error(
-                  "Voice shutdown could not confirm the last words. Your draft is kept.",
-                );
+                throw new Error(translate(m.shutdownUnconfirmed));
               await waitForVoiceDelay(200, drainSignal);
               drainSignal.throwIfAborted();
             }

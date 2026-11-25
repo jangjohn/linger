@@ -154,13 +154,25 @@ describe("local repository gate", { timeout: 60_000 }, () => {
     expect(result.stderr).toContain("Usage: BASE=<target-ref>");
   });
 
-  it("runs commitlint, the env inventory, changed-file format and lint, and the repository checks", () => {
+  it("runs commitlint, the env inventory, changed-file format and lint, and skips script tests when scripts are untouched", () => {
     const result = runGate();
     expect(result.status).toBe(0);
     expect(result.commands).toEqual([
       expect.stringMatching(/^pnpm exec commitlint --from \S+ --to \S+/),
       "pnpm env:inventory:check",
       "pnpm exec prettier --check apps/web/src/example.ts",
+      "make check-docs",
+    ]);
+  });
+
+  it("runs check-scripts-fast when a script or script-tested path changes", () => {
+    const result = runGate({ changedPath: "scripts/new.mjs" });
+    expect(result.status).toBe(0);
+    expect(result.commands).toEqual([
+      expect.stringMatching(/^pnpm exec commitlint --from \S+ --to \S+/),
+      "pnpm env:inventory:check",
+      "pnpm exec prettier --check scripts/new.mjs",
+      "pnpm exec eslint scripts/new.mjs",
       "make check-scripts-fast check-docs",
     ]);
   });
@@ -171,6 +183,7 @@ describe("local repository gate", { timeout: 60_000 }, () => {
     });
     expect(ideographs.status).not.toBe(0);
     expect(ideographs.stderr).toContain("English-only");
+    expect(ideographs.commands).not.toContain("make check-docs");
     expect(ideographs.commands).not.toContain(
       "make check-scripts-fast check-docs",
     );
@@ -180,6 +193,40 @@ describe("local repository gate", { timeout: 60_000 }, () => {
         'export const sample = "\u3072\u3089\u304c\u306a\u3002";\n',
     });
     expect(kana.status).toBe(0);
+  });
+
+  it("allows CJK ideographs only in the translation catalogs", () => {
+    const changedContent = '{ "greeting": "\u4f60\u597d" }\n';
+    for (const changedPath of [
+      "apps/web/src/i18n/locales/zh-CN.json",
+      "apps/desktop/src/i18n/locales/zh-CN.json",
+    ]) {
+      const catalog = runGate({ changedPath, changedContent });
+      expect(catalog.status).toBe(0);
+      expect(catalog.commands).toContain(
+        `pnpm exec prettier --check ${changedPath}`,
+      );
+    }
+
+    for (const changedPath of [
+      "apps/web/src/i18n/zh-CN.json",
+      "apps/web/src/i18n/locales.json",
+      "apps/desktop/src/i18n/zh-CN.json",
+      "apps/desktop/src/i18n/locales.json",
+      "apps/desktop/src/shell/setup.html",
+      "apps/desktop/locales/zh-CN.json",
+    ]) {
+      const elsewhere = runGate({ changedPath, changedContent });
+      expect(elsewhere.status).not.toBe(0);
+      expect(elsewhere.stderr).toContain("English-only");
+    }
+
+    const worktree = runGate({
+      worktree: true,
+      changedPath: "apps/web/src/i18n/locales/zh-CN.json",
+      changedContent,
+    });
+    expect(worktree.status).toBe(0);
   });
 
   it("formats and lints only existing changed files outside published Skill versions", () => {
@@ -257,7 +304,7 @@ describe("local repository gate", { timeout: 60_000 }, () => {
   it("diffs from the merge base when the target ref moved ahead", () => {
     const result = runGate({ advancedTarget: true });
     expect(result.status).toBe(0);
-    expect(result.commands.at(-1)).toBe("make check-scripts-fast check-docs");
+    expect(result.commands.at(-1)).toBe("make check-docs");
     expect(result.commands[0]).toContain(`--from ${result.base} `);
   });
 });

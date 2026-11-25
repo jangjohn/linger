@@ -395,6 +395,16 @@ describe("Room navigation", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Library" })).toBeVisible();
   });
+
+  it("keeps the Work Items Dashboard out of the primary navigation rail", async () => {
+    const fixture = await navigationFixture();
+
+    renderNavigation(fixture, new QueryClient());
+
+    expect(
+      screen.queryByRole("link", { name: "Dashboard" }),
+    ).not.toBeInTheDocument();
+  });
 });
 
 async function navigationFixture() {

@@ -613,6 +613,21 @@ describe("TeamHub routes", () => {
     expect(screen.getByRole("button", { name: "Open Messages" })).toBeVisible();
   });
 
+  it("renders the in-shell not-found page for bare /t/:tenantId/dashboard", async () => {
+    const runtime = createTestTeamHubRuntime();
+    const queryClient = testQueryClient();
+    const router = createMemoryRouter(createAppRoutes(queryClient, runtime), {
+      initialEntries: ["/t/tenant-northstar/dashboard"],
+    });
+
+    renderApp(queryClient, runtime, router);
+
+    expect(
+      await screen.findByRole("heading", { name: "Page not found" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open Messages" })).toBeVisible();
+  });
+
   it("preloads the Room chat chunk from /, /t/:tenantId/rooms, and /t/:tenantId/rooms/:roomId loaders", async () => {
     const runtime = createTestTeamHubRuntime();
     const queryClient = testQueryClient();

@@ -59,9 +59,10 @@ func (a *App) resolveConnectorAccount(c *gin.Context) {
 		a.writeAgentAPIError(c, 400, api.AgentApiErrorCodeInvalidInput, "Invalid application key or account selector")
 		return
 	}
-	// No account can be connected without the deployment's Composio key, so
-	// the user is asked for the key first; the Agent then asks again.
-	if !a.externalSources.ProviderConfigured() {
+	// No Composio app can be connected without the deployment's Composio key,
+	// so the user is asked for the key first; the Agent then asks again.
+	// Feishu Mail connects through the owner's lark-cli instead.
+	if !a.externalSources.ProviderConfigured() && input.AppKey != externalsource.FeishuMailAppKey {
 		if !slices.ContainsFunc(a.externalSources.ListApps(), func(app externalsource.ExternalApp) bool { return app.Key == input.AppKey }) {
 			a.writeAgentAPIError(c, 400, api.AgentApiErrorCodeInvalidInput, "Unsupported application")
 			return
@@ -101,7 +102,7 @@ func (a *App) resolveConnectorAccount(c *gin.Context) {
 	if isConnectionIDSelector(selector) {
 		requestedAccount = ""
 	}
-	if roomID, card, ok := a.postConnectorCard(c, token, prompt, typedcard.DecisionCommand{
+	if roomID, card, ok := a.postConnectorCard(c, token, "list_connected_apps", prompt, typedcard.DecisionCommand{
 		ConnectionAuth: &typedcard.ConnectionAuthDecision{Prompt: prompt, AppKey: input.AppKey, Account: requestedAccount, ReusePending: true},
 	}); ok {
 		c.JSON(200, gin.H{"status": "authorization_required", "room_id": roomID, "message_id": card.MessageID, "interaction_id": card.DecisionID})
@@ -128,7 +129,7 @@ func (a *App) requestProviderKey(c *gin.Context, token, appKey string) {
 	} else {
 		appKey = ""
 	}
-	if _, _, ok := a.postConnectorCard(c, token, prompt, typedcard.DecisionCommand{
+	if _, _, ok := a.postConnectorCard(c, token, "list_connected_apps", prompt, typedcard.DecisionCommand{
 		ProviderKey: &typedcard.ProviderKeyDecision{Prompt: prompt, AppKey: appKey},
 	}); ok {
 		a.writeAgentAPIError(c, http.StatusConflict, api.AgentApiErrorCodeProviderKeyRequired,
@@ -147,11 +148,11 @@ func (a *App) askForProviderKey(c *gin.Context, token, appKey string, err error)
 }
 
 // postConnectorCard posts the card that asks the Agent's Human for what a
-// connector command still needs. It writes the error response itself and
-// reports whether the card was posted.
-func (a *App) postConnectorCard(c *gin.Context, token, prompt string, command typedcard.DecisionCommand) (string, typedcard.CreateResult, bool) {
+// command still needs; action is the command's business action. It writes
+// the error response itself and reports whether the card was posted.
+func (a *App) postConnectorCard(c *gin.Context, token, action, prompt string, command typedcard.DecisionCommand) (string, typedcard.CreateResult, bool) {
 	c.Header("Cache-Control", "no-store")
-	auth, err := a.agentAuth.Authorize(c.Request.Context(), token, "list_connected_apps")
+	auth, err := a.agentAuth.Authorize(c.Request.Context(), token, action)
 	if a.writeAgentAuthError(c, "request connector authorization", err) {
 		return "", typedcard.CreateResult{}, false
 	}

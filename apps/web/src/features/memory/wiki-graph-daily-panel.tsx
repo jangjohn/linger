@@ -12,6 +12,7 @@ import {
 import { ReadOnlyBlockNoteDocument } from "@/components/read-only-blocknote-document";
 import { useDocumentAnchorLinks } from "@/components/document-anchor-links";
 import { Button } from "@/components/ui/button";
+import { useT } from "@/i18n/use-translation";
 import { resolveMemoryDocumentLink } from "./memory-document-links";
 
 import {
@@ -21,15 +22,17 @@ import {
   usePeriodReports,
   type PeriodReportKind,
 } from "./wiki-period-reports";
+import { wikiTimelineMessages as m } from "./wiki-timeline.messages";
+/** What each handle is called on a Daily and on a Weekly report. */
 const RESIZE_HANDLES = {
-  n: "top edge",
-  s: "bottom edge",
-  e: "right edge",
-  w: "left edge",
-  ne: "top right corner",
-  nw: "top left corner",
-  se: "bottom right corner",
-  sw: "bottom left corner",
+  n: [m.resizeDailyTop, m.resizeWeeklyTop],
+  s: [m.resizeDailyBottom, m.resizeWeeklyBottom],
+  e: [m.resizeDailyRight, m.resizeWeeklyRight],
+  w: [m.resizeDailyLeft, m.resizeWeeklyLeft],
+  ne: [m.resizeDailyTopRight, m.resizeWeeklyTopRight],
+  nw: [m.resizeDailyTopLeft, m.resizeWeeklyTopLeft],
+  se: [m.resizeDailyBottomRight, m.resizeWeeklyBottomRight],
+  sw: [m.resizeDailyBottomLeft, m.resizeWeeklyBottomLeft],
 } as const;
 type ResizeDirection = keyof typeof RESIZE_HANDLES;
 interface WindowBox {
@@ -110,7 +113,8 @@ export function WikiGraphDailyPanel({
   kind?: PeriodReportKind;
   onClose: () => void;
 }) {
-  const label = kind === "daily" ? "Daily" : "Weekly";
+  const t = useT();
+  const isDaily = kind === "daily";
   const contentRef = useRef<HTMLDivElement>(null);
   const windowRef = useRef<HTMLElement>(null);
   const gesture = useRef<{
@@ -248,7 +252,7 @@ export function WikiGraphDailyPanel({
       />
       <aside
         ref={windowRef}
-        aria-label={`${label} report`}
+        aria-label={t(isDaily ? m.dailyReport : m.weeklyReport)}
         className="wiki-graph-daily-panel"
         style={box ?? undefined}
         onPointerMove={moveGesture}
@@ -264,16 +268,20 @@ export function WikiGraphDailyPanel({
           onPointerDown={(event) => beginGesture(event, "move")}
         >
           <div className="min-w-0">
-            <p className="wiki-graph-daily-eyebrow">{label} summary</p>
+            <p className="wiki-graph-daily-eyebrow">
+              {t(isDaily ? m.dailySummary : m.weeklySummary)}
+            </p>
             <h2>
               <time dateTime={day}>{periodLabel(day, kind)}</time>
             </h2>
           </div>
           <div className="flex shrink-0 items-center gap-1">
             <Button
-              aria-label={`Toggle ${label} contents`}
+              aria-label={t(
+                isDaily ? m.toggleDailyContents : m.toggleWeeklyContents,
+              )}
               aria-expanded={tocOpen}
-              title="Contents"
+              title={t(m.contents)}
               onClick={() => setTocOpen((open) => !open)}
               size="icon"
               tone="ghost"
@@ -281,7 +289,8 @@ export function WikiGraphDailyPanel({
               <Icon icon={LeftToRightListBulletIcon} size={16} />
             </Button>
             <Button
-              aria-label={`Close ${label}`}
+              data-voice-close
+              aria-label={t(isDaily ? m.closeDaily : m.closeWeekly)}
               onClick={onClose}
               size="icon"
               tone="ghost"
@@ -293,10 +302,10 @@ export function WikiGraphDailyPanel({
         <div className="wiki-graph-daily-reading">
           {tocOpen && headings.length > 0 ? (
             <nav
-              aria-label={`${label} contents`}
+              aria-label={t(isDaily ? m.dailyContents : m.weeklyContents)}
               className="wiki-graph-daily-toc workspace-scrollbar"
             >
-              <p>Contents</p>
+              <p>{t(m.contents)}</p>
               {headings.map((heading) => (
                 <button
                   key={heading.id}
@@ -324,7 +333,7 @@ export function WikiGraphDailyPanel({
           >
             {pending ? (
               <p role="status" className="p-6 text-sm text-app-muted">
-                Loading {label}…
+                {t(isDaily ? m.loadingDaily : m.loadingWeekly)}
               </p>
             ) : error ? (
               <div role="alert" className="p-6 text-sm">
@@ -336,12 +345,14 @@ export function WikiGraphDailyPanel({
                   }
                   tone="secondary"
                 >
-                  Retry {label}
+                  {t(isDaily ? m.retryDaily : m.retryWeekly)}
                 </Button>
               </div>
             ) : entry ? (
               <ReadOnlyBlockNoteDocument
-                ariaLabel={`${day} ${label} content`}
+                ariaLabel={t(isDaily ? m.dailyContent : m.weeklyContent, {
+                  day,
+                })}
                 markdown={entry.content || entry.summary}
                 presentation="knowledge"
                 documentTitle={entry.title}
@@ -349,7 +360,7 @@ export function WikiGraphDailyPanel({
               />
             ) : (
               <p className="p-6 text-sm text-app-muted">
-                No {label} report for this {kind === "daily" ? "day" : "week"}.
+                {t(isDaily ? m.noDailyReport : m.noWeeklyReport)}
               </p>
             )}
             {anchors.error ? (
@@ -365,7 +376,7 @@ export function WikiGraphDailyPanel({
             type="button"
             className="wiki-graph-daily-resize"
             data-direction={direction}
-            aria-label={`Resize ${label} ${RESIZE_HANDLES[direction]}`}
+            aria-label={t(RESIZE_HANDLES[direction][isDaily ? 0 : 1])}
             onPointerDown={(event) => beginGesture(event, direction)}
             onKeyDown={(event) => {
               const measured = measureBox();

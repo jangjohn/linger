@@ -333,7 +333,7 @@ describe("Room Chat", () => {
       expect.objectContaining({
         actorId: "actor-codex",
         kind: "agentActivity",
-        title: "Activity · Codex",
+        title: "Codex",
       }),
     );
     const opened = openPanelTab.mock.calls.at(-1)?.[0] as {

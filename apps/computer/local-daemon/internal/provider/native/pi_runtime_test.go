@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
 )
 
 type piHarness struct {
@@ -134,13 +136,14 @@ func TestPiStartPreconditions(t *testing.T) {
 		prompt string
 		spec   RunSpec
 	}{
-		"blank prompt":     {"  \n", RunSpec{}},
-		"computer args":    {"x", RunSpec{ComputerArgs: []string{"--x"}}},
-		"agent args":       {"x", RunSpec{AgentArgs: []string{"--x"}}},
-		"bad effort":       {"x", RunSpec{Effort: "ultra"}},
-		"invalid mcp":      {"x", RunSpec{MCPServers: json.RawMessage(`[1]`)}},
-		"missing session":  {"x", RunSpec{ResumeID: "never-created"}},
-		"extension absent": {"x", RunSpec{MCPServers: json.RawMessage(`{"mcpServers":{"computer":{"type":"http","url":"http://127.0.0.1:1/"}}}`)}},
+		"blank prompt":             {"  \n", RunSpec{}},
+		"computer args":            {"x", RunSpec{ComputerArgs: []string{"--x"}}},
+		"agent args":               {"x", RunSpec{AgentArgs: []string{"--x"}}},
+		"bad effort":               {"x", RunSpec{Effort: "ultra"}},
+		"invalid mcp":              {"x", RunSpec{MCPServers: json.RawMessage(`[1]`)}},
+		"missing session":          {"x", RunSpec{ResumeID: "never-created"}},
+		"extension absent":         {"x", RunSpec{MCPServers: json.RawMessage(`{"mcpServers":{"computer":{"type":"http","url":"http://127.0.0.1:1/"}}}`)}},
+		"review without extension": {"x", RunSpec{PermissionReviewer: &permission.Reviewer{}}},
 	}
 	for name, tc := range cases {
 		tc.spec.Dir = h.dir
@@ -359,6 +362,54 @@ func TestPiRecoverableToolFailure(t *testing.T) {
 	}
 }
 
+func TestPiAnswersTheManagedExtensionsReview(t *testing.T) {
+	extension := filepath.Join(t.TempDir(), "pi-mcp.mjs")
+	if err := os.WriteFile(extension, []byte("export default {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name     string
+		reviewer bool
+		want     piVerdict
+	}{
+		{name: "without review", want: piVerdict{Allow: true}},
+		{name: "denied", reviewer: true, want: piVerdict{Message: "not now"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dialogs := filepath.Join(t.TempDir(), "dialogs")
+			h := piNewHarness(t, "review", map[string]string{piFakeDialogEnv: dialogs})
+			h.runtime, _ = Open("pi", Profile{Program: h.runtime.(*piRuntime).profile.Program, Env: h.env, ManagedMCPExtension: extension})
+			requester := agyDenyingRequester{asked: make(chan string, 1)}
+			spec := RunSpec{}
+			if c.reviewer {
+				spec.PermissionReviewer = &permission.Reviewer{Requester: requester, Timeout: time.Minute}
+			}
+			if _, outcome := piCollect(t, h.start(t.Context(), "push it", spec)); outcome.Status != statusCompleted {
+				t.Fatalf("outcome = %+v", outcome)
+			}
+			if asked := len(requester.asked); asked != map[bool]int{true: 1}[c.reviewer] {
+				t.Fatalf("reviews asked = %d", asked)
+			}
+			data, _ := os.ReadFile(dialogs)
+			answers := map[string]map[string]any{}
+			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+				var answer map[string]any
+				if json.Unmarshal([]byte(line), &answer) != nil {
+					t.Fatalf("answer %q", line)
+				}
+				answers[answer["id"].(string)] = answer
+			}
+			if len(answers) != 2 || answers["ui-other"]["cancelled"] != true {
+				t.Fatalf("answers = %v", answers)
+			}
+			var verdict piVerdict
+			if value, _ := answers["ui-review"]["value"].(string); json.Unmarshal([]byte(value), &verdict) != nil || verdict != c.want {
+				t.Fatalf("verdict = %+v, want %+v", verdict, c.want)
+			}
+		})
+	}
+}
+
 func TestPiCompositeToolIDs(t *testing.T) {
 	h := piNewHarness(t, "composite", nil)
 	events, outcome := piCollect(t, h.start(t.Context(), "go", RunSpec{}))
@@ -448,15 +499,14 @@ func TestPiLaunchArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	mcp := json.RawMessage(`{"mcpServers":{"computer":{"type":"http","url":"http://127.0.0.1:9/mcp"}}}`)
-	_, outcome := piCollect(t, h.start(t.Context(), "go", RunSpec{AssignSessionID: "args-session", Model: "fixture/model", Effort: "none", Title: "Title", AppendPrompt: "be brief", MCPServers: mcp}))
+	_, outcome := piCollect(t, h.start(t.Context(), "go", RunSpec{AssignSessionID: "args-session", Model: "fixture/model", Effort: "none", Title: "Title", SystemPrompt: "be brief", MCPServers: mcp}))
 	if outcome.Status != statusCompleted || !outcome.ExitConfirmed {
 		t.Fatalf("outcome = %+v", outcome)
 	}
 	data, _ := os.ReadFile(argv)
 	sessionDir := filepath.Join(h.root, "args-session")
-	want := append([]string{"--mode", "rpc", "--session-dir", sessionDir, "--session-id", "args-session"}, PiRPCResourceArgs()...)
+	want := append([]string{"--mode", "rpc", "--session-dir", sessionDir, "--session-id", "args-session"}, PiRPCResourceArgs(filepath.Join(sessionDir, piInstructionsName))...)
 	want = append(want, "--model", "fixture/model", "--thinking", "off", "--name", "Title",
-		"--append-system-prompt", filepath.Join(sessionDir, piInstructionsName),
 		"--skill", filepath.Join(h.dir, ".agents", "skills"), "--extension", extension, "--tools", piBaseTools+",mcp__*")
 	if got := strings.Split(string(data), "\n"); strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("argv\n got %q\nwant %q", got, want)
@@ -479,6 +529,19 @@ func TestPiLaunchArguments(t *testing.T) {
 	}
 	if nodePath, _ := os.ReadFile(argv + ".node_path"); len(nodePath) != 0 {
 		t.Fatalf("NODE_PATH without an extension = %q", nodePath)
+	}
+
+	// The managed extension runs the shell-text-hook without MCP servers.
+	_, outcome = piCollect(t, h.start(t.Context(), "go", RunSpec{Model: piDefaultModel, ShellTextHook: "/opt/linger/linger-computer-daemon"}))
+	data, _ = os.ReadFile(argv)
+	if outcome.Status != statusCompleted || !strings.HasSuffix(string(data), "--extension\n"+extension+"\n--tools\n"+piBaseTools) {
+		t.Fatalf("shell text argv = %q (%+v)", data, outcome)
+	}
+	if hook, _ := os.ReadFile(argv + ".shell_text_hook"); string(hook) != "/opt/linger/linger-computer-daemon" {
+		t.Fatalf("%s = %q", piShellTextHookEnvKey, hook)
+	}
+	if nodePath, _ := os.ReadFile(argv + ".node_path"); string(nodePath) != filepath.Join(filepath.Dir(filepath.Dir(extension)), "node_modules") {
+		t.Fatalf("NODE_PATH = %q", nodePath)
 	}
 }
 
@@ -577,11 +640,11 @@ func TestPiSessionValidation(t *testing.T) {
 }
 
 func TestPiResourceArgsAreFresh(t *testing.T) {
-	first := PiRPCResourceArgs()
+	first := PiRPCResourceArgs("")
 	first[0] = "changed"
 	_ = append(first, "--extra")
-	if got := PiRPCResourceArgs(); len(got) != 8 || got[0] != "--no-extensions" || got[5] != "--no-approve" ||
-		got[6] != "--system-prompt" || got[7] != "" {
+	if got := PiRPCResourceArgs("prompt.md"); len(got) != 10 || got[0] != "--no-extensions" || got[5] != "--no-approve" ||
+		got[6] != "--system-prompt" || got[7] != "prompt.md" || got[8] != "--append-system-prompt" || got[9] != "" {
 		t.Fatalf("args = %v", got)
 	}
 }

@@ -10,6 +10,10 @@ import type {
   TeamHubActorRef,
   TeamHubScheduledRoutine,
 } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT } from "@/i18n/use-translation";
 
 import {
   WEEKDAYS,
@@ -17,28 +21,26 @@ import {
   cadenceLabel,
   draftFromRoutine,
   emptyRoutineDraft,
+  formatHour,
   formatWhen,
   type RoutineDraft,
+  weekdayName,
 } from "./routine-cadence";
 import { RoutineTimeField } from "./routine-time-field";
+import { routinesMessages as m } from "./routines.messages";
 
 type When = "tomorrow" | "date" | "daily" | "weekdays" | "weekly" | "hours";
 
-const WHENS: [When, string][] = [
-  ["tomorrow", "Tomorrow"],
-  ["date", "Pick a date"],
-  ["daily", "Every day"],
-  ["weekdays", "Weekdays"],
-  ["weekly", "Every week"],
-  ["hours", "Every few hours"],
+const WHENS: [When, Message<string>][] = [
+  ["tomorrow", m.whenTomorrow],
+  ["date", m.whenDate],
+  ["daily", m.whenDaily],
+  ["weekdays", m.whenWeekdays],
+  ["weekly", m.whenWeekly],
+  ["hours", m.whenHours],
 ];
 const MON_FRI = WEEKDAYS.slice(0, 5);
-const QUICK_TIMES = [
-  ["08:00", "8 AM"],
-  ["09:00", "9 AM"],
-  ["12:00", "12 PM"],
-  ["18:00", "6 PM"],
-] as const;
+const QUICK_HOURS = [8, 9, 12, 18];
 const INTERVALS = [1, 2, 3, 4, 6, 12];
 
 function localDay(offset = 0) {
@@ -106,6 +108,7 @@ export function RoutineDialog({
   roomId: string;
   routine?: TeamHubScheduledRoutine;
 }) {
+  const t = useT();
   const [draft, setDraft] = useState<RoutineDraft>(() => initialDraft(routine));
   const [name, setName] = useState(routine?.name ?? "");
   const [mention, setMention] = useState(
@@ -116,15 +119,15 @@ export function RoutineDialog({
   const [error, setError] = useState<string | null>(null);
   const update = (patch: Partial<RoutineDraft>) =>
     setDraft((current) => ({ ...current, ...patch }));
-  const fail = (fallback: string) => (cause: unknown) =>
-    setError(cause instanceof Error ? cause.message : fallback);
+  const fail = (fallback: Message<string>) => (cause: unknown) =>
+    setError(cause instanceof Error ? cause.message : translate(fallback));
 
   const save = useMutation({
     mutationFn: async () => {
       const cadence = cadenceFromDraft(draft);
       const nextName = name.trim() || routineName(draft);
       if (!draft.instruction.trim())
-        throw new Error("Say what the Routine should do.");
+        throw new Error(translate(m.instructionRequired));
       if (routine) {
         await teamHubData(
           client.api.PATCH("/v0/routines/{routineId}", {
@@ -154,7 +157,7 @@ export function RoutineDialog({
       );
     },
     onSuccess: onSaved,
-    onError: fail("Could not save routine."),
+    onError: fail(m.saveFailed),
   });
   const remove = useMutation({
     mutationFn: async () => {
@@ -162,7 +165,7 @@ export function RoutineDialog({
       await deleteRoomRoutine(client, routine);
     },
     onSuccess: onSaved,
-    onError: fail("Could not delete routine."),
+    onError: fail(m.deleteFailed),
   });
   const runNow = useMutation({
     mutationFn: async () => {
@@ -174,7 +177,7 @@ export function RoutineDialog({
       );
     },
     onSuccess: onSaved,
-    onError: fail("Could not run routine."),
+    onError: fail(m.runFailed),
   });
 
   const cadence = (() => {
@@ -191,8 +194,9 @@ export function RoutineDialog({
     mention === (routine.mention_actor_id ?? "");
   const nextRun =
     unchanged && routine.enabled && routine.next_run_at
-      ? `Next ${formatWhen(routine.next_run_at)}`
+      ? formatWhen(routine.next_run_at)
       : "";
+  const schedule = cadence ? cadenceLabel(cadence, t) : t(m.chooseTime);
 
   return (
     <ModalDialog
@@ -201,13 +205,14 @@ export function RoutineDialog({
         <>
           {routine ? (
             <Button
+              data-voice-risk="never"
               className="mr-auto text-destructive hover:text-destructive"
               disabled={remove.isPending}
               onClick={() => remove.mutate()}
               tone="ghost"
               type="button"
             >
-              Delete
+              {t(commonMessages.delete)}
             </Button>
           ) : null}
           {routine ? (
@@ -216,7 +221,7 @@ export function RoutineDialog({
               onClick={() => runNow.mutate()}
               type="button"
             >
-              Run now
+              {t(m.runNow)}
             </Button>
           ) : null}
           <Button
@@ -225,13 +230,13 @@ export function RoutineDialog({
             tone="primary"
             type="submit"
           >
-            {routine ? "Save" : "Create"}
+            {routine ? t(commonMessages.save) : t(m.create)}
           </Button>
         </>
       }
       onClose={onClose}
       size="md"
-      title={routine ? "Edit routine" : "New routine"}
+      title={routine ? t(m.editRoutine) : t(m.newRoutine)}
     >
       <form
         className="flex flex-col gap-4 px-5 py-4"
@@ -244,7 +249,7 @@ export function RoutineDialog({
       >
         <div>
           <span className="block text-xs font-medium text-foreground">
-            When
+            {t(m.when)}
           </span>
           <WhenEditor
             draft={draft}
@@ -253,23 +258,24 @@ export function RoutineDialog({
             update={update}
           />
           <p className="mt-2 truncate text-xs tabular-nums text-muted-foreground">
-            {cadence ? cadenceLabel(cadence) : "Choose a time"}
-            {cadence && nextRun ? ` · ${nextRun}` : ""}
+            {cadence && nextRun
+              ? t(m.summaryWithNext, { cadence: schedule, when: nextRun })
+              : schedule}
           </p>
         </div>
         <label className="block text-xs font-medium text-foreground">
-          Instruction
+          {t(m.instruction)}
           <textarea
             className={`${FIELD} mt-1 min-h-28 w-full py-2 leading-relaxed`}
             onChange={(event) => update({ instruction: event.target.value })}
-            placeholder="What should it do then?"
+            placeholder={t(m.instructionPlaceholder)}
             required
             value={draft.instruction}
           />
         </label>
         {!agentScoped ? (
           <label className="block text-xs font-medium text-foreground">
-            Name (optional)
+            {t(m.nameOptional)}
             <input
               className={`${FIELD} mt-1 h-9 w-full`}
               maxLength={120}
@@ -280,15 +286,15 @@ export function RoutineDialog({
         ) : null}
         {!agentScoped && (mentionOptions.length > 0 || mention) ? (
           <label className="block text-xs font-medium text-foreground">
-            Mention
+            {t(m.mention)}
             <Select
-              aria-label="Mention"
+              aria-label={t(m.mention)}
               className="mt-1 w-full font-normal"
               disabled={!routine && Boolean(mentionActorId)}
               onValueChange={setMention}
               value={mention}
             >
-              <SelectItem value="">None</SelectItem>
+              <SelectItem value="">{t(m.mentionNone)}</SelectItem>
               {mentionOptions.map((agent) => (
                 <SelectItem key={agent.id} value={agent.id}>
                   {agent.display_name}
@@ -296,7 +302,7 @@ export function RoutineDialog({
               ))}
               {mention &&
               !mentionOptions.some((agent) => agent.id === mention) ? (
-                <SelectItem value={mention}>Current Agent</SelectItem>
+                <SelectItem value={mention}>{t(m.currentAgent)}</SelectItem>
               ) : null}
             </Select>
           </label>
@@ -325,6 +331,7 @@ function WhenEditor({
   pickDate: boolean;
   update: (patch: Partial<RoutineDraft>) => void;
 }) {
+  const t = useT();
   const when = whenOf(draft, pickDate);
   const day = draft.runAt.slice(0, 10) || localDay(1);
   const setTime = (time: string) =>
@@ -360,24 +367,24 @@ function WhenEditor({
   return (
     <div className="mt-1 flex flex-col gap-2.5">
       <Select
-        aria-label="When"
+        aria-label={t(m.when)}
         className="w-full font-normal"
         onValueChange={(value) => choose(value as When)}
         value={when}
       >
         {WHENS.map(([value, label]) => (
           <SelectItem key={value} value={value}>
-            {label}
+            {t(label)}
           </SelectItem>
         ))}
       </Select>
       {draft.kind === "weekly" ? (
         <fieldset className="flex flex-wrap gap-1.5">
-          <legend className="sr-only">Weekdays</legend>
+          <legend className="sr-only">{t(m.weekdays)}</legend>
           {WEEKDAYS.map((weekday) => (
             <label className="cursor-pointer" key={weekday}>
               <input
-                aria-label={weekday[0]!.toUpperCase() + weekday.slice(1)}
+                aria-label={weekdayName(weekday, "long")}
                 checked={draft.weekdays.includes(weekday)}
                 className="sr-only"
                 onChange={(event) =>
@@ -392,7 +399,7 @@ function WhenEditor({
                 type="checkbox"
               />
               <span className="select-pill w-11 justify-center px-0">
-                {weekday[0]!.toUpperCase() + weekday.slice(1, 3)}
+                {weekdayName(weekday, "short")}
               </span>
             </label>
           ))}
@@ -400,7 +407,9 @@ function WhenEditor({
       ) : null}
       {draft.kind === "every_n_hours" ? (
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="mr-1 text-xs text-muted-foreground">Every</span>
+          <span className="mr-1 text-xs text-muted-foreground">
+            {t(m.every)}
+          </span>
           {[...new Set([...INTERVALS, draft.intervalHours])]
             .sort((left, right) => left - right)
             .map((hours) => (
@@ -411,7 +420,7 @@ function WhenEditor({
                 onClick={() => update({ intervalHours: hours })}
                 type="button"
               >
-                {hours}h
+                {t(m.hoursShort, { count: hours })}
               </button>
             ))}
         </div>
@@ -419,7 +428,7 @@ function WhenEditor({
         <>
           {when === "date" ? (
             <input
-              aria-label="Date"
+              aria-label={t(m.date)}
               className="ui-field-control h-9 w-44 text-sm text-foreground"
               min={localDay()}
               onChange={(event) =>
@@ -435,17 +444,20 @@ function WhenEditor({
             <div className="w-32 [&>div]:mt-0">
               <RoutineTimeField onChange={setTime} value={draft.time} />
             </div>
-            {QUICK_TIMES.map(([time, label]) => (
-              <button
-                aria-pressed={draft.time === time}
-                className="select-pill"
-                key={time}
-                onClick={() => setTime(time)}
-                type="button"
-              >
-                {label}
-              </button>
-            ))}
+            {QUICK_HOURS.map((hour) => {
+              const time = `${String(hour).padStart(2, "0")}:00`;
+              return (
+                <button
+                  aria-pressed={draft.time === time}
+                  className="select-pill"
+                  key={time}
+                  onClick={() => setTime(time)}
+                  type="button"
+                >
+                  {formatHour(hour)}
+                </button>
+              );
+            })}
           </div>
         </>
       )}

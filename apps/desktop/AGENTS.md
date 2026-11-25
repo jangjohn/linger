@@ -25,7 +25,13 @@ Gateway and runs Agents. The daemon exits with the app.
   `packaging/mac/Dockerfile` and `rcodesign` (ad-hoc signature). Add
   `--developer-id P12 --developer-id-password FILE` for a Developer ID
   signature with the hardened runtime, and `--notary-key JSON` to notarize and
-  staple; see the script's docstring.
+  staple the DMG in one Apple submission (stapling `Linger.app` separately for
+  `--update-archive`; `Linger.app` inside the DMG is notarized by Apple with
+  the DMG submission but not separately stapled); see the script's docstring.
+  Notarizing needs the bundled macOS
+  archives Developer ID signed first: the Sign macOS native archives workflow
+  runs `packaging/mac/sign_native_archives.py` with the release secrets (see
+  [Bundled archives](../../docs/desktop-release.md#bundled-archives)).
 - `python3 packaging/win/package.py`: build
   `out/Linger-<version>-x64-setup.exe` (per-user NSIS installer) and
   `out/Linger-<version>-x64.zip` on Linux after `node build.mjs` with the
@@ -45,12 +51,30 @@ Gateway and runs Agents. The daemon exits with the app.
   The callback restores the originating window and forwards the return to its
   signed-in SPA, which requests TeamHub verification.
 
-- The Web link preview panel frames other sites. The window drops their
-  framing refusals (`X-Frame-Options`, CSP `frame-ancestors`) for frames of
-  the app, except the panel's frame, named `linger-url-preview:<id>`. When
-  that frame's final response refuses framing, the window sends
-  `preview.frame-refused`, and the panel offers the system browser instead,
-  where the user's sign-ins work.
+- The Web link preview panel shows other sites in native views
+  (`src/main/preview-views.ts`, `preview.view` in the preload API). Each is a
+  `WebContentsView` the page asks for by id (at most eight) and lays over its
+  panel; a top-level page ignores framing rules (`X-Frame-Options`, CSP
+  `frame-ancestors`), so every site shows. Previews share the persistent
+  `persist:linger-preview` session, apart from the app's session with the
+  Linger server: sign-ins made there last across restarts, and sites get no
+  permissions beyond clipboard writes. They keep Electron's user agent, so
+  sites that refuse embedded browsers, such as Google sign-in, need the
+  system browser. Only the Linger page's main frame may drive the views. It
+  learns each view's address and history after every navigation, never its
+  content. A view loads only http and https; links asking for a new tab load
+  in place, and only script popups (sign-in windows) open a window: at most
+  two per view, titled with their site and closed with the view. A crashed
+  view reloads once. While a layer of the page (a portal beside the app
+  root, an open dialog or popover, or an element hit-tested over the panel)
+  covers the panel, or the panel is inert or being resized, the page hides
+  the view and the panel shows empty. The window closes every view when its
+  page navigates, crashes or its window closes.
+- Web builds without native previews still frame sites. The window drops
+  framing refusals for frames of the app, except the panel's frame, named
+  `linger-url-preview:<id>`. When that frame's final response refuses
+  framing, the window sends `preview.frame-refused`, and the panel offers
+  the system browser instead.
 
 - `src/main/modules.ts`: `Module` interface, typed bus and the host that starts
   modules in dependency layers and stops them in reverse.
@@ -59,10 +83,16 @@ Gateway and runs Agents. The daemon exits with the app.
   status summary, tray menu and tray icons, drawn from the logo PNGs in
   `resources/tray/` with a status badge.
 - `src/main/local-server.ts`: LocalServer, the setup page's Quick Install
-  path. It fetches the pinned Node runtime (sources in the download region's
+  path. On Windows, install preflight checks both the install home and the
+  Computer daemon directory (`<userData>/computer`) non-destructively via
+  `windowsPrivateLocation` before fetching Node or unpacking, so ancestor ACL
+  refusals fail immediately with the offending ancestor path and SID instead of
+  after enrollment. It fetches the pinned Node runtime (sources in the download region's
   order, `scripts/installs/README.md`) and unpacks the linger source package
   into the install location (the default home, or a folder picked under
-  Customize; tar runs inside the target with relative paths, and the
+  Customize; tar runs inside the target with relative paths, falling back to
+  the pure-Node extractor when `tar.exe` is missing with `ENOENT` on stripped
+  Windows images, and the
   finished folder is moved into place with `renameRetrying`, which waits out
   Windows' short-lived locks on new files) and starts the bundled
   `dist/installer/installer.js` headless (`--no-open`), which runs every
@@ -76,11 +106,20 @@ Gateway and runs Agents. The daemon exits with the app.
   installer (`GET /api/runtime-login`) whether the runtime is signed in
   after all; only when it is not does a "Sign in to <Runtime>" step show,
   with a dialog. Authorize starts the runtime's own login through the
-  installer (`POST /api/runtime-login`), which opens the browser on its
-  localhost callback page itself; Desktop opens only a Codex device page.
-  The dialog waits, checks every few seconds and closes once signed in. The
-  printed link and Claude Code's paste-code form sit behind "Having
-  trouble?"; Cancel stops the login (`DELETE /api/runtime-login`); the
+  installer (`POST /api/runtime-login`). On macOS and Windows the runtime
+  opens the browser on its localhost callback page itself. On Linux Desktop
+  asks for Codex's `method: "browser"` login, which keeps the CLI from
+  opening a browser, and opens the link itself through `xdg-open`, waiting
+  for its result (`open-url.ts`), because Electron's `shell.openExternal`
+  never reports failure there; when no browser opens the dialog says so.
+  "Use a code on another device" restarts Codex with `method: "device"` on
+  any platform, and Desktop opens that device page too. While a login runs
+  the dialog shows its link with Open in browser and Copy link, and a
+  Codex device code with Copy code; it checks every few seconds, closes
+  once signed in and brings the window forward. A failed login's `reason`
+  (`unavailable`, `timed_out`, `ended`) picks its message. Claude Code's
+  paste-code form sits behind "Having trouble?"; Cancel stops the login
+  (`DELETE /api/runtime-login`); the
   dialog also offers installing another runtime instead (a new job with
   that `setupChoice`). No sign-in secret passes through the page. The
   dialog also offers BYOK, with the same form as Customize's BYOK
@@ -91,8 +130,18 @@ Gateway and runs Agents. The daemon exits with the app.
   which lists `base + path + /models` and sends one request to
   `base + path + endpoint` in the format the page derived from that address.
   Then it saves the installed runtime's executable and profile paths
-  (`GET /api/instances/desktop/runtime`) as `runtimeEnvironment` in the
-  Desktop config, and the runtime its `setupChoice` runs (`local-models` runs
+  from the live completed job as `runtimeEnvironment` in the
+  Desktop config. After sign-in, when reusing a completed job, or when the installer
+  omits the runtime, it reads `GET /api/instances/desktop/runtime` for the current
+  environment. The job's setup choice identifies the runtime for sign-in when available.
+  On Windows that lookup can take minutes (#385, #549): the
+  desktop waits for it while the installer answers, asks again after a
+  dropped connection (the installer joins the running lookup), and gives up
+  only after `RUNTIME_LOOKUP_LIMIT_MS` (10 minutes) with the typed `failure`
+  `runtime_lookup_timed_out` or, once unreachable for the reconnect window,
+  `runtime_lookup_unreachable`; the setup page words both. After 15 seconds
+  the status carries `waiting: "runtime"` and the page says what the bar
+  waits on. Desktop also saves the runtime its `setupChoice` runs (`local-models` runs
   on Pi) as `preferredRuntime`. The daemon config carries that as
   `preferred_runtime`, and the daemon marks that runtime's diagnostic
   `preferred`, so TeamHub creates Another Me and the starter Agents on it
@@ -158,11 +207,23 @@ Gateway and runs Agents. The daemon exits with the app.
   In the report, `local-models` is the planned model served by Pi, shown with the model,
   GPU, memory and download (the card's memory is the whole stack's, so
   "with its services"); otherwise the named runtime, with why there is no
-  local model. The page words each reason by its code and the counts it
-  carries (`gpuIndex`, `freeBytes`, `requiredBytes`); the tool's message
-  goes only to the main process log (`local_server.inspected`), never to
-  the page. Under Customize the Local model card stays visible once the
-  check ends: disabled, "Not available on this computer", with that reason.
+  local model. The page words each reason by its code and the structured
+  counts or numeric versions it carries (`gpuIndex`, `freeBytes`,
+  `requiredBytes`, `detectedCudaVersion`, `requiredCudaVersion`,
+  `driverVersion`); the tool's message goes only to the main process log
+  (`local_server.inspected`), never to the page. Under Customize the Local
+  model card stays visible once the check ends: disabled, "Not available on
+  this computer", with that reason. For `cuda-driver-update-required` and
+  `cuda-driver-version-unknown`, the page explains the NVIDIA graphics driver
+  requirement (with required driver branch via `@linger/service-kit/nvidia-driver`),
+  offers one-click verified Windows GeForce RTX driver installation
+  (`driver.start-install`, downloading from NVIDIA's allowlisted CDN, verifying
+  NVIDIA Authenticode signature before elevated silent install, and persisting
+  `pendingDriverUpdate` across reboots), NVIDIA App launch on Windows
+  (`driver.open-nvidia-app`), NVIDIA's official download and upgrade guide links
+  (`SETUP_EXTERNAL_URLS`), and Check again (`local.recheck`), and auto-rechecks
+  when installation completes or the setup window regains focus after a driver
+  action.
   Off macOS the page names the system tray, not the menu bar.
   Under Customize the local model runs only behind Pi: with another runtime
   it is greyed (`aria-disabled`, still focusable), does not toggle, and says
@@ -197,15 +258,32 @@ Gateway and runs Agents. The daemon exits with the app.
   file and renamed, so a power loss leaves the old record or none) and, while
   the window still uses that origin and the computer is enrolled, restarts the
   services on launch with `installer.js --resume`, which also restarts them
-  when the instance's `user.env` changed. When another program took the web
+  when the instance's `user.env` changed. Before it starts the installer
+  (`--resume`, or the installer that sets up) it asks
+  `session.resolveProxy` for the Soniox websocket URL (`system-proxy.ts`,
+  at most 1.5 s, alongside the Node runtime check) and passes an HTTP
+  proxy, the first choice of a fixed or PAC setting, as
+  `LINGER_SYSTEM_HTTPS_PROXY`; the installer gives it to TeamHub and
+  node-services only. `DIRECT`, SOCKS, a failure or a timeout pass none,
+  and an `HTTPS_PROXY` in the app's own environment wins. It logs
+  `local_server.system_proxy` (`source`, `ms`), never the address. A
+  system proxy changed while the app runs applies at the next launch. A
+  launch whose resolution fails (a PAC or WPAD lookup past the timeout, or a
+  PAC server not up yet) passes none, so TeamHub and node-services restart
+  without the proxy, and the next launch that resolves it restarts them with
+  it again. When another program took the web
   port, the installer moves the services to a free one and reports the new
   origin (`details.origin`, or the setup job's `origin`). The record, the
   window's `serverUrl` and the `savedEnrollments` entry follow it together
   (`setServer` with the previous origin emits `server.moved`, not
-  `server.changed`), so the Computer stays enrolled: it reaches TeamHub
-  through the gateway URL TeamHub gave it, and the session cookies are not
-  port-scoped. The record and `serverUrl` change only together, so a later
-  launch still resumes. A source folder removed since, or
+  `server.changed`), so the Computer stays enrolled and the session cookies
+  are not port-scoped. When `node-services` also (or independently) moved off
+  a taken port, `LocalServer` reads the instance's `source.ports.nodeServices`
+  after resume or a fast-ready move and updates the saved loopback `gatewayUrl`
+  in `credential.json` through `Enrollment.syncLocalGatewayUrl` (emitting
+  `computer.changed` to restart the daemon on the new port without changing the
+  Computer identity or token; remote gateway URLs are never rewritten). The
+  record and `serverUrl` change only together, so a later launch still resumes. A source folder removed since, or
   one the installer no longer accepts as a Linger checkout (such as one the
   earlier Simplex app unpacked, or this package's own folder with files
   missing since), is unpacked again from the app's package first and
@@ -217,17 +295,48 @@ Gateway and runs Agents. The daemon exits with the app.
   new folder (`details.source`) and the origin answers does it record that
   folder and prune the older one; otherwise the older services keep running
   from their folder, the record keeps naming it, and the start failure page's
-  Retry moves them again. An app older than the recorded version
+  Retry moves them again. A prune never removes a folder a running process
+  still starts from (`foldersInUse`; when processes cannot be listed, it
+  removes nothing) and logs `local_server.source_in_use` instead. An app older than the recorded version
   (a downgrade) leaves the services on their newer source and logs
-  `local_server.source_newer_than_app`. When the local model stops a resume,
-  the start failure names the stack's first known binding reason code
+  `local_server.source_newer_than_app`. When local models fail to come back on a
+  resume, the installer still brings up the services and reports
+  `details.localModelsDegraded`, which the desktop logs as
+  `local_server.local_models_unavailable` and exposes on
+  `LocalServerStatus.localModelsDegraded` so the person can still reach the
+  workspace and the Models page. If an older installer still fails a resume for
+  the local model, the start failure names the stack's first known binding reason code
   (`details.reasons`, such as `pi-extensions-unavailable`) in its own words
-  and, by `details.code`, the action that works: Try Again for
-  `LOCAL_MODELS_RECOVERY_REQUIRED` (the resume applies the approved plan
-  again), Set Up Again to review a new plan or choose another runtime. A Quick Install that stopped
+  and, by `details.code` and `details.causeCode`, the action that works:
+  Set Up Again for `LOCAL_MODELS_APPROVAL_REQUIRED` and for
+  `LOCAL_MODELS_RECOVERY_REQUIRED` when `details.causeCode` indicates the saved
+  plan cannot be re-applied without replanning (`STACK_REPLAN_FAILED`,
+  `STACK_PLAN_CHANGED`, `STACK_APPROVAL_MISMATCH`, `STACK_PLAN_INVALID`), and
+  Try Again or Set Up Again for transient `LOCAL_MODELS_RECOVERY_REQUIRED`
+  failures (the resume applies the approved plan again). During Quick Install,
+  `LOCAL_MODELS_RECOVERY_REQUIRED` with `binding-unavailable` in
+  `errorReasons` skips blind replanning and surfaces the structured reason copy;
+  transient apply failures (`STACK_COMPONENT_FAILED`, `STACK_APPLY_INTERRUPTED`)
+  after a plan was approved in the same run retry that approved plan once to
+  resume downloads instead of forcing a replan, while other
+  `LOCAL_MODELS_RECOVERY_REQUIRED` causes (including ones without a prior
+  approval in the same run) still replan once, and `LOCAL_MODELS_UNAVAILABLE`
+  selects user guidance by `errorCauseCode` (`HUB_UNREACHABLE`,
+  `DISK_INSUFFICIENT`, `GPU_CONFLICT`, `STACK_PLAN_FAILED`, or memory when
+  `MEMORY_INSUFFICIENT`/absent). While installing or resuming, `LocalServer`
+  emits `local-server.busy` so `PowerGuard` keeps the system from suspending
+  mid-download without toggling the saved `preventSleep` preference. A Quick Install that stopped
   before the computer enrolled is not resumed: setup shows again and Install
   finishes it, reusing a finished job only while its origin answers (a stopped
-  server gets a new job, which starts the services again). The start failure
+  server gets a new job, which starts the services again). It follows a
+  running or finished job only when that job's `setupChoice` is what the
+  person chose now (`local-models` for the local model; any but
+  `local-models` for the installer's pick); otherwise it asks for a new job.
+  The installer answers at once with that job `queued` and runs it once it
+  has stopped the earlier one, such as a local model download that kept
+  running after a quit or services still starting; setup polls the queued
+  job like any other, so a subscription chosen since never shows the earlier
+  download. The start failure
   page's Set Up Again forgets the record (`local-server.json`), clears the
   active enrollment while keeping per-origin `savedEnrollments` in
   `config.json` (`legacy_data_set_aside` clears `savedEnrollments` as well),
@@ -275,18 +384,25 @@ Gateway and runs Agents. The daemon exits with the app.
 - `src/main/diagnostics.ts`: Diagnostics, "Show Logs" (opens
   `<userData>/logs`) and "Save Diagnostics" (a redacted
   `linger-diagnostics-<time>.zip` in Downloads) for the setup page's failed
-  step, the start failure page and the tray. The zip holds the Desktop logs
-  and `config.json`, the installer job JSON and logs, the instance JSON and
-  service logs under each install home. Credential files (`gateway.json`, `caller.key`,
+  step, the start failure page and the tray; the Web client's Settings runs
+  the same save through the preload's `diagnostics.save`. The zip holds the
+  Desktop logs and `config.json`, the installer job JSON and logs, the
+  instance JSON and service logs under each install home. Credential files (`gateway.json`, `caller.key`,
   `control.key`, `credential.json`, `launch.html`, `*.env`, `*.input.json`,
   keys, cookies, databases) never go in, every saved voice key is replaced
   wherever a log printed it, and every text passes through `redact` plus a
-  secret-key JSON filter, and the person's home folder becomes `~`. It
+  secret-key JSON filter, and the person's home folder becomes `~`. It also
+  bundles the newest bounded `localmodels` stack run records
+  (`runtime/localmodels/state/stacks/*.run.json` and `.progress`), local
+  deployment records (`runtime/localmodels/state/deployments/local/*.json`),
+  and deployment engine logs (`runtime/localmodels/models/deployments/*/server.log`),
+  capped in count and byte size and excluding `byok.json`, `api-key`, and model
+  weights. It
   imports no Electron API, so it is tested with Windows paths on any
   platform.
-- `src/main/diagnostics-upload.ts`: "Send Diagnostics" on the same three
-  surfaces, shown only while a receiver is set up (`diagnosticsUploadUrl` in
-  `config.json`, else `HOSTED_DIAGNOSTICS_UPLOAD_URL`, which `build.mjs` bakes
+- `src/main/diagnostics-upload.ts`: "Send Diagnostics" on the setup page, the
+  start failure page and the tray, shown only while a receiver is set up
+  (`diagnosticsUploadUrl` in `config.json`, else `HOSTED_DIAGNOSTICS_UPLOAD_URL`, which `build.mjs` bakes
   in from the release pipeline's `LINGER_DIAGNOSTICS_UPLOAD_URL` secret and
   leaves unset in other builds). `DiagnosticsSender` builds the zip
   into `<userData>/diagnostics-outbox`, waits for consent showing every file,
@@ -314,16 +430,31 @@ Gateway and runs Agents. The daemon exits with the app.
   enrolled server in the hidden window without showing it, and `prewarmAssets`
   warms `/` and `/assets/*` in `session.defaultSession`'s HTTP cache. On
   launch the window loads `serverUrl` without a blocking HTTP probe; if
-  `did-fail-load` fires and `localServer.resumable(serverUrl)` sees an active
-  resume or a valid matching `local-server.json`, it shows the
-  Starting page instead of `offline.html`. `window.did_finish_load` logs
+  `did-fail-load` fires for the current `serverUrl` and
+  `localServer.isStarting(serverUrl)` sees an active resume (or a valid
+  matching `local-server.json` before `LocalServer.start()` runs), it shows the
+  Starting page instead of `offline.html`; stale failures from an older port
+  are ignored, and `setServer` pushes the updated origin to the title bar right
+  away. `window.did_finish_load` logs
   `{ reason, duration_ms, target }` with origin + pathname only (never query or
   hash), and `LocalServer` resume emits `local_server.resume_started`,
   `local_server.resume_stage` (`stage`, `ms`), `local_server.resume_succeeded`
   (`total_ms`), and `local_server.resume_failed` (`stage`, `total_ms`,
   redacted `error` bounded to 500 chars with query/hash stripped). A resume
   whose saved BYOK gateway did not come back still succeeds and logs
-  `local_server.byok_gateway_unavailable` (`code`, `message`).
+  `local_server.byok_gateway_unavailable` (`code`, `message`); the Computer
+  mounts the gateway again before the next Run on it. Once ready, a server
+  the window shows can still stop: its supervisor restarts it, and the
+  desktop resumes it like a launch when it does not answer
+  (`local_server.unreachable_resume` with `trigger`): at once on
+  `local-server.retry`, and after `UNREACHABLE_GRACE_MS` (longer than the
+  supervisor's restart delays) on `local-server.unreachable` (WindowManager
+  emits it when it shows `offline.html` for a failed load) or the
+  `WATCH_MS` watch. Those two resume at most once a minute, and only after
+  `UNREACHABLE_PROBES` checks in a row spread over the grace went unanswered,
+  each allowed `UNREACHABLE_PROBE_TIMEOUT_MS` (longer than the launch's 1 s
+  fast check), so a server slowed by heavy load is not taken for a stopped
+  one; a resume that fails shows the start failure page as on launch.
 - `src/main/voice-window.ts`: the floating voice window. Electron cannot open
   Document Picture-in-Picture windows, so the SPA opens a small native window
   with `window.open("")` under the target `linger-voice-window-<n>`
@@ -334,15 +465,63 @@ Gateway and runs Agents. The daemon exits with the app.
   parent so it stays up when the main window is minimized or closed to the
   tray, and closes with the page (reload, crash, main window closed). While it
   is open the page is not background-throttled. Only a window the main page
-  itself opened is kept; one from a frame in it is destroyed. Its native close button ends
-  Voice Mode; `lingerDesktop.voiceWindow.showMainWindow()` (its presence is
-  how the SPA knows the app supports this) brings the main window forward and
-  keeps the call. An app without `voiceWindow` keeps the in-page windows.
+  itself opened is kept; one from a frame in it is destroyed. It opens at the
+  bottom right of the main window's screen and resizes down to 240x96. Its
+  native close button ends the call or the recording;
+  `lingerDesktop.voiceWindow.showMainWindow()` (its presence is how the SPA
+  knows the app supports this) restores and focuses the main window, on macOS
+  bringing the app in front of the active one, and the SPA then closes the
+  floating window and keeps the session in the page. An app without
+  `voiceWindow` keeps the in-page windows.
 - `src/shell/*.html`: app-owned pages (title bar, offline/setup page). They
   have no network access and talk to the main process via `src/preload/shell.ts`.
+  Their text lives in the `*.messages.ts` beside them; the main process
+  serves each page through `localizePage` (`src/i18n/page.ts`), which adds the
+  page's messages in the current language and the small runtime in
+  `src/shell/messages.html` (`t`, `tSpans`, and `data-t` / `data-t-<attribute>`
+  fill-in). Markup carries message names, never English or translated text.
+  The setup page stays sandboxed with `window.open` and navigation blocked;
+  the main process flags checked Inkling 2 Mini models with `featuredInkling`
+  via `@linger/service-kit/featured-models`, preload exposes
+  `featuredAnnouncementUrl`, and external partner links call
+  `setup.run({ op: "external.open", url })`, which accepts only the exact
+  HTTPS URLs listed in `SETUP_EXTERNAL_URLS` (`src/shared/setup.ts`) and opens
+  them through `shell.openExternal`.
+- `src/i18n`: the shell's languages (English and Simplified Chinese) on the
+  shared core `@linger/service-kit/messages`. `language.ts` matches a language
+  and formats messages; `locales/zh-CN.json` is the shell's Chinese catalog,
+  one namespace per `*.messages.ts`, following the Web glossary
+  (`apps/web/src/i18n/locales/zh-CN.glossary.md`). `catalog.test.ts` finds
+  every `*.messages.ts` and fails on a missing or extra translation, a changed
+  placeholder or tag, or a page naming a message it lacks.
+- `src/main/language.ts`: Language. The shell follows the language picked in
+  the Web client's Settings, which the SPA reports (`language.set`) once a
+  choice is stored; the main process keeps it in its config. Before any
+  choice it follows the system's preferred languages (Simplified Chinese for
+  `zh`, `zh-CN`, `zh-Hans-*`; English otherwise). A change emits
+  `language.changed`: the tray menu and status rebuild, the title bar reloads,
+  and the offline page takes it on its next load. The setup page takes the
+  language when it opens; it runs before the SPA has ever reported one, so it
+  uses the stored choice or the system's language. Main-process text (menus,
+  dialogs, notifications) uses `Language.t` with the messages in
+  `src/main/*.messages.ts`; a message missing from the catalog shows in
+  English. Errors from transfers and servers stay in English.
 - `src/preload/index.ts`: the only SPA API, `window.lingerDesktop`. Its
   `update` reads the Updater's state (without the release page URL) and runs
-  the tray's install and check, for the SPA's account menu.
+  the tray's install and check, for the SPA's account menu; `settings` exposes
+  `preventSleep` (`get`, `set`, `onChange`) so Settings › Computers mirrors and
+  stays in sync with the tray's Prevent Sleep toggle; `driverUpdate`
+  (`src/main/driver-updater.ts`, `src/main/windows-driver-platform.ts`) detects
+  and launches NVIDIA App / GeForce Experience on Windows, opens the allowlisted
+  NVIDIA download/guide URLs, and on Windows x64 runs verified one-click GeForce
+  RTX DCH WHQL downloads (allowlisted CDN, Windows Authenticode check, elevated
+  `-s -noreboot -noeula` install, `PowerGuard` sleep block, and `config.json`
+  `pendingDriverUpdate` post-reboot resume) with `getInstallState` /
+  `onInstallState` / `startInstall` / `clearInstallState`; and
+  `localServer.owned()` reports whether the window points at this app's own
+  local installation regardless of startup/resume readiness, so the SPA can hide
+  CLI daemon download entry points even during hot start or install-time
+  preload.
 - `src/shared/api.ts`, `src/shared/shell.ts`: preload contract types and IPC
   channel names.
 - `src/main/computer-daemon.ts`: ComputerDaemon. While the computer is
@@ -352,12 +531,22 @@ Gateway and runs Agents. The daemon exits with the app.
   credential in `LINGER_COMPUTER_TOKEN` (`gateway.token_env`). The config's
   `desktop` section puts the daemon in Desktop mode: no self-update, it exits
   when its stdin closes, and it reports `{"type":"status",...}` lines on
-  stdout, which drive the tray and the SPA status. Its log goes to
-  `<userData>/logs/computer-daemon.log`. Crashes restart with backoff; the
-  exit reason, logged with `computer_daemon.exited` and shown once starts
-  keep failing, is the last stderr line outside the daemon's log records (a
-  Go crash: its `panic:` line), or none; new
-  folders or a new name restart it once tasks finish.
+  stdout (`gateway_state`, `active_operations`, `active_model_invokes`).
+  `active_operations` drives the tray busy state, quit confirmation, idle
+  restarts, updater waiting and the SPA status (`runtime.activity`);
+  `active_model_invokes` (omitted by older daemons, treated as `0`) emits
+  `runtime.model_activity` for `PowerGuard` only, so background model calls
+  (Memory, Wiki) hold `prevent-app-suspension` while running and through a
+  short release tail (`MODEL_ACTIVITY_TAIL_MS`) without marking the Computer
+  busy. Its log goes to
+  `<userData>/logs/computer-daemon.log`. Crashes and launch failures retry
+  with backoff. The Desktop reports the reason after three consecutive
+  attempts fail before the daemon reports a status. The exit log
+  (`computer_daemon.exited`) records the last stderr line outside the
+  daemon's log records, when present, or the `panic:` line for a Go panic.
+  A synchronous launch failure logs the error as `computer_daemon.launch_failed`.
+  Invalid launch arguments are reported without their values.
+  New folders or a new name restart the daemon once tasks finish.
   On macOS it writes `{"type":"hello","features":["permissions.v1"]}` to
   the daemon's stdin after spawn and answers `permission.request` lines with
   `permission.response` from `src/main/system-permissions.ts` (the app's
@@ -388,7 +577,11 @@ Gateway and runs Agents. The daemon exits with the app.
   failed state with that reason, and Retry runs the migration again. There is
   no downgrade path: an older build reads neither the converted instances nor
   the moved data folder. The bundle ID and
-  Windows AppUserModelID are `com.simplexai.linger.desktop.preview`. The
+  Windows AppUserModelID are `com.simplexai.linger.desktop.preview`. On
+  Windows, `markStartMenuShortcut` (`src/main/start-menu-shortcut.ts`) updates
+  `Linger.lnk` only when `LINGER_DESKTOP_USER_DATA` is unset and the shortcut
+  already targets the current executable (after canonicalizing both absolute
+  paths); write failures log a warning without aborting startup. The
   Windows setup installs into `%LOCALAPPDATA%\Programs\Linger`; on upgrade it
   closes and removes `%LOCALAPPDATA%\Programs\Simplex` and moves the
   "Open at login" Run value from `ai.simplex.desktop.preview` to the new id.
@@ -417,7 +610,10 @@ Gateway and runs Agents. The daemon exits with the app.
   quit a running app). Retry in that prompt runs the stop again. Nothing running: the stop finds nothing and setup goes on. The
   stop also asks the pinned localmodels kit, when that kit is installed in the
   home, to unload every model its model library loaded (`library status`,
-  then `library unload` for each `loaded` model), to end its foundations
+  then `library cancel` for each `loading` model, `library status` every
+  500 ms for up to 10 s until none is loading, and `library unload` for each
+  model the last read shows `loaded`; a model still loading then is a stop
+  failure), to end its foundations
   controller under `runtime/model-services` (`foundations stop`), and to stop
   the stack's processes and the gateway the tool started, the library's
   Bifrost included (`stack down`); it downloads nothing, and Linger does not

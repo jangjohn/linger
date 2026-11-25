@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
 )
 
 var (
@@ -142,11 +146,11 @@ func codexMemoryDisabled(result json.RawMessage) bool {
 	return true
 }
 
-// unload unsubscribes the loaded thread and, when supported, waits until
+// unload unsubscribes the loaded thread and, on a Daemon-owned home, waits until
 // the app-server no longer lists it.
 func (op *codexOperation) unload(ctx context.Context, threadID string) error {
 	budget := op.budget("thread/unsubscribe")
-	confirm := codexSupportsImmediateUnload(op.proc.version, op.proc.home)
+	confirm := codexUnloadsImmediately(op.proc.home)
 	unloadCtx, cancel := context.WithTimeoutCause(ctx, budget, &codexHandshakeTimeout{method: "thread/unsubscribe", budget: budget})
 	defer cancel()
 	op.markSetup("thread/unsubscribe")
@@ -216,13 +220,24 @@ func (op *codexOperation) openThread(ctx context.Context) error {
 	if spec.Effort != "" {
 		config["model_reasoning_effort"] = spec.Effort
 	}
-	if limit := toolOutputTokenLimit(spec.ContextWindow); limit != toolOutputTokens && stableCodexAtLeast(op.proc.version, codexToolOutputLimitVersion) {
+	if limit := toolOutputTokenLimit(spec.ContextWindow); limit != toolOutputTokens {
 		config["tool_output_token_limit"] = limit
 	}
+	hooks := map[string]any{}
+	// Codex runs a Windows command under PowerShell, whose quoting the shell
+	// text rule does not describe.
+	if spec.ShellTextHook != "" && runtime.GOOS != "windows" {
+		hooks["PreToolUse"] = permission.CodexShellTextHooks(spec.ShellTextHook)
+	}
 	if hook := spec.CodexPermissionHook; hook != nil {
-		params["approvalPolicy"], params["approvalsReviewer"] = "untrusted", "user"
+		if hook.ReviewPermissions {
+			params["approvalPolicy"], params["approvalsReviewer"] = "untrusted", "user"
+		}
+		maps.Copy(hooks, hook.Config)
+	}
+	if len(hooks) > 0 {
 		config["bypass_hook_trust"] = true
-		config["hooks"] = hook.Config
+		config["hooks"] = hooks
 	}
 	if len(config) > 0 {
 		params["config"] = config

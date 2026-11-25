@@ -16,15 +16,14 @@ import type {
   TeamHubExternalApp,
   TeamHubExternalConnection,
 } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import { useT } from "@/i18n/use-translation";
 
-import {
-  DISCORD_SERVER_UNCONFIRMED_MESSAGE,
-  INSUFFICIENT_PERMISSION_MESSAGE,
-} from "./authorization-error";
 import {
   externalConnectionQueryOptions,
   externalConnectionsQueryKey,
 } from "./connected-apps-queries";
+import { appDescription } from "./app-groups";
 import { ConnectAppStatus, useConnectAppFlow } from "./connect-app-flow";
 import {
   establishedExternalConnections,
@@ -34,6 +33,13 @@ import {
   externalConnectionEstablished,
   externalConnectionUnconfirmed,
 } from "./connection-state";
+import { connectorMessages as m } from "./connectors.messages";
+
+import {
+  FeishuConnectGuide,
+  isFeishuConnectError,
+  useFeishuMailSetup,
+} from "./feishu-connect-guide";
 
 export function AppManageDialog({
   app,
@@ -44,6 +50,7 @@ export function AppManageDialog({
   connections: TeamHubExternalConnection[];
   onClose: () => void;
 }) {
+  const t = useT();
   const [disconnecting, setDisconnecting] =
     useState<TeamHubExternalConnection | null>(null);
   // Without a Composio key, Connect opens the key dialog on top of this one.
@@ -58,6 +65,16 @@ export function AppManageDialog({
       externalConnectionNeedsAttention(connection),
   );
   const canConnect = connectFlow.canStart(app);
+  const checksFeishuSetup = app.key === "feishu_mail" && canConnect;
+  const setup = useFeishuMailSetup(checksFeishuSetup);
+  const connectionError = connectFlow.connection.error;
+  const failedConnect =
+    checksFeishuSetup && isFeishuConnectError(connectionError);
+  const setupError = checksFeishuSetup ? setup.error : undefined;
+  const canAuthorize =
+    canConnect &&
+    (!checksFeishuSetup ||
+      (!setup.isFetching && !setup.isPending && !setupError && !failedConnect));
   const supportsAutoReminders = app.capabilities.includes(
     "proactive_reminders",
   );
@@ -66,20 +83,32 @@ export function AppManageDialog({
     <>
       <ModalDialog
         closeOnBackdrop
-        description={app.description}
+        description={appDescription(app, t)}
         onClose={onClose}
         size="md"
         title={app.display_name}
       >
         <div className="px-5 py-4">
-          {canConnect ? (
+          {setupError || failedConnect ? (
+            <Button
+              disabled={setup.isFetching || connectFlow.connection.isPending}
+              onClick={() => {
+                connectFlow.connection.clearError();
+                void setup.refetch();
+              }}
+              size="compact"
+              tone="secondary"
+            >
+              {t(m.feishuCheckAgain)}
+            </Button>
+          ) : canConnect ? (
             <Button
               aria-label={
                 established.length
-                  ? `Add another ${app.display_name} account`
-                  : `Connect ${app.display_name}`
+                  ? t(m.addAnotherAccount, { app: app.display_name })
+                  : t(m.connectApp, { app: app.display_name })
               }
-              disabled={connectFlow.connection.isPending}
+              disabled={!canAuthorize || connectFlow.connection.isPending}
               onClick={() =>
                 connectFlow.start(
                   app,
@@ -90,19 +119,28 @@ export function AppManageDialog({
               tone="secondary"
             >
               <Icon icon={PlusSignIcon} size={14} />
-              {established.length ? "Add account" : "Connect"}
+              {established.length ? t(m.addAccount) : t(m.connect)}
             </Button>
           ) : (
             <Button disabled size="compact">
-              Connect
+              {t(m.connect)}
             </Button>
           )}
+          {setupError && !failedConnect ? (
+            isFeishuConnectError(setupError) ? (
+              <FeishuConnectGuide className="mt-3" error={setupError} />
+            ) : (
+              <p className="mt-3 text-xs text-app-danger" role="alert">
+                {setupError.message}
+              </p>
+            )
+          ) : null}
           <ConnectAppStatus className="mt-3" flow={connectFlow} />
           {rows.length ? (
             <div className="mt-4 divide-y divide-border border-t border-border">
               {rows.map((connection) => (
                 <ConnectionRow
-                  canReconnect={canConnect}
+                  canReconnect={canAuthorize}
                   connection={connection}
                   key={connection.id}
                   supportsAutoReminders={supportsAutoReminders}
@@ -149,6 +187,7 @@ function ConnectionRow({
 }) {
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
+  const t = useT();
   const needsReconnecting = externalConnectionNeedsAttention(connection);
   const statusCheck = useMutation({
     mutationFn: () =>
@@ -166,7 +205,7 @@ function ConnectionRow({
   const duplicateIdentity =
     connection.status_error_code === "duplicate_remote_principal";
   const unconfirmed = externalConnectionUnconfirmed(connection);
-  const label = connection.identity_label ?? connection.provider;
+  const account = connection.identity_label ?? connection.provider;
 
   return (
     <div className="flex min-h-[58px] flex-wrap items-center gap-3 py-2.5">
@@ -175,11 +214,12 @@ function ConnectionRow({
           {accountIdentityText(
             connection.provider,
             connection.identity_label,
-          ) ?? "Authorization in progress"}
+            t,
+          ) ?? t(m.authorizationInProgress)}
         </p>
         <div className="mt-1 flex flex-wrap items-center gap-2">
           {needsReconnecting ? (
-            <StatusPill tone="warning">Needs reconnecting</StatusPill>
+            <StatusPill tone="warning">{t(m.needsReconnecting)}</StatusPill>
           ) : (
             <ConnectionStatus
               status={connection.status}
@@ -191,11 +231,13 @@ function ConnectionRow({
       <div className="flex flex-wrap items-center gap-1.5">
         {connection.status === "active" || unconfirmed ? (
           <Button
-            aria-label={unconfirmed ? `Check again ${label}` : `Check ${label}`}
+            aria-label={t(unconfirmed ? m.checkAccountAgain : m.checkAccount, {
+              account,
+            })}
             disabled={statusCheck.isPending || checking}
             onClick={() => statusCheck.mutate()}
             size="compactIcon"
-            title={unconfirmed ? "Check again" : "Check connection"}
+            title={t(unconfirmed ? m.checkAgain : m.checkConnection)}
             tone="ghost"
           >
             <Icon
@@ -209,21 +251,21 @@ function ConnectionRow({
         ) : null}
         {needsReconnecting && canReconnect ? (
           <Button
-            aria-label={`Reconnect ${connection.identity_label ?? connection.provider}`}
+            aria-label={t(m.reconnectAccount, { account })}
             disabled={reconnecting}
             onClick={onReconnect}
             size="compact"
             tone="secondary"
           >
-            Reconnect
+            {t(m.reconnect)}
           </Button>
         ) : null}
         {!["disconnecting", "revoke_pending"].includes(connection.status) ? (
           <Button
-            aria-label={`Disconnect ${connection.identity_label ?? connection.provider}`}
+            aria-label={t(m.disconnectAccount, { account })}
             onClick={onDisconnect}
             size="compactIcon"
-            title="Disconnect"
+            title={t(m.disconnect)}
             tone="ghost"
           >
             <Icon icon={Delete02Icon} size={14} />
@@ -232,24 +274,26 @@ function ConnectionRow({
       </div>
       {unconfirmed ? (
         <p className="basis-full text-xs text-app-danger" role="alert">
-          {connection.status_error_code === "discord_guild_required"
-            ? `${DISCORD_SERVER_UNCONFIRMED_MESSAGE} Check again, or disconnect and reconnect.`
-            : "The connection couldn't be confirmed yet. Check again."}
+          {t(
+            connection.status_error_code === "discord_guild_required"
+              ? m.discordUnconfirmedInDialog
+              : m.connectionUnconfirmed,
+          )}
         </p>
       ) : null}
       {connection.status_error_code === "provider_auth_failed" ? (
         <p className="basis-full text-xs text-app-danger" role="alert">
-          {INSUFFICIENT_PERMISSION_MESSAGE}
+          {t(m.insufficientPermission)}
         </p>
       ) : null}
       {statusCheck.error ? (
         <p className="basis-full text-xs text-app-danger" role="alert">
-          {errorMessage(statusCheck.error, "Connection action failed.")}
+          {errorMessage(statusCheck.error, t(m.connectionActionFailed))}
         </p>
       ) : null}
       {duplicateIdentity ? (
         <p className="basis-full text-xs text-app-danger" role="alert">
-          This account is already connected.
+          {t(m.accountAlreadyConnected)}
         </p>
       ) : null}
       {connection.status === "active" && supportsAutoReminders ? (
@@ -266,6 +310,7 @@ function AutoReminders({
 }) {
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
+  const t = useT();
   const update = useMutation({
     mutationFn: (enabled: boolean) =>
       client.setExternalConnectionAutoReminders(connection.id, enabled),
@@ -284,14 +329,16 @@ function AutoReminders({
       <label className="flex min-h-8 items-center justify-between gap-3">
         <span className="min-w-0">
           <span className="block text-sm font-medium text-foreground">
-            Auto reminders
+            {t(m.autoReminders)}
           </span>
           <span className="block text-xs text-muted-foreground">
-            Agents check this account for things that need your attention.
+            {t(m.autoRemindersHint)}
           </span>
         </span>
         <input
-          aria-label={`Auto reminders for ${connection.identity_label ?? connection.provider}`}
+          aria-label={t(m.autoRemindersFor, {
+            account: connection.identity_label ?? connection.provider,
+          })}
           checked={enabled}
           className="agent-connector-switch"
           disabled={update.isPending}
@@ -302,7 +349,7 @@ function AutoReminders({
       </label>
       {update.error ? (
         <p className="mt-1 text-xs text-app-danger" role="alert">
-          {errorMessage(update.error, "Auto reminders could not be updated.")}
+          {errorMessage(update.error, t(m.autoRemindersNotUpdated))}
         </p>
       ) : null}
     </div>
@@ -318,6 +365,7 @@ export function DisconnectConnectionDialog({
 }) {
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
+  const t = useT();
   const [disconnected, setDisconnected] = useState(false);
   const disconnect = useMutation({
     mutationFn: () =>
@@ -349,16 +397,23 @@ export function DisconnectConnectionDialog({
   return (
     <ModalDialog
       description={
-        accountIdentityText(connection.provider, connection.identity_label) ??
-        connection.provider
+        accountIdentityText(
+          connection.provider,
+          connection.identity_label,
+          t,
+        ) ?? connection.provider
       }
       onClose={onClose}
       size="md"
-      title="Disconnect account?"
+      title={t(m.disconnectTitle)}
       footer={
         <>
-          <Button disabled={disconnect.isPending} onClick={onClose}>
-            {disconnected ? "Close" : "Cancel"}
+          <Button
+            data-voice-close={disconnected ? "" : undefined}
+            disabled={disconnect.isPending}
+            onClick={onClose}
+          >
+            {t(disconnected ? commonMessages.close : commonMessages.cancel)}
           </Button>
           {!disconnected ? (
             <Button
@@ -366,24 +421,22 @@ export function DisconnectConnectionDialog({
               onClick={() => disconnect.mutate()}
               tone="danger"
             >
-              Disconnect
+              {t(m.disconnect)}
             </Button>
           ) : null}
         </>
       }
     >
       <div className="px-5 py-4">
-        <p className="text-sm text-muted-foreground">
-          Agents lose access to this account. Content already imported is kept.
-        </p>
+        <p className="text-sm text-muted-foreground">{t(m.disconnectBody)}</p>
         {ended ? (
           <div
             className="mt-4 space-y-1 border-y border-border py-3 text-sm"
             role="status"
           >
-            <p>App access stopped in Linger.</p>
+            <p>{t(m.accessStopped)}</p>
             <p className="text-muted-foreground">
-              Provider authorization: {revokeLabel(ended)}
+              {t(providerAuthorization(ended))}
             </p>
           </div>
         ) : null}
@@ -391,7 +444,7 @@ export function DisconnectConnectionDialog({
           <p className="mt-3 text-sm text-app-danger" role="alert">
             {errorMessage(
               disconnect.error ?? current.error,
-              "Account could not be disconnected.",
+              t(m.accountNotDisconnected),
             )}
           </p>
         ) : null}
@@ -407,13 +460,16 @@ function ConnectionStatus({
   status: TeamHubExternalConnection["status"];
   unconfirmed: boolean;
 }) {
+  const t = useT();
   return (
     <StatusPill tone={status === "active" ? "success" : "warning"}>
-      {status === "active"
-        ? "Active"
-        : unconfirmed
-          ? "Not confirmed"
-          : "Disconnecting"}
+      {t(
+        status === "active"
+          ? m.statusActive
+          : unconfirmed
+            ? m.statusNotConfirmed
+            : m.statusDisconnecting,
+      )}
     </StatusPill>
   );
 }
@@ -424,9 +480,10 @@ function errorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-function revokeLabel(connection: TeamHubExternalConnection) {
-  if (connection.status === "revoked") return "revoked";
+/** How far the provider is with taking the authorization back. */
+function providerAuthorization(connection: TeamHubExternalConnection) {
+  if (connection.status === "revoked") return m.providerAuthorizationRevoked;
   if (connection.status_error_code?.startsWith("provider_revoke_"))
-    return "retrying";
-  return "pending";
+    return m.providerAuthorizationRetrying;
+  return m.providerAuthorizationPending;
 }

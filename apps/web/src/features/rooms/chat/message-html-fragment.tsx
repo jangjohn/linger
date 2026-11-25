@@ -7,8 +7,11 @@ import {
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/components/ui/icon";
 
+import { commonMessages } from "@/i18n/common.messages";
+import { useT } from "@/i18n/use-translation";
 import { writeClipboardText } from "@/lib/clipboard";
 
+import { chatMessages } from "./chat.messages";
 import {
   appFontFaces,
   currentFragmentTheme,
@@ -181,6 +184,7 @@ function FragmentHostActions({ html, title }: { html: string; title: string }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const t = useT();
 
   useEffect(() => {
     if (!open) return;
@@ -212,7 +216,7 @@ function FragmentHostActions({ html, title }: { html: string; title: string }) {
       <button
         aria-expanded={open}
         aria-haspopup="menu"
-        aria-label="Widget actions"
+        aria-label={t(chatMessages.widgetActions)}
         className="flex size-7 items-center justify-center rounded-md border border-transparent bg-app-surface text-app-muted shadow-sm transition-colors hover:bg-app-hover hover:text-app-ink"
         onClick={() => setOpen((current) => !current)}
         type="button"
@@ -242,7 +246,9 @@ function FragmentHostActions({ html, title }: { html: string; title: string }) {
             ) : (
               <Icon icon={Copy01Icon} size={16} />
             )}
-            {copied ? "Copied" : "Copy to clipboard"}
+            {copied
+              ? t(commonMessages.copied)
+              : t(chatMessages.copyToClipboard)}
           </button>
           <button
             className="flex w-full shrink-0 items-center gap-2.5 whitespace-nowrap rounded-lg px-2 py-2 text-left text-sm text-app-ink hover:bg-app-hover"
@@ -254,7 +260,7 @@ function FragmentHostActions({ html, title }: { html: string; title: string }) {
             type="button"
           >
             <Icon icon={Download04Icon} size={16} />
-            Download file
+            {t(chatMessages.downloadFile)}
           </button>
         </div>
       ) : null}

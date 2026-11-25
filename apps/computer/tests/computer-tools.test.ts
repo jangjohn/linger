@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -51,6 +51,240 @@ it("keeps Pi's public MCP extension bound to private Operation proxies", async (
     expect(result.stdout).toContain(
       "private immutable MCP configuration passed",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it.skipIf(process.platform === "win32")(
+  "refuses a bash call the Daemon's shell-text-hook refuses",
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "linger-pi-shell-text-"));
+    try {
+      const hook = path.join(root, "daemon");
+      await writeFile(
+        hook,
+        `#!${process.execPath}
+let input = "";
+process.stdin.on("data", (chunk) => (input += chunk));
+process.stdin.on("end", () => {
+  const { tool_input } = JSON.parse(input);
+  if (process.argv[2] !== "shell-text-hook" || !tool_input.command.includes("$1")) process.exit(0);
+  process.stderr.write("Not run: use a quoted heredoc\\n");
+  process.exit(2);
+});
+`,
+        { mode: 0o700 },
+      );
+      const result = await run(
+        process.execPath,
+        [
+          "--input-type=module",
+          "--eval",
+          `
+      import assert from "node:assert/strict";
+      import { refuseRewrittenShellText } from ${JSON.stringify(new URL("../tools/pi-mcp.mjs", import.meta.url).href)};
+      const hook = ${JSON.stringify(hook)};
+      const bash = (command) => ({ toolName: "bash", input: { command } });
+      assert.deepEqual(
+        await refuseRewrittenShellText(bash('teamhub message send --content "Quote: $180"'), hook),
+        { block: true, reason: "Not run: use a quoted heredoc" },
+      );
+      assert.equal(await refuseRewrittenShellText(bash('teamhub message send --content "Total $TOTAL"'), hook), undefined);
+      assert.equal(await refuseRewrittenShellText(bash('teamhub message send --content "Done."'), hook), undefined);
+      assert.equal(await refuseRewrittenShellText({ toolName: "read", input: { path: "$1" } }, hook), undefined);
+      assert.equal(await refuseRewrittenShellText(bash('teamhub message send --content "$180"'), ${JSON.stringify(path.join(root, "missing"))}), undefined);
+      assert.equal(await refuseRewrittenShellText(bash('teamhub message send --content "$180"'), undefined), undefined);
+      console.log("shell text check passed");
+    `,
+        ],
+        { timeout: 20_000 },
+      );
+      expect(result.stdout).toContain("shell text check passed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+it("asks the Daemon about Pi commands and MCP calls and blocks unless allowed", async () => {
+  const entry = new URL("../tools/pi-mcp.mjs", import.meta.url).href;
+  const { PERMISSION_REVIEW, reviewToolCall } = (await import(entry)) as {
+    PERMISSION_REVIEW: string;
+    reviewToolCall: (
+      event: { toolName: string; input: Record<string, unknown> },
+      ui: { input: (title: string, placeholder: string) => Promise<unknown> },
+    ) => Promise<unknown>;
+  };
+  const asked: Array<{ title: string; call: unknown }> = [];
+  const ui = (answer: string | undefined) => ({
+    input: async (title: string, placeholder: string) => {
+      asked.push({ title, call: JSON.parse(placeholder) });
+      return answer;
+    },
+  });
+  const bash = { toolName: "bash", input: { command: "git push" } };
+
+  expect(
+    await reviewToolCall({ toolName: "read", input: {} }, ui("")),
+  ).toBeUndefined();
+  expect(asked).toEqual([]);
+  expect(
+    await reviewToolCall(bash, ui(JSON.stringify({ allow: true }))),
+  ).toBeUndefined();
+  expect(asked).toEqual([{ title: PERMISSION_REVIEW, call: bash }]);
+  expect(
+    await reviewToolCall(
+      { toolName: "mcp__computer__click", input: {} },
+      ui(JSON.stringify({ allow: false, message: "not now" })),
+    ),
+  ).toEqual({ block: true, reason: "not now" });
+  expect(await reviewToolCall(bash, ui(undefined))).toEqual({
+    block: true,
+    reason: "bash was not approved",
+  });
+});
+
+it("synchronizes managed MCP servers dynamically and reports structured verdicts", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "linger-pi-sync-mcp-"));
+  try {
+    const configPath = path.join(root, "linger-mcp.json");
+    const entry = new URL("../tools/pi-mcp.mjs", import.meta.url).href;
+    const mod = (await import(entry)) as {
+      MCP_SYNC_COMMAND: string;
+      MCP_SYNC_DIALOG: string;
+      mountManagedMcp: (
+        pi: Record<string, unknown>,
+        configPath: string,
+        mountExtension: (pi: Record<string, unknown>) => Promise<void>,
+      ) => Promise<void>;
+    };
+    const writeConfig = (mcpServers: Record<string, unknown>) =>
+      writeFile(configPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+    const proxy = (port: number, name: string) => ({
+      type: "http",
+      url: `http://127.0.0.1:${port}/mcp/tok/${name}`,
+    });
+    await writeConfig({});
+
+    type EventHandler = (event: unknown, ctx: unknown) => Promise<void> | void;
+    type CommandHandler = (args: string, ctx: unknown) => Promise<void>;
+    const registered = new Map<string, Record<string, unknown>>();
+    const handlers = new Map<string, EventHandler[]>();
+    const commands = new Map<string, { handler: CommandHandler }>();
+    const notifications: string[] = [];
+    let nextNotice: { message: string; type: "warning" | "error" } | undefined;
+
+    const emit = async (event: string, payload: unknown) => {
+      // Real Pi exposes ExtensionContext.ui as a getter-only property.
+      const ui = {
+        get notify() {
+          return (_message: string, type: string) => notifications.push(type);
+        },
+      };
+      const ctx = {
+        get ui() {
+          return ui;
+        },
+      };
+      for (const handler of handlers.get(event) ?? []) {
+        await handler(payload, ctx);
+      }
+    };
+
+    const fakePi = {
+      on: (event: string, handler: EventHandler) => {
+        handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+      },
+      getMcpServers: () =>
+        [...registered.entries()].map(([name, config]) => ({
+          name,
+          config: structuredClone(config),
+          extensionPath: entry,
+        })),
+      registerMcpServer: (name: string, config: Record<string, unknown>) => {
+        registered.set(name, structuredClone(config));
+        void emit("mcp_servers_change", { servers: fakePi.getMcpServers() });
+      },
+      unregisterMcpServer: (name: string) => {
+        if (registered.delete(name)) {
+          void emit("mcp_servers_change", { servers: fakePi.getMcpServers() });
+        }
+      },
+      registerCommand: (name: string, def: { handler: CommandHandler }) => {
+        commands.set(name, def);
+      },
+    };
+
+    await mod.mountManagedMcp(fakePi, configPath, async (mcpPi) => {
+      (mcpPi.on as typeof fakePi.on)(
+        "mcp_servers_change",
+        async (_ev, rawCtx) => {
+          const { ui } = rawCtx as {
+            ui: { notify: (message: string, type: string) => void };
+          };
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          if (nextNotice) {
+            const notice = nextNotice;
+            nextNotice = undefined;
+            ui.notify(notice.message, notice.type);
+          }
+        },
+      );
+    });
+    expect(registered.size).toBe(0);
+
+    const runSync = async () => {
+      let verdict: { title: string; payload: unknown } | undefined;
+      await commands.get(mod.MCP_SYNC_COMMAND)!.handler("", {
+        ui: {
+          input: async (title: string, placeholder: string) => {
+            verdict = { title, payload: JSON.parse(placeholder) };
+            return "ok";
+          },
+        },
+      });
+      return verdict;
+    };
+
+    const ok = { title: mod.MCP_SYNC_DIALOG, payload: { ok: true } };
+    await writeConfig({
+      computer: proxy(4101, "computer"),
+      docs: proxy(4101, "docs"),
+    });
+    expect(await runSync()).toEqual(ok);
+    expect([...registered.keys()].sort()).toEqual(["computer", "docs"]);
+
+    // Replace one server and drop the other.
+    await writeConfig({ computer: proxy(4102, "computer") });
+    expect(await runSync()).toEqual(ok);
+    expect([...registered.keys()]).toEqual(["computer"]);
+    expect(registered.get("computer")?.url).toBe(proxy(4102, "computer").url);
+
+    // Per-server connection warnings pass through without failing warm attach.
+    nextNotice = {
+      type: "warning",
+      message: "MCP servers need attention:\n  flaky: failed",
+    };
+    await writeConfig({
+      computer: proxy(4102, "computer"),
+      flaky: proxy(4102, "flaky"),
+    });
+    expect(await runSync()).toEqual(ok);
+
+    // Hard runtime errors fail the verdict so the Daemon falls back cleanly.
+    nextNotice = { type: "error", message: "MCP failed to load: boom" };
+    await writeConfig({
+      computer: proxy(4102, "computer"),
+      flaky: proxy(4102, "flaky"),
+      broken: proxy(4102, "broken"),
+    });
+    expect(await runSync()).toEqual({
+      title: mod.MCP_SYNC_DIALOG,
+      payload: { ok: false, error: "MCP failed to load: boom" },
+    });
+    expect(notifications).toEqual(["warning", "error"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

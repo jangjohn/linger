@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { resetLanguageForTest, setLanguage } from "@/i18n/language";
+import zhCN from "@/i18n/locales/zh-CN.json";
 
 import {
   describeVoiceMediaError,
@@ -7,6 +10,7 @@ import {
   matchBoundVoiceMicrophone,
   requestVoiceMicrophones,
   retryOnVoiceMediaAbort,
+  VoiceMicrophoneError,
 } from "./microphone-devices";
 
 describe("requestVoiceMicrophones", () => {
@@ -296,3 +300,60 @@ function device(
     label,
   } as MediaDeviceInfo;
 }
+
+describe("VoiceMicrophoneError", () => {
+  afterEach(() => resetLanguageForTest());
+
+  it("is told apart by its code and worded in the language on screen", async () => {
+    const unbound = new VoiceMicrophoneError("no-binding");
+    const timedOut = new VoiceMicrophoneError("timeout");
+    expect(unbound.code).toBe("no-binding");
+    expect(describeVoiceMediaError(unbound)).toBe(
+      "Connect a microphone before enabling voice",
+    );
+
+    await setLanguage("zh-CN");
+
+    expect(describeVoiceMediaError(unbound)).toBe(
+      zhCN.recording.connectMicrophone,
+    );
+    expect(describeVoiceMediaError(timedOut)).toBe(
+      zhCN.recording.microphoneTimedOut,
+    );
+  });
+});
+
+describe("a refused microphone", () => {
+  const refused = new DOMException("Permission denied", "NotAllowedError");
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetLanguageForTest();
+  });
+
+  it("says the browser refused it in a browser", () => {
+    expect(describeVoiceMediaError(refused)).toBe(
+      "Microphone permission was denied",
+    );
+  });
+
+  it("points the Mac desktop app to System Settings", async () => {
+    vi.stubGlobal("window", { lingerDesktop: { platform: "darwin" } });
+    expect(describeVoiceMediaError(refused)).toBe(
+      "Linger can't use the microphone. Allow Linger in System Settings › Privacy & Security › Microphone, then try again.",
+    );
+
+    await setLanguage("zh-CN");
+
+    expect(describeVoiceMediaError(refused)).toBe(
+      zhCN.recording.microphoneBlockedOnMac,
+    );
+  });
+
+  it("keeps the browser wording in the desktop app off macOS", () => {
+    vi.stubGlobal("window", { lingerDesktop: { platform: "win32" } });
+    expect(describeVoiceMediaError(refused)).toBe(
+      "Microphone permission was denied",
+    );
+  });
+});

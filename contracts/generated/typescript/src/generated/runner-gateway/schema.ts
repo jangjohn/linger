@@ -204,7 +204,16 @@ export const runnerGatewayEnvelopeSchema = {
     ServiceFeature: {
       description:
         "An optional Runner behavior the Agent Service accepts. An older service rejects its frames as a protocol violation.",
-      enum: ["local_models", "byok_endpoint"],
+      enum: [
+        "local_models",
+        "byok_endpoint",
+        "local_models_diagnostics",
+        "model_invoke_outcomes",
+        "local_models_engine",
+        "local_models_concurrency_probe",
+        "local_model_unavailable",
+        "local_models_external_holders",
+      ],
     },
     Timestamp: {
       type: "string",
@@ -2175,7 +2184,7 @@ export const runnerGatewayEnvelopeSchema = {
     },
     LocalModelErrorCode: {
       description:
-        "Closed localmodels library error set. Extend it only together with the localmodels library contract.",
+        "Closed localmodels library error set. Extend it only together with the localmodels library contract; UNKNOWN_ERROR preserves forward compatibility with newer localmodels releases.",
       enum: [
         "MODEL_UNKNOWN",
         "INVALID_STATE",
@@ -2183,6 +2192,9 @@ export const runnerGatewayEnvelopeSchema = {
         "MEMORY_INSUFFICIENT",
         "DISK_INSUFFICIENT",
         "PLATFORM_UNSUPPORTED",
+        "GPU_UNSUPPORTED",
+        "DRIVER_UPDATE_REQUIRED",
+        "RUNTIME_DEPENDENCY_MISSING",
         "LOAD_NO_ROOM",
         "DOWNLOAD_FAILED",
         "CHECKSUM_MISMATCH",
@@ -2193,6 +2205,7 @@ export const runnerGatewayEnvelopeSchema = {
         "MODEL_FILES_MISSING",
         "GATEWAY_REGISTRATION_FAILED",
         "CANCELLED",
+        "UNKNOWN_ERROR",
       ],
     },
     LocalModelsUnavailableCode: {
@@ -2210,6 +2223,9 @@ export const runnerGatewayEnvelopeSchema = {
         "MEMORY_INSUFFICIENT",
         "DISK_INSUFFICIENT",
         "PLATFORM_UNSUPPORTED",
+        "GPU_UNSUPPORTED",
+        "DRIVER_UPDATE_REQUIRED",
+        "RUNTIME_DEPENDENCY_MISSING",
         "LOAD_NO_ROOM",
         "DOWNLOAD_FAILED",
         "CHECKSUM_MISMATCH",
@@ -2220,6 +2236,7 @@ export const runnerGatewayEnvelopeSchema = {
         "MODEL_FILES_MISSING",
         "GATEWAY_REGISTRATION_FAILED",
         "CANCELLED",
+        "UNKNOWN_ERROR",
         "TOOL_NOT_INSTALLED",
         "TOOL_FAILED",
       ],
@@ -2319,6 +2336,23 @@ export const runnerGatewayEnvelopeSchema = {
         },
       },
     },
+    LocalModelPoolExternalHolder: {
+      description:
+        "A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close.",
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "bytes"],
+      properties: {
+        name: {
+          type: "string",
+          minLength: 1,
+          maxLength: 200,
+        },
+        bytes: {
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+      },
+    },
     LocalModelPool: {
       description:
         "One place models load into. The system and unified budgets are 80% of RAM, as localmodels computes them.",
@@ -2350,6 +2384,16 @@ export const runnerGatewayEnvelopeSchema = {
             $ref: "#/$defs/LocalModelPoolHolder",
           },
         },
+        external_holders: {
+          description:
+            "Closeable desktop applications holding this pool's memory, as localmodels reports them. [] means localmodels looked and found none; an absent field means not reported. Sent only when service_features declares local_models_external_holders.",
+          type: "array",
+          minItems: 0,
+          maxItems: 256,
+          items: {
+            $ref: "#/$defs/LocalModelPoolExternalHolder",
+          },
+        },
       },
     },
     LocalModelAvailabilityReason: {
@@ -2362,6 +2406,10 @@ export const runnerGatewayEnvelopeSchema = {
             "MEMORY_INSUFFICIENT",
             "DISK_INSUFFICIENT",
             "PLATFORM_UNSUPPORTED",
+            "GPU_UNSUPPORTED",
+            "DRIVER_UPDATE_REQUIRED",
+            "RUNTIME_DEPENDENCY_MISSING",
+            "UNAVAILABLE",
           ],
         },
         need_bytes: {
@@ -2369,6 +2417,86 @@ export const runnerGatewayEnvelopeSchema = {
         },
         have_bytes: {
           $ref: "#/$defs/NonNegativeInteger",
+        },
+        memory_kind: {
+          description:
+            "With MEMORY_INSUFFICIENT: which memory space was short.",
+          enum: ["vram", "ram", "unified"],
+        },
+        gpu_vendor: {
+          description:
+            "With GPU_UNSUPPORTED: detected GPU vendor class on this Computer.",
+          enum: ["amd", "intel", "none", "unknown"],
+        },
+        required_cuda: {
+          description:
+            "With DRIVER_UPDATE_REQUIRED: minimum CUDA version required by the pinned engine.",
+          type: "string",
+          minLength: 1,
+          maxLength: 32,
+        },
+        detected_cuda: {
+          description:
+            "With DRIVER_UPDATE_REQUIRED: CUDA version reported by the installed driver.",
+          type: "string",
+          minLength: 1,
+          maxLength: 32,
+        },
+        driver_version: {
+          description:
+            "With DRIVER_UPDATE_REQUIRED: installed NVIDIA driver version.",
+          type: "string",
+          minLength: 1,
+          maxLength: 64,
+        },
+        missing_libraries: {
+          description:
+            "With RUNTIME_DEPENDENCY_MISSING: missing shared libraries such as libgomp.so.1.",
+          type: "array",
+          minItems: 1,
+          maxItems: 16,
+          uniqueItems: true,
+          items: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+          },
+        },
+        required_glibc: {
+          description:
+            "With RUNTIME_DEPENDENCY_MISSING: minimum glibc version required by the engine.",
+          type: "string",
+          minLength: 1,
+          maxLength: 32,
+        },
+        detected_glibc: {
+          description:
+            "With RUNTIME_DEPENDENCY_MISSING: glibc version detected on this Computer.",
+          type: "string",
+          minLength: 1,
+          maxLength: 32,
+        },
+      },
+    },
+    LocalModelsDebugInfo: {
+      description:
+        "Present on LocalModelsSnapshot only when localmodels debug mode (tiny or simulate) is active on the Computer.",
+      type: "object",
+      additionalProperties: false,
+      required: ["mode", "source"],
+      properties: {
+        mode: {
+          enum: ["tiny", "simulate"],
+        },
+        source: {
+          enum: ["env", "state_config", "user_config"],
+        },
+        config_path: {
+          description:
+            "Local config file path when source is state_config or user_config; stripped for non-owners in the public view.",
+          type: "string",
+          minLength: 1,
+          maxLength: 4096,
         },
       },
     },
@@ -2482,6 +2610,12 @@ export const runnerGatewayEnvelopeSchema = {
       description: "Model capability verified by localmodels on this platform.",
       type: "string",
       enum: ["vision", "tool_use", "reasoning", "coding", "multilingual"],
+    },
+    LocalModelEngine: {
+      description:
+        "Inference engine family that runs this model entry. Never inferred from name or description.",
+      type: "string",
+      enum: ["llama.cpp", "polystrata", "strata"],
     },
     LocalModel: {
       description:
@@ -2644,6 +2778,35 @@ export const runnerGatewayEnvelopeSchema = {
           type: "number",
           minimum: 0,
         },
+        engine: {
+          description:
+            "Inference engine family for this model. Sent only when runner.welcome service_features names local_models_engine.",
+          $ref: "#/$defs/LocalModelEngine",
+        },
+        engine_label: {
+          description:
+            "Display-only engine version and backend for this model. Sent only when runner.welcome service_features names local_models_engine.",
+          type: "string",
+          minLength: 1,
+          maxLength: 120,
+        },
+        concurrency: {
+          description:
+            "Maximum concurrent request slots configured or probed for this model when loaded. Sent only when runner.welcome service_features names local_models_engine.",
+          type: "integer",
+          minimum: 1,
+          maximum: 64,
+        },
+        concurrency_probing: {
+          description:
+            "True while a model is running its post-load max-concurrency probe before reporting loaded. Sent only when runner.welcome service_features names local_models_concurrency_probe.",
+          type: "boolean",
+        },
+        host_ram_bytes: {
+          description:
+            "Additional host system RAM used alongside GPU VRAM for hybrid offload engines. Sent only when runner.welcome service_features names local_models_engine.",
+          $ref: "#/$defs/NonNegativeInteger",
+        },
       },
     },
     LocalModelsUnavailableReason: {
@@ -2700,6 +2863,11 @@ export const runnerGatewayEnvelopeSchema = {
           items: {
             $ref: "#/$defs/LocalModel",
           },
+        },
+        debug: {
+          description:
+            "Present only when localmodels debug mode is active and the Agent Service declared local_models_diagnostics.",
+          $ref: "#/$defs/LocalModelsDebugInfo",
         },
       },
     },
@@ -3887,6 +4055,11 @@ export const runnerGatewayEnvelopeSchema = {
           description:
             "The Daemon sends Runtime permission prompts as human_interaction.requested with kind permission_review; Agent Service answers each with an operation.input runtime_response.",
         },
+        stop_hook: {
+          type: "boolean",
+          description:
+            "The Daemon sends Runtime stop-hook checks as human_interaction.requested with kind runtime_hook (hook: stop); Agent Service answers each with an operation.input runtime_response.",
+        },
         resume_after_yield: {
           type: "boolean",
           description:
@@ -3927,6 +4100,23 @@ export const runnerGatewayEnvelopeSchema = {
         },
       },
     },
+    PreviousRuntimeSession: {
+      type: "object",
+      additionalProperties: false,
+      description:
+        "Identifies the superseded native session of this Context so a fresh run.start can export its local transcript into ./playground/.previous-context.md.",
+      required: ["provider_type", "session_id"],
+      properties: {
+        provider_type: {
+          enum: ["codex", "claude", "pi", "antigravity"],
+        },
+        session_id: {
+          type: "string",
+          minLength: 1,
+          maxLength: 256,
+        },
+      },
+    },
     ContextRunStartRequest: {
       type: "object",
       additionalProperties: false,
@@ -3951,6 +4141,9 @@ export const runnerGatewayEnvelopeSchema = {
         },
         session: {
           $ref: "#/$defs/OpaqueObject",
+        },
+        previous_session: {
+          $ref: "#/$defs/PreviousRuntimeSession",
         },
         input: {
           $ref: "#/$defs/AgentInput",
@@ -4099,6 +4292,9 @@ export const runnerGatewayEnvelopeSchema = {
               $ref: "#/$defs/OpaqueObject",
             },
             permission_review: {
+              const: true,
+            },
+            stop_hook: {
               const: true,
             },
             mcp_relays: {
@@ -4513,6 +4709,9 @@ export const runnerGatewayEnvelopeSchema = {
         permission_review: {
           type: "boolean",
         },
+        stop_hook: {
+          type: "boolean",
+        },
       },
     },
     SessionCompact: {
@@ -4623,6 +4822,13 @@ export const runnerGatewayEnvelopeSchema = {
         runtime_type: {
           enum: ["codex", "claude", "pi"],
         },
+        model: {
+          description:
+            "Explicit provider model to run on this Runtime. Omitted leaves selection to the Runtime's own default; sent only to a Computer release that decodes it.",
+          type: "string",
+          minLength: 1,
+          maxLength: 160,
+        },
         mode: {
           enum: ["structured", "text", "workspace"],
         },
@@ -4718,6 +4924,8 @@ export const runnerGatewayEnvelopeSchema = {
           $ref: "#/$defs/Id",
         },
         outcome: {
+          description:
+            "context_too_long and unsupported are sent only after a runner.welcome whose service_features names model_invoke_outcomes; otherwise the Daemon downgrades them to failed and runtime_unavailable.",
           enum: [
             "completed",
             "timed_out",
@@ -4727,6 +4935,8 @@ export const runnerGatewayEnvelopeSchema = {
             "runtime_unavailable",
             "auth_required",
             "runtime_incompatible",
+            "context_too_long",
+            "unsupported",
             "failed",
           ],
         },
@@ -5574,6 +5784,7 @@ export const runnerGatewayEnvelopeSchema = {
             "network_error",
             "rate_limited",
             "model_unavailable",
+            "local_model_unavailable",
             "context_too_long",
             "model_service_error",
             "timeout",
@@ -5759,7 +5970,7 @@ export const runnerGatewayEnvelopeSchema = {
           $ref: "#/$defs/Id",
         },
         server: {
-          enum: ["browser", "playground"],
+          enum: ["browser", "playground", "feishu_mail"],
         },
         tool_name: {
           type: "string",

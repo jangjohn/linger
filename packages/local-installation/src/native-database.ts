@@ -15,6 +15,7 @@ import {
 } from "./native-process.js";
 import { preLingerSchema, setAsideLegacyData } from "./legacy-database.js";
 import { runProcess } from "./process.js";
+import { excerptLine, redact } from "./redaction.js";
 import { parseEnv } from "node:util";
 
 /** The PostgreSQL program `name` in `bin`, with `.exe` on Windows. */
@@ -27,8 +28,10 @@ export function postgresProgram(
 }
 
 // postgres.exe refuses to run with an elevated token ("Run as administrator",
-// or an administrator account with UAC off). Elevated tokens carry the High
-// (or System) mandatory label, which `whoami` names by SID in every language.
+// the built-in Administrator, or an administrator account with UAC off), so
+// such a token starts it with Administrators disabled, as pg_ctl does.
+// Elevated tokens carry the High (or System) mandatory label, which `whoami`
+// names by SID in every language.
 export async function windowsElevated(
   run: typeof runProcess = runProcess,
 ): Promise<boolean> {
@@ -44,6 +47,11 @@ export async function windowsElevated(
     result?.code === 0 && /S-1-16-(12288|16384)\b/.test(result.stdout ?? "")
   );
 }
+
+// Slow HDDs and Windows antivirus scanning can hold PostgreSQL in initial
+// data-directory fsync past 30 seconds while the server process stays alive.
+const POSTGRES_READY_TIMEOUT_MS = 120_000;
+const POSTGRES_READY_PROGRESS_MS = 15_000;
 
 // Prepares the instance's private PostgreSQL. A database from before Linger
 // is set aside with its data for a fresh one, and `legacyBackup` names the
@@ -61,10 +69,8 @@ export async function prepareNativeDatabase(options: {
     throw new Error(
       "Native PostgreSQL must run as a normal user; run Linger without sudo.",
     );
-  if (process.platform === "win32" && (await windowsElevated()))
-    throw new Error(
-      "Native PostgreSQL cannot run as administrator; start Linger normally, not with Run as administrator.",
-    );
+  const withoutAdministrators =
+    process.platform === "win32" && (await windowsElevated());
   if (!instance.source || instance.mode !== "source-native")
     throw new Error("Native database needs a native source instance");
   const port = instance.source.ports.postgres;
@@ -83,10 +89,26 @@ export async function prepareNativeDatabase(options: {
       timeoutMs,
       onOutput: options.onOutput,
     });
-    if (result.code !== 0)
+    if (result.code !== 0) {
+      // The program's own last lines are what the person and the report need:
+      // "inspect the log" alone sends them looking for a file in a directory
+      // they were never told about. The password never appears here, and the
+      // window is five lines because initdb ends with cleanup lines such as
+      // "removing data directory" that would otherwise push out its FATAL one.
+      const detail = redact(
+        result.stderr
+          .replaceAll(password, "[redacted]")
+          .split(/\r?\n/u)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .slice(-5)
+          .map((line) => excerptLine(line))
+          .join(" "),
+      ).replace(/[.;]+$/u, "");
       throw new Error(
-        `Native PostgreSQL ${name} failed; inspect the instance log.`,
+        `Native PostgreSQL ${name} failed${detail ? `: ${detail}` : ""}. Inspect the instance log.`,
       );
+    }
     return result;
   };
   const open = async () => {
@@ -171,6 +193,14 @@ export async function prepareNativeDatabase(options: {
       env,
       signal,
       redactions: [password],
+      withoutAdministrators,
+      // A release that repins the PostgreSQL archive unpacks it into a new
+      // component folder, so the server an earlier release left running
+      // differs only in its executable path. The new server opens the same
+      // data directory: on macOS and Linux the stop is a fast shutdown; on
+      // Windows it terminates the server, which recovers from its WAL on
+      // start, as after any Windows stop.
+      restartOnConfigurationChange: true,
     });
     const connection = [
       "--host",
@@ -182,7 +212,9 @@ export async function prepareNativeDatabase(options: {
       "--dbname",
       "postgres",
     ];
-    const deadline = Date.now() + 30_000;
+    const startedAt = Date.now();
+    const deadline = startedAt + POSTGRES_READY_TIMEOUT_MS;
+    let nextProgressAt = startedAt + POSTGRES_READY_PROGRESS_MS;
     for (;;) {
       signal.throwIfAborted();
       if (!(await inspectNativeProcess(instance.root, "postgres")).running)
@@ -193,8 +225,17 @@ export async function prepareNativeDatabase(options: {
         { env, signal, timeoutMs: 5_000 },
       );
       if (ready.code === 0) break;
-      if (Date.now() >= deadline)
-        throw new Error("Native PostgreSQL did not become ready.");
+      const now = Date.now();
+      if (now >= deadline)
+        throw new Error(
+          `Native PostgreSQL did not become ready within ${Math.round(POSTGRES_READY_TIMEOUT_MS / 1000)}s (pg_isready exit ${ready.code}); inspect its instance log.`,
+        );
+      if (now >= nextProgressAt) {
+        options.onOutput(
+          `Waiting for native PostgreSQL to become ready (${Math.floor((now - startedAt) / 1000)}s elapsed)...\n`,
+        );
+        nextProgressAt = now + POSTGRES_READY_PROGRESS_MS;
+      }
       await delay(200, undefined, { signal });
     }
     const present = await command("psql", [

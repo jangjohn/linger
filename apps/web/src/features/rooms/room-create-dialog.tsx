@@ -4,11 +4,13 @@ import { useNavigate } from "react-router";
 
 import { Button } from "@/components/ui/button";
 import { ModalDialog } from "@/components/ui/modal-dialog";
-import { classifyTeamHubCommandFailure } from "@/features/teamhub/teamhub-command-outcome";
 import { teamHubData } from "@/features/teamhub/teamhub-api";
+import { TeamHubError } from "@/features/teamhub/teamhub-client";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type { TeamHubRoomCreateInput } from "@/features/teamhub/teamhub-types";
+import { useT } from "@/i18n/use-translation";
 
+import { roomDialogMessages as m } from "./room-dialogs.messages";
 import { requireRoomScope, tenantRoomsQueryOptions } from "./room-queries";
 
 export function RoomCreateDialog({
@@ -19,6 +21,7 @@ export function RoomCreateDialog({
   tenantId: string;
 }) {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const nameInputRef = useRef<HTMLInputElement>(null);
@@ -55,24 +58,22 @@ export function RoomCreateDialog({
           trimmedName.toLocaleLowerCase(),
     );
 
+  // TeamHub's own message is shown as it is; an unknown outcome is worded here.
   const failure = createRoom.error
-    ? classifyTeamHubCommandFailure(
-        createRoom.error,
-        "this Room was created",
-        "Check your Rooms before you retry.",
-      )
-    : null;
+    ? createRoom.error instanceof TeamHubError
+      ? createRoom.error.message
+      : t(m.createUnconfirmed)
+    : undefined;
   // Names only have to be unique among the Rooms this Human is in, so the
   // conflicting Room is always one they can see.
-  const nameTakenMessage =
-    "You already have a Room with this name. Choose a different name.";
+  const nameTakenMessage = t(m.nameTaken);
   const failureMessage = duplicateName
     ? nameTakenMessage
     : createRoom.error instanceof Error &&
         "code" in createRoom.error &&
         createRoom.error.code === "ROOM_NAME_TAKEN"
       ? nameTakenMessage
-      : failure?.message;
+      : failure;
 
   useEffect(() => {
     nameInputRef.current?.focus();
@@ -93,7 +94,7 @@ export function RoomCreateDialog({
     <ModalDialog
       onClose={onClose}
       size="md"
-      title="Create Room"
+      title={t(m.createRoom)}
       footer={
         <Button
           disabled={!trimmedName || duplicateName}
@@ -102,14 +103,14 @@ export function RoomCreateDialog({
           tone="primary"
           type="submit"
         >
-          Create Room
+          {t(m.createRoom)}
         </Button>
       }
     >
       <form className="px-5 py-4" id={formId} onSubmit={handleSubmit}>
         <label className="block">
           <span className="mb-1.5 block text-sm font-medium text-app-ink">
-            Room name
+            {t(m.roomName)}
           </span>
           <input
             aria-invalid={duplicateName || undefined}
@@ -119,7 +120,7 @@ export function RoomCreateDialog({
             disabled={createRoom.isPending}
             maxLength={120}
             onChange={(event) => setName(event.target.value)}
-            placeholder="Room name"
+            placeholder={t(m.roomName)}
             ref={nameInputRef}
             value={name}
           />

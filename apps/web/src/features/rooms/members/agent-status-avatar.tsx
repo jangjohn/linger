@@ -1,5 +1,8 @@
 import { useContext } from "react";
 import { ActionMenu } from "@/components/ui/action-menu";
+import { useT } from "@/i18n/use-translation";
+
+import { agentInfoMessages } from "./agent-info.messages";
 import { ActorAvatar } from "./actor-avatar";
 import { AgentLiveActivities } from "./agent-live-activities";
 import {
@@ -23,6 +26,7 @@ export function AgentStatusAvatar({
   status?: AgentAvatarStatus;
   onOpenProfile?: (actorId: string) => void;
 }) {
+  const t = useT();
   const context = useContext(AgentAvatarStatusContext);
   const live = status ?? context.statuses.get(actorId);
   const openProfile = onOpenProfile ?? context.onOpenProfile;
@@ -42,7 +46,10 @@ export function AgentStatusAvatar({
       openOnHover
       onTriggerClick={!live ? () => openProfile(actorId) : undefined}
       placement="bottom-start"
-      label={`Open ${name} ${live ? "status" : "profile"}`}
+      label={t(
+        live ? agentInfoMessages.openStatus : agentInfoMessages.openProfile,
+        { name },
+      )}
       trigger={avatar}
       buttonClassName="shrink-0 rounded-full focus-visible:outline-2 focus-visible:outline-app-focus"
       menuClassName="agent-status-popover fixed z-[100] w-72 max-w-[calc(100vw-16px)] max-h-[min(360px,calc(100dvh-16px))] overflow-y-auto rounded-xl bg-popover p-1.5 shadow-md"
@@ -73,7 +80,7 @@ export function AgentStatusAvatar({
         ...(context.onOpenActivityLog
           ? [
               {
-                label: "View activity",
+                label: t(agentInfoMessages.viewActivity),
                 onSelect: () => context.onOpenActivityLog?.(actorId),
               },
             ]

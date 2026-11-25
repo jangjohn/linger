@@ -9,15 +9,14 @@ import {
 } from "@linger/wire-contracts/runner-gateway/validator";
 import { logAgentEvent } from "../observability/agent-log.js";
 import {
+  FIRST_STOP_HOOK_COMPUTER_VERSION,
   findRuntimeModel,
-  LocalComputerModelError,
+  isComputerVersionAtLeast,
   LocalRuntimeAuthenticationRequiredError,
   resolveRuntimeModel,
   runtimeModelCatalogForComputer,
-  type LocalReasoningEffort,
   type LocalRuntimeModelCatalog,
   type LocalRuntimeModelDefinition,
-  type LocalRuntimeType,
 } from "./local-computer-management.js";
 import { isServingConnection } from "./runner-connections.js";
 import type {
@@ -219,6 +218,10 @@ export class RunnerOperationPreparation {
     });
     if (!desired) return undefined;
     const prepareId = this.context.createId();
+    const runContext = filterProviderPrepareRunContext(
+      options.runContext,
+      connection.hello.daemon_version,
+    );
     const command = parseAgentToDaemonEnvelope({
       type: "prepare",
       target: "provider",
@@ -241,10 +244,7 @@ export class RunnerOperationPreparation {
       runtime,
       session_options: options.sessionOptions,
       session: options.session,
-      ...(options.runContext !== undefined &&
-      Object.keys(options.runContext).length > 0
-        ? { run_context: options.runContext }
-        : {}),
+      ...(runContext !== undefined ? { run_context: runContext } : {}),
     });
     if (command.type !== "prepare" || command.target !== "provider") {
       throw new RunnerGatewayProtocolError("Invalid Provider prepare command");
@@ -263,22 +263,6 @@ export class RunnerOperationPreparation {
     return { prepareId };
   }
 }
-
-export const assertReasoningEffort = (
-  model: LocalRuntimeModelDefinition,
-  reasoningEffort: LocalReasoningEffort | undefined,
-  runtimeType: LocalRuntimeType,
-): void => {
-  const allowed = model.allowedReasoningEffort ?? [];
-  // A model without effort levels runs without one (withSupportedReasoningEffort).
-  if (allowed.length === 0) return;
-  if (reasoningEffort === undefined || !allowed.includes(reasoningEffort)) {
-    throw new LocalComputerModelError(
-      runtimeType,
-      "Local Computer model reasoning effort is unavailable",
-    );
-  }
-};
 
 const contextRunStartMatches = (
   start: RunnerOperationState["start"],
@@ -309,3 +293,17 @@ const sameLocalMcpRelayDescriptor = (
   left.expires_at === right.expires_at &&
   left.tool_names.length === right.tool_names.length &&
   left.tool_names.every((tool, index) => tool === right.tool_names[index]);
+
+function filterProviderPrepareRunContext(
+  runContext: RunnerProviderPrepareOptions["runContext"],
+  daemonVersion: string,
+): RunnerProviderPrepareOptions["runContext"] {
+  if (runContext === undefined) return undefined;
+  const filtered = { ...runContext };
+  if (
+    !isComputerVersionAtLeast(daemonVersion, FIRST_STOP_HOOK_COMPUTER_VERSION)
+  ) {
+    delete filtered.stop_hook;
+  }
+  return Object.keys(filtered).length > 0 ? filtered : undefined;
+}

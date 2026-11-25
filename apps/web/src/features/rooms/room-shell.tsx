@@ -20,11 +20,13 @@ import {
 import { DesktopBarSlot } from "@/app/desktop-frame";
 import { isDesktopShell } from "@/app/desktop-shell";
 import { AccountMenu } from "@/features/auth/account-menu";
-import { LOGOUT_ERROR_MESSAGE, useLogout } from "@/features/auth/use-logout";
+import { authMessages } from "@/features/auth/auth.messages";
+import { useLogout } from "@/features/auth/use-logout";
 
 import { Button } from "@/components/ui/button";
 import { useGlobalSearchShortcut } from "@/features/search/search-shortcut";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { useT } from "@/i18n/use-translation";
 import type {
   TeamHubCurrentIdentity,
   TeamHubRoomListItem,
@@ -45,6 +47,8 @@ import {
 } from "./chat/voice-mode/voice-mode-session";
 import { registerVoiceShell } from "./chat/voice-mode/voice-ui-bridge";
 import { RoomNavigation } from "./room-navigation";
+import { navigationMessages } from "./room-navigation.messages";
+import { roomSurfaceMessages } from "./room-surface.messages";
 import {
   AuthenticatedRouteLoading,
   RoomNavigationLoading,
@@ -97,6 +101,7 @@ function RoomShellReady({
   tenantId: string;
 }) {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const roomsQuery = useQuery(tenantRoomsQueryOptions(client, tenantId));
   const { data: identity } = useSuspenseQuery(
     teamHubIdentityQueryOptions(client),
@@ -146,8 +151,8 @@ function RoomShellReady({
   }, []);
 
   useEffect(() => {
-    document.title = `${spaceOwnerName}'s space`;
-  }, [spaceOwnerName]);
+    document.title = t(navigationMessages.space, { name: spaceOwnerName });
+  }, [spaceOwnerName, t]);
 
   const rooms = roomsQuery.data;
   return (
@@ -177,15 +182,15 @@ function RoomShellReady({
             navigationPending ? (
               <>
                 <span className="sr-only" role="status">
-                  Loading Rooms…
+                  {t(navigationMessages.loadingRooms)}
                 </span>
                 <RoomNavigationLoading />
               </>
             ) : roomsQuery.isError ? (
               <div role="alert">
-                Rooms could not be loaded.{" "}
+                {t(navigationMessages.roomsUnavailable)}{" "}
                 <Button onClick={() => void roomsQuery.refetch()}>
-                  Retry Rooms
+                  {t(navigationMessages.retryRooms)}
                 </Button>
               </div>
             ) : undefined
@@ -270,6 +275,7 @@ function RoomShellContent({
   const { client } = useTeamHubRuntime();
   const location = useLocation();
   const navigate = useNavigate();
+  const t = useT();
   useScrollPaneActivity();
   const newRoomId =
     typeof location.state?.newRoomId === "string" &&
@@ -375,7 +381,9 @@ function RoomShellContent({
               <div className="flex h-(--app-header-height) shrink-0 items-center gap-3 border-b border-border/60 bg-app-sidebar px-3 md:hidden">
                 <MobileNavigationButton />
                 <span className="truncate text-sm font-medium">
-                  {spaceOwnerNameFor(identity, tenantId)}'s space
+                  {t(navigationMessages.space, {
+                    name: spaceOwnerNameFor(identity, tenantId),
+                  })}
                 </span>
               </div>
             )}
@@ -384,13 +392,16 @@ function RoomShellContent({
                 className="flex shrink-0 items-center gap-3 border-b border-border/60 px-4 py-3 text-sm text-app-danger"
                 role="alert"
               >
-                <span>{LOGOUT_ERROR_MESSAGE}</span>
+                <span>{t(authMessages.logoutUnconfirmed)}</span>
                 <Button
+                  data-voice-risk="never"
                   loading={logout.isPending}
                   onClick={logout.mutate}
                   tone="ghost"
                 >
-                  {logout.isPending ? "Logging out" : "Retry logout"}
+                  {logout.isPending
+                    ? t(roomSurfaceMessages.loggingOut)
+                    : t(roomSurfaceMessages.retryLogout)}
                 </Button>
               </div>
             ) : null}

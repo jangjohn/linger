@@ -338,6 +338,14 @@ type AgentUsageTotal struct {
 	CompactionCount  int64  `json:"compaction_count"`
 }
 
+type AnotherMeBackgroundFailure struct {
+	AgentActorID        string             `json:"agent_actor_id"`
+	TenantID            string             `json:"tenant_id"`
+	ConsecutiveFailures int32              `json:"consecutive_failures"`
+	Reason              string             `json:"reason"`
+	LastFailedAt        pgtype.Timestamptz `json:"last_failed_at"`
+}
+
 type AuthSession struct {
 	ID            string             `json:"id"`
 	AccountID     string             `json:"account_id"`
@@ -1176,6 +1184,7 @@ type Message struct {
 	FiredRoutineID          pgtype.Text        `json:"fired_routine_id"`
 	FiredRoutineInstruction pgtype.Text        `json:"fired_routine_instruction"`
 	CardKind                pgtype.Text        `json:"card_kind"`
+	HumanWaiting            bool               `json:"human_waiting"`
 }
 
 type MessageCard struct {
@@ -1885,6 +1894,8 @@ type VoiceMediaEpoch struct {
 	RecorderFailureCode       pgtype.Text        `json:"recorder_failure_code"`
 	RecorderReportedAt        pgtype.Timestamptz `json:"recorder_reported_at"`
 	RestartRetryAt            pgtype.Timestamptz `json:"restart_retry_at"`
+	StopReconcileFailures     int32              `json:"stop_reconcile_failures"`
+	StopReconcileRetryAt      pgtype.Timestamptz `json:"stop_reconcile_retry_at"`
 }
 
 type VoiceProviderKey struct {
@@ -1944,6 +1955,23 @@ type VoiceTranscriptUncertainty struct {
 	EndOffsetMs      int64              `json:"end_offset_ms"`
 	Reason           string             `json:"reason"`
 	RecoveredAt      pgtype.Timestamptz `json:"recovered_at"`
+}
+
+type WebSearchKey struct {
+	Backend          string             `json:"backend"`
+	ApiKeyCiphertext []byte             `json:"api_key_ciphertext"`
+	State            string             `json:"state"`
+	QuotaRemaining   pgtype.Float8      `json:"quota_remaining"`
+	QuotaLimit       pgtype.Float8      `json:"quota_limit"`
+	QuotaResetsAt    pgtype.Timestamptz `json:"quota_resets_at"`
+	QuotaObservedAt  pgtype.Timestamptz `json:"quota_observed_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WebSearchSetting struct {
+	Singleton      bool               `json:"singleton"`
+	DefaultBackend pgtype.Text        `json:"default_backend"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WikiCurrentSource struct {

@@ -1,7 +1,12 @@
 import path from "node:path";
 import { lingerHome } from "@linger/local-installation/home";
+import {
+  windowsPrivateRefusal,
+  type WindowsPrivateRefusal,
+} from "@linger/local-installation/windows-private";
 import type { LegacyInstanceSkipped } from "@linger/local-installation/legacy-migration";
 import type { RuntimeDescriptor } from "@linger/local-installation/managed-runtimes";
+import type { RuntimeLookupTimings } from "./server/instance-runtime.js";
 import { fileURLToPath } from "node:url";
 import { launchInstaller } from "./server/launch.js";
 export { startInstallerServer } from "./server/server.js";
@@ -131,6 +136,17 @@ const failedToStart = (error: unknown) => {
   process.stderr.write(`${startFailure(error)}\n`);
   process.exitCode = 1;
 };
+// The line the desktop client reads on stdout when the installer manager
+// could not start, so it acts on the cause by code, not by the words above.
+export function startFailureLine(error: unknown): string | undefined {
+  const refusal = windowsPrivateRefusal(error);
+  return refusal ? `${JSON.stringify({ startFailure: refusal })}\n` : undefined;
+}
+const serveFailed = (error: unknown) => {
+  const line = startFailureLine(error);
+  if (line) process.stdout.write(line);
+  failedToStart(error);
+};
 async function resume(options: ReturnType<typeof parseInstallerArguments>) {
   // Headless restart for the desktop client: progress on stderr, the outcome
   // as one JSON line on stdout.
@@ -156,19 +172,28 @@ async function resume(options: ReturnType<typeof parseInstallerArguments>) {
   }));
   // The desktop's own Computer takes the runtime and localmodels tool paths
   // from every resume, so an install from before it knew one gains it.
+  // The desktop does not read resume stderr, so timings ride in the outcome.
+  let runtimeLookupTimings: RuntimeLookupTimings | undefined;
   const runtime =
     outcome.code === 0 && options.externalComputer
       ? await import("./server/instance-runtime.js")
           .then(({ instanceRuntime }) =>
             instanceRuntime(options.home, options.instanceName!, {
               runtimeDescriptors,
+              onTimings: (timings) => {
+                runtimeLookupTimings = timings;
+              },
             }),
           )
           .catch(() => undefined)
       : undefined;
   // Detached service processes may keep handles open; exit once flushed.
   process.stdout.write(
-    `${JSON.stringify({ ...outcome, ...(runtime ? { runtime } : {}) })}\n`,
+    `${JSON.stringify({
+      ...outcome,
+      ...(runtime ? { runtime } : {}),
+      ...(runtimeLookupTimings ? { runtimeLookupTimings } : {}),
+    })}\n`,
     () => process.exit(outcome.code),
   );
 }
@@ -222,7 +247,9 @@ async function inspect(options: ReturnType<typeof parseInstallerArguments>) {
 export async function saveUserKeys(
   options: { home: string; instanceName?: string },
   input: string,
-): Promise<{ saved: string[] } | { error: string }> {
+): Promise<
+  { saved: string[] } | { error: string; refusal?: WindowsPrivateRefusal }
+> {
   const [{ instanceRoot }, { updateUserKeys }] = await Promise.all([
     import("@linger/local-installation/instance"),
     import("@linger/local-installation/user-environment"),
@@ -240,8 +267,11 @@ export async function saveUserKeys(
     );
     return { saved };
   } catch (error) {
+    // The desktop client acts on a refused folder by its code and reason.
+    const refusal = windowsPrivateRefusal(error);
     return {
       error: error instanceof Error ? error.message : "Cannot save keys",
+      ...(refusal ? { refusal } : {}),
     };
   }
 }
@@ -446,5 +476,5 @@ if (
     await byokEndpointCommand(options, options.byokCommand);
   else if (options?.inspect) await inspect(options);
   else if (options?.resume) await resume(options);
-  else if (options) await serve(options).catch(failedToStart);
+  else if (options) await serve(options).catch(serveFailed);
 }

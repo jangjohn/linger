@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/native"
 )
 
 func TestModelInvokeTimeoutAllowsWikiRefreshDeadline(t *testing.T) {
@@ -48,7 +50,7 @@ func disabledFeatures(args []string) []string {
 }
 
 func TestCodexModelInvokeArgsPinEffortIsolationAndNoPrompt(t *testing.T) {
-	args := codexModelInvokeArgs(ModelInvokeStructured, "low", "/tmp/call/work", "/tmp/call/schema.json", "/tmp/call/last.txt")
+	args := codexModelInvokeArgs(ModelInvokeStructured, "low", "", "/tmp/call/work", "/tmp/call/schema.json", "/tmp/call/last.txt")
 	if args[0] != "exec" || !slices.Contains(args, "--skip-git-repo-check") || !slices.Contains(args, "--ephemeral") ||
 		!slices.Contains(args, "--ignore-rules") || argValue(args, "--sandbox") != "read-only" ||
 		argValue(args, "--color") != "never" || argValue(args, "-C") != "/tmp/call/work" ||
@@ -63,25 +65,30 @@ func TestCodexModelInvokeArgsPinEffortIsolationAndNoPrompt(t *testing.T) {
 		t.Fatalf("codex exec must disable features via -c overrides rather than --disable: %q", args)
 	}
 	want := []string{
-		"shell_tool", "unified_exec", "code_mode_host", "multi_agent", "goals",
+		"shell_tool", "unified_exec", "code_mode_host", "goals",
 		"browser_use", "browser_use_external", "browser_use_full_cdp_access",
 		"computer_use", "in_app_browser", "apps", "plugins", "hooks",
 		"image_generation", "view_image", "tool_suggest", "skill_search", "sleep_tool",
+		"multi_agent", "multi_agent_v2",
 	}
 	if got := disabledFeatures(args); !slices.Equal(got, want) {
 		t.Fatalf("disabled features = %q", got)
+	}
+	if !slices.Contains(args, "agents.enabled=false") {
+		t.Fatalf("sub-agents stay on: %q", args)
 	}
 	// Every option takes its value; nothing is left over as a PROMPT argument.
 	if last := args[len(args)-1]; last != "/tmp/call/last.txt" {
 		t.Fatalf("argv ends with %q", last)
 	}
 
-	text := codexModelInvokeArgs(ModelInvokeText, "high", "/w", "", "/l")
-	if slices.Contains(text, "--output-schema") || !slices.Contains(text, `model_reasoning_effort="high"`) {
+	text := codexModelInvokeArgs(ModelInvokeText, "high", "gpt-account-default", "/w", "", "/l")
+	if slices.Contains(text, "--output-schema") || !slices.Contains(text, `model_reasoning_effort="high"`) ||
+		argValue(text, "-m") != "gpt-account-default" || slices.Contains(args, "-m") {
 		t.Fatalf("text args = %q", text)
 	}
 
-	workspace := codexModelInvokeArgs(ModelInvokeWorkspace, "medium", "/w", "", "/l")
+	workspace := codexModelInvokeArgs(ModelInvokeWorkspace, "medium", "", "/w", "", "/l")
 	if argValue(workspace, "--sandbox") != "workspace-write" {
 		t.Fatalf("workspace args = %q", workspace)
 	}
@@ -132,13 +139,14 @@ func TestCodexModelInvokeAvoidsUnknownDisableFlagsOnOlderCodex(t *testing.T) {
 
 func TestClaudeModelInvokeArgsDisableToolsAndCustomizations(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object"}`)
-	args := claudeModelInvokeArgs(ModelInvokeStructured, "low", schema)
+	args := claudeModelInvokeArgs(ModelInvokeStructured, "low", "claude-sonnet-4-6", schema)
 	for _, flag := range []string{"-p", "--safe-mode", "--strict-mcp-config", "--no-session-persistence", "--disable-slash-commands"} {
 		if !slices.Contains(args, flag) {
 			t.Fatalf("args lack %s: %q", flag, args)
 		}
 	}
 	if argValue(args, "--output-format") != "json" || argValue(args, "--json-schema") != `{"type":"object"}` ||
+		argValue(args, "--model") != "claude-sonnet-4-6" ||
 		argValue(args, "--effort") != "low" || argValue(args, "--permission-mode") != "dontAsk" {
 		t.Fatalf("args = %q", args)
 	}
@@ -149,15 +157,32 @@ func TestClaudeModelInvokeArgsDisableToolsAndCustomizations(t *testing.T) {
 		t.Fatalf("structured mode is restricted: %q", args)
 	}
 
-	text := claudeModelInvokeArgs(ModelInvokeText, "medium", nil)
-	if slices.Contains(text, "--json-schema") || argValue(text, "--effort") != "medium" {
+	text := claudeModelInvokeArgs(ModelInvokeText, "medium", "", nil)
+	if slices.Contains(text, "--json-schema") || slices.Contains(text, "--model") || argValue(text, "--effort") != "medium" {
 		t.Fatalf("text args = %q", text)
 	}
 
-	workspace := claudeModelInvokeArgs(ModelInvokeWorkspace, "high", nil)
+	workspace := claudeModelInvokeArgs(ModelInvokeWorkspace, "high", "", nil)
 	if argValue(workspace, "--tools") != "Read,Write,Edit,Glob,Grep" || !slices.Contains(workspace, "--restricted") ||
 		argValue(workspace, "--permission-mode") != "acceptEdits" {
 		t.Fatalf("workspace args = %q", workspace)
+	}
+
+	noneArgs := claudeModelInvokeArgs(ModelInvokeText, "none", "", nil)
+	if slices.Contains(noneArgs, "--effort") || argValue(noneArgs, "--thinking") != "disabled" {
+		t.Fatalf("none args = %q; want --thinking disabled without --effort", noneArgs)
+	}
+
+	emptyArgs := claudeModelInvokeArgs(ModelInvokeText, "", "", nil)
+	if slices.Contains(emptyArgs, "--effort") || slices.Contains(emptyArgs, "--thinking") {
+		t.Fatalf("empty effort args = %q; want neither --effort nor --thinking", emptyArgs)
+	}
+
+	codexEmpty := codexModelInvokeArgs(ModelInvokeText, "", "", "/w", "", "/l")
+	for _, arg := range codexEmpty {
+		if strings.HasPrefix(arg, "model_reasoning_effort=") {
+			t.Fatalf("codex empty effort included reasoning override: %q", codexEmpty)
+		}
 	}
 }
 
@@ -300,7 +325,13 @@ func TestModelInvokerClassifiesFailures(t *testing.T) {
 		{stderr: "Reading prompt from stdin...\nError: Unknown feature flag: sleep_tool\n", outcome: ModelInvokeRuntimeIncompatible},
 		{stderr: "error: unexpected argument '--ignore-rules' found\n", outcome: ModelInvokeRuntimeIncompatible},
 		{event: `{"type":"turn.failed","error":{"message":"401 Unauthorized: token expired"}}`, outcome: ModelInvokeAuthRequired},
+		// A model the account cannot use fails the same way on every attempt,
+		// so it is not reported as a transient failure.
+		{event: modelNotFoundEvent, outcome: ModelInvokeRuntimeIncompatible},
 		{stderr: "Error: stream disconnected before completion\n", outcome: ModelInvokeFailed},
+		{event: `{"type":"turn.failed","error":{"message":"context window exceeded","codexErrorInfo":"contextWindowExceeded"}}`, outcome: ModelInvokeContextTooLong},
+		{event: `{"type":"turn.failed","error":{"message":"{\"error\":{\"type\":\"exceed_context_size_error\",\"message\":\"request exceeds context\"}}"}}`, outcome: ModelInvokeContextTooLong},
+		{event: `{"type":"turn.failed","error":{"message":"upstream unavailable","codexErrorInfo":{"internalServerError":{"httpStatusCode":503}}}}`, outcome: ModelInvokeRuntimeUnavailable},
 	} {
 		fixture := newCodexInvokeFixture(t, func(_ context.Context, command *exec.Cmd) error {
 			_, _ = io.WriteString(command.Stderr, test.stderr)
@@ -312,6 +343,105 @@ func TestModelInvokerClassifiesFailures(t *testing.T) {
 		result := fixture.invoker.Invoke(context.Background(), structuredRequest())
 		if result.Outcome != test.outcome || result.Reason == "" {
 			t.Fatalf("%q: result = %+v", test.stderr+test.event, result)
+		}
+	}
+
+	// Claude structured terminal_reason=prompt_too_long maps to context_too_long
+	// without matching error prose.
+	claudePromptTooLong := classifyModelInvokeFailureWithDiagnostics(
+		context.Background(), context.Background(), "claude", errors.New("exit status 1"), "", "Prompt is too long", "context_too_long", native.RuntimeFailureDiagnostics{},
+	)
+	if claudePromptTooLong.Outcome != ModelInvokeContextTooLong {
+		t.Fatalf("claude prompt_too_long = %+v", claudePromptTooLong)
+	}
+}
+
+// modelNotFoundEvent is how codex exec --json reports a model the signed-in
+// account cannot use: the API error body is the event's message.
+const modelNotFoundEvent = `{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-builtin' model is not supported when using Codex with a ChatGPT account.\",\"code\":\"model_not_found\"}}"}}`
+
+func TestModelInvokerReportsAnUnavailableModelReadably(t *testing.T) {
+	fixture := newCodexInvokeFixture(t, func(_ context.Context, command *exec.Cmd) error {
+		_, _ = io.WriteString(command.Stdout, modelNotFoundEvent+"\n")
+		return errors.New("exit status 1")
+	})
+	result := fixture.invoker.Invoke(context.Background(), structuredRequest())
+	if result.Outcome != ModelInvokeRuntimeIncompatible ||
+		result.Reason != "The model is not available to this account: The 'gpt-builtin' model is not supported when using Codex with a ChatGPT account." {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+// writeCodexConfig replaces the fixture's config.toml.
+func writeCodexConfig(t *testing.T, fixture codexInvokeFixture, config string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(fixture.source, "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// withDefaultModel makes the fixture's Codex catalog mark model as default.
+func withDefaultModel(fixture *codexInvokeFixture, model string) {
+	lookup := fixture.invoker.Lookup
+	fixture.invoker.Lookup = func(ctx context.Context, runtimeType string) (ModelInvokeRuntime, bool, error) {
+		installed, ok, err := lookup(ctx, runtimeType)
+		installed.DefaultModel = model
+		return installed, ok, err
+	}
+}
+
+func TestCodexModelInvokeRunsTheCatalogDefaultWhenConfigNamesNoModel(t *testing.T) {
+	// Without -m, Codex runs its built-in default, which this account rejects.
+	var args []string
+	fixture := newCodexInvokeFixture(t, func(_ context.Context, command *exec.Cmd) error {
+		args = command.Args
+		if argValue(command.Args, "-m") == "" {
+			_, _ = io.WriteString(command.Stdout, modelNotFoundEvent+"\n")
+			return errors.New("exit status 1")
+		}
+		return os.WriteFile(argValue(command.Args, "-o"), []byte(`{"answer":"ok"}`), 0o600)
+	})
+	writeCodexConfig(t, fixture, "")
+	withDefaultModel(&fixture, "gpt-account-default")
+	result := fixture.invoker.Invoke(context.Background(), structuredRequest())
+	if result.Outcome != ModelInvokeCompleted || result.Model != "gpt-account-default" || argValue(args, "-m") != "gpt-account-default" {
+		t.Fatalf("result = %+v, args = %q", result, args)
+	}
+
+	// A model the user configured, directly or through the active profile,
+	// still decides.
+	for _, config := range []string{
+		"model = \"fixture-model\"\n",
+		"profile = \"fast\"\n[profiles.fast]\nmodel = \"fixture-model\"\n",
+	} {
+		writeCodexConfig(t, fixture, config)
+		fixture.invoker.Invoke(context.Background(), structuredRequest())
+		if slices.Contains(args, "-m") {
+			t.Fatalf("config %q: args = %q", config, args)
+		}
+	}
+
+	// A catalog that marks no default leaves the choice to Codex.
+	writeCodexConfig(t, fixture, "")
+	withDefaultModel(&fixture, "")
+	fixture.invoker.Invoke(context.Background(), structuredRequest())
+	if slices.Contains(args, "-m") {
+		t.Fatalf("args = %q", args)
+	}
+
+	// An explicit request model always wins, overriding an incompatible model
+	// configured in config.toml or its active profile.
+	for _, config := range []string{
+		"model = \"unsupported-local-model\"\n",
+		"profile = \"custom\"\n[profiles.custom]\nmodel = \"unsupported-local-model\"\n",
+	} {
+		writeCodexConfig(t, fixture, config)
+		withDefaultModel(&fixture, "gpt-account-default")
+		req := structuredRequest()
+		req.Model = "gpt-explicit"
+		result := fixture.invoker.Invoke(context.Background(), req)
+		if result.Outcome != ModelInvokeCompleted || result.Model != "gpt-explicit" || argValue(args, "-m") != "gpt-explicit" {
+			t.Fatalf("config %q: result = %+v, args = %q", config, result, args)
 		}
 	}
 }
@@ -461,5 +591,70 @@ func TestCodexInvokeSandboxConfigKeepsWindowsUnelevated(t *testing.T) {
 	}
 	if args := codexInvokeSandboxConfig("darwin"); args != nil {
 		t.Fatalf("darwin args = %q", args)
+	}
+}
+
+func TestClaudeModelInvokeDisablesNonessentialTrafficAndPreservesOverride(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name     string
+		override string
+		want     string
+	}{
+		{name: "default", want: "1"},
+		{name: "caller override", override: "0", want: "0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			callerEnv := map[string]string{
+				"HOME":              home,
+				"CLAUDE_CONFIG_DIR": claudeDir,
+				"PATH":              "/usr/bin",
+			}
+			if test.override != "" {
+				callerEnv["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = test.override
+			}
+			var observed string
+			invoker := ModelInvoker{
+				TempBase: filepath.Join(t.TempDir(), "operation-tmp"),
+				Lookup: func(_ context.Context, runtimeType string) (ModelInvokeRuntime, bool, error) {
+					if runtimeType != "claude" {
+						return ModelInvokeRuntime{}, false, nil
+					}
+					return ModelInvokeRuntime{
+						ExecutablePath: "/fixture/claude",
+						Version:        "2.1.309",
+						Environment:    callerEnv,
+					}, true, nil
+				},
+				Run: func(_ context.Context, command *exec.Cmd) error {
+					observed = environmentMap(command)["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]
+					_, _ = io.WriteString(command.Stdout, `{"type":"result","is_error":false,"result":"OK"}`)
+					return nil
+				},
+			}
+			result := invoker.Invoke(context.Background(), ModelInvokeRequest{
+				RuntimeType:     "claude",
+				Mode:            ModelInvokeText,
+				ReasoningEffort: "low",
+				Input:           "hello",
+				Timeout:         time.Minute,
+			})
+			if result.Outcome != ModelInvokeCompleted || observed != test.want {
+				t.Fatalf("outcome = %+v, observed = %q, want %q", result, observed, test.want)
+			}
+			if test.override == "" {
+				if _, mutated := callerEnv["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]; mutated {
+					t.Fatal("claudeModelInvocation mutated caller environment map")
+				}
+			}
+		})
 	}
 }

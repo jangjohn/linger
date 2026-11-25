@@ -7,6 +7,7 @@ import {
   VoiceControlContext,
   type VoiceControlContextValue,
 } from "./voice-control-context";
+import { VoiceMicrophoneError } from "./microphone-devices";
 import { RecordingEntry } from "./recording-entry";
 import { VoiceFocusSurface } from "./voice-focus-surface";
 import { TeamHubRuntimeProvider } from "@/features/teamhub/teamhub-runtime";
@@ -44,7 +45,10 @@ describe("RecordingEntry", () => {
     );
     const meetings = screen.getByRole("button", { name: "Meetings" });
     expect(meetings).toBeEnabled();
-    expect(meetings).toHaveAttribute("title", "Meetings");
+    expect(meetings).toHaveAttribute(
+      "title",
+      "Transcript recovery failed. Open to retry.",
+    );
     expect(meetings).toHaveTextContent("Meetings");
     expect(document.querySelector(".animate-spin")).toBeNull();
   });
@@ -263,6 +267,85 @@ describe("VoiceFocusSurface", () => {
     expect(startCapture).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
     await vi.waitFor(() => expect(startCapture).toHaveBeenCalledOnce());
+  });
+
+  it("points the Mac desktop app to System Settings for a blocked microphone", async () => {
+    const desktop = window as { lingerDesktop?: unknown };
+    desktop.lingerDesktop = { platform: "darwin" };
+    try {
+      render(
+        <VoiceControlContext.Provider
+          value={voiceValue({
+            boundDevice: undefined,
+            captureState: { status: "idle" },
+            discoverDevices: vi.fn(async () => {
+              throw new DOMException("Permission denied", "NotAllowedError");
+            }),
+            listenerStatus: "disabled",
+          })}
+        >
+          <VoiceFocusSurface autoStart onExit={vi.fn()} />
+        </VoiceControlContext.Provider>,
+      );
+      expect(
+        await screen.findByRole("heading", { name: "Recording did not start" }),
+      ).toBeVisible();
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Linger can't use the microphone. Allow Linger in System Settings › Privacy & Security › Microphone, then try again.",
+      );
+    } finally {
+      delete desktop.lingerDesktop;
+    }
+  });
+
+  it("asks the browser again when the remembered microphone does not connect", async () => {
+    const discoverDevices = vi.fn(async () => [microphone]);
+    const selectDevice = vi.fn(async () => undefined);
+    const startCapture = vi
+      .fn<() => Promise<undefined>>()
+      .mockRejectedValueOnce(new VoiceMicrophoneError("timeout"))
+      .mockResolvedValue(undefined);
+    render(
+      <VoiceControlContext.Provider
+        value={voiceValue({
+          captureState: { status: "idle" },
+          discoverDevices,
+          listenerStatus: "disabled",
+          selectDevice,
+          startCapture,
+        })}
+      >
+        <VoiceFocusSurface autoStart onExit={vi.fn()} />
+      </VoiceControlContext.Provider>,
+    );
+    await vi.waitFor(() => expect(startCapture).toHaveBeenCalledTimes(2));
+    expect(discoverDevices).toHaveBeenCalledOnce();
+    expect(selectDevice).toHaveBeenCalledWith(microphone.deviceId);
+  });
+
+  it("explains an unbound microphone from its code", async () => {
+    const startCapture = vi.fn(async () => {
+      throw new VoiceMicrophoneError("no-binding");
+    });
+    render(
+      <VoiceControlContext.Provider
+        value={voiceValue({
+          captureState: { status: "idle" },
+          discoverDevices: vi.fn(async () => [microphone]),
+          listenerStatus: "disabled",
+          startCapture,
+        })}
+      >
+        <VoiceFocusSurface autoStart onExit={vi.fn()} />
+      </VoiceControlContext.Provider>,
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Recording did not start" }),
+    ).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Connect a microphone before enabling voice",
+    );
+    expect(startCapture).toHaveBeenCalledTimes(2);
   });
 
   it("shows Pause then Stop in the top row and no separate Mute", () => {
@@ -571,6 +654,13 @@ describe("VoiceFocusSurface", () => {
     );
     expect(setMicrophoneMuted).toHaveBeenLastCalledWith(true);
     expect(screen.getByText("Recording paused")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Microphone muted. Your voice is not recorded until you resume.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/Recording continues/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Listening…")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Resume recording" }));
     await vi.waitFor(() =>
       expect(
@@ -579,6 +669,77 @@ describe("VoiceFocusSurface", () => {
     );
     expect(setMicrophoneMuted).toHaveBeenLastCalledWith(false);
     expect(stopCapture).not.toHaveBeenCalled();
+    expect(screen.getByText("Listening…")).toBeVisible();
+  });
+
+  it.each([
+    ["a Start that failed", "start_outcome_unknown", true],
+    ["a Start still waiting for the recorder", undefined, false],
+  ] as const)(
+    "says whether audio is saved while starting after %s",
+    (_case, lastFailureCode, warned) => {
+      render(
+        <VoiceControlContext.Provider
+          value={voiceValue({
+            captureState: {
+              status: "starting",
+              capture: {
+                ...capture(),
+                status: "starting",
+                last_failure_code: lastFailureCode,
+              },
+            },
+          })}
+        >
+          <VoiceFocusSurface onExit={vi.fn()} />
+        </VoiceControlContext.Provider>,
+      );
+      const warning = screen.queryByText(/Audio is not being saved yet/);
+      if (warned) expect(warning).toBeVisible();
+      else expect(warning).not.toBeInTheDocument();
+    },
+  );
+
+  it("says muted, not that recording continues, while paused with unconfirmed transcript", async () => {
+    render(
+      <VoiceControlContext.Provider
+        value={voiceValue({
+          captureState: {
+            status: "recording",
+            capture: {
+              ...capture(),
+              last_failure_code: "transcript_incomplete",
+            },
+          },
+        })}
+      >
+        <VoiceFocusSurface onExit={vi.fn()} />
+      </VoiceControlContext.Provider>,
+    );
+    expect(screen.getByText(/Recording continues/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Pause recording" }));
+    expect(
+      await screen.findByText(
+        "Microphone muted. Your voice is not recorded until you resume.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/Recording continues/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "a listener error",
+      { listenerError: "Voice transcription failed", listenerStatus: "error" },
+    ],
+    ["a disconnected microphone", { listenerStatus: "enabling" }],
+  ] as const)("does not claim to be listening with %s", (_case, overrides) => {
+    render(
+      <VoiceControlContext.Provider value={voiceValue(overrides)}>
+        <VoiceFocusSurface onExit={vi.fn()} />
+      </VoiceControlContext.Provider>,
+    );
+    expect(screen.queryByText("Listening…")).not.toBeInTheDocument();
+    expect(screen.getByText("No transcript is available yet.")).toBeVisible();
   });
 
   it("asks before stopping and keeps recording when the Human declines", () => {

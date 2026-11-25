@@ -1,6 +1,7 @@
 import type { RoomDocumentMenuActions } from "@/features/rooms/documents/room-document-actions-menu";
 import { Select, SelectItem } from "@/components/ui/select";
 import type { TeamHubDocumentTreeSummary } from "@/features/teamhub/teamhub-types";
+import { useT } from "@/i18n/use-translation";
 
 import { documentFileName } from "./document-display-name";
 import {
@@ -18,6 +19,7 @@ import {
 } from "./library-folder-browser";
 import type { PendingDocumentUpload } from "./library-upload-queue";
 import type { WorkspaceTab } from "./library-workspace-tabs";
+import { libraryMessages as m } from "./library.messages";
 
 /**
  * One open folder level of My pages or Shared with me: type and sort filters,
@@ -66,29 +68,30 @@ export function LibraryFolderListing({
   tenantId: string;
   trail: readonly LibraryFolder[];
 }) {
+  const t = useT();
   return (
     <>
       <div className="workspace-file-filters">
         <Select
-          aria-label="File type"
+          aria-label={t(m.fileType)}
           onValueChange={onFileTypeChange}
           value={fileType}
           variant="pill"
         >
           {documentFileTypes.map(({ value, label }) => (
             <SelectItem key={value} value={value}>
-              {label}
+              {t(label)}
             </SelectItem>
           ))}
         </Select>
         <Select
-          aria-label="Sort documents"
+          aria-label={t(m.sortDocuments)}
           onValueChange={onSortByChange}
           value={sortBy}
           variant="pill"
         >
-          <SelectItem value="updated">Sort by last modified</SelectItem>
-          <SelectItem value="name">Sort by name</SelectItem>
+          <SelectItem value="updated">{t(m.sortByModified)}</SelectItem>
+          <SelectItem value="name">{t(m.sortByName)}</SelectItem>
         </Select>
       </div>
       {folderId ? (
@@ -104,11 +107,12 @@ export function LibraryFolderListing({
             {error}
           </p>
           <button
+            data-voice-close
             className="shrink-0 rounded-md px-1.5 text-app-muted hover:bg-app-hover hover:text-app-body"
             onClick={onDismissError}
             type="button"
           >
-            Dismiss
+            {t(m.dismiss)}
           </button>
         </div>
       ) : null}
@@ -119,7 +123,7 @@ export function LibraryFolderListing({
         activeView={
           folderId
             ? {
-                empty: "This folder is empty",
+                empty: t(m.folderEmpty),
                 label: trail.at(-1)!.name,
               }
             : activeView

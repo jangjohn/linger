@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 
+import type { Language } from "../i18n/language.js";
 import type { ConfigStore } from "./config.js";
 import type { Logger } from "./log.js";
 
@@ -22,13 +23,21 @@ export interface BusEvents {
   // The local server's installer reported new runtime or localmodels paths.
   "computer.runtime": [];
   "diagnostics.changed": [];
+  "driver-update.busy": [busy: boolean];
+  "driver-update.changed": [];
   "grants.changed": [];
+  // The shell's language changed; menus, the tray and shell pages redraw.
+  "language.changed": [language: Language];
+  "local-server.busy": [busy: boolean];
   "local-server.changed": [];
   // Forget the installation the window used and set this computer up again.
   "local-server.reset": [];
   "local-server.retry": [];
+  // The window could not load the server it shows.
+  "local-server.unreachable": [];
   "power.changed": [];
   "runtime.activity": [running: number];
+  "runtime.model_activity": [running: number];
   "runtime.state": [state: string];
   "server.changed": [serverUrl: string];
   // The same server answers at another origin; enrollments follow it.

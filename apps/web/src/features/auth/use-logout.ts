@@ -11,13 +11,15 @@ import { teamHubIdentityQueryOptions } from "@/features/rooms/room-queries";
 import { teamHubDone } from "@/features/teamhub/teamhub-api";
 import { announceTeamHubAuthenticationRequired } from "@/features/teamhub/teamhub-authentication";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { translate } from "@/i18n/language";
 
+import { authMessages } from "./auth.messages";
 import { safeAuthenticationReturnTo } from "./authentication-return-to";
 import { clearLocalAuthenticatedState } from "./local-authenticated-state";
 
-export const LOGOUT_ERROR_MESSAGE = "Could not confirm logout. Please retry.";
+/** The English source; the confirmation itself follows the language on screen. */
 export const LOGOUT_UNSAVED_DOCUMENT_MESSAGE =
-  "Some Document edits are not saved yet. Log out and discard them?";
+  authMessages.logoutUnsavedDocuments.source;
 
 export function useLogout({ returnTo }: { returnTo?: string } = {}) {
   const { client } = useTeamHubRuntime();
@@ -62,7 +64,7 @@ export function useLogout({ returnTo }: { returnTo?: string } = {}) {
       if (pending.current) return;
       if (
         hasUnsavedRoomDocumentChanges() &&
-        !window.confirm(LOGOUT_UNSAVED_DOCUMENT_MESSAGE)
+        !window.confirm(translate(authMessages.logoutUnsavedDocuments))
       )
         return;
       pending.current = true;

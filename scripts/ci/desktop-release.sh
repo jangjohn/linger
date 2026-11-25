@@ -31,6 +31,11 @@ set -euo pipefail
 #
 # Inputs (environment):
 #   DESKTOP_VERSION              release version, as printed by `version` (compile, package)
+#   DESKTOP_REQUIRE_MACOS_SIGNING
+#                                when `true`, fail darwin-arm64 packaging instead of ad-hoc signing
+#                                if Developer ID or notary credentials are missing
+#   DESKTOP_REQUIRE_UPDATE_KEY   when `true`, fail `manifest` instead of warning if
+#                                DESKTOP_UPDATE_KEY is unset
 #   LINGER_NATIVE_POSTGRES_DIR   where build.mjs reads the bundled archives
 #                                (~/.cache/linger-desktop)
 #   LINGER_NATIVE_DEPS_URL       folder serving those archives by file name; in a GitLab
@@ -40,6 +45,12 @@ set -euo pipefail
 #                                without it Send Diagnostics is hidden
 #   RELEASE_OUT                  output root (.linger-runtime/desktop-release); release
 #                                files go to $RELEASE_OUT/assets/
+#   DESKTOP_PACKAGING_IMAGE_PREFIX
+#                                optional container image prefix (such as
+#                                ghcr.io/simplexai-labs/linger/desktop); when
+#                                set, ensure_docker_image tries pulling
+#                                <prefix>-<tag>:<dockerfile-sha256> before
+#                                building locally
 #   RCODESIGN                    rcodesign executable for darwin-arm64 (PATH)
 #   MACOS_DEVELOPER_ID_P12, MACOS_DEVELOPER_ID_PASSWORD_FILE
 #                                Developer ID Application .p12 and a file with its
@@ -209,18 +220,32 @@ cmd_compile() {
 }
 
 ensure_docker_image() {
-  local tag="$1" dir="$2" sha current
+  local tag="$1" dir="$2" sha current remote
   sha="$(sha256_of "$dir/Dockerfile")"
   current="$(docker image inspect --format '{{index .Config.Labels "linger.dockerfile.sha256"}}' "$tag" 2>/dev/null || true)"
   if [[ "$current" == "$sha" ]]; then
     echo "desktop-release: reusing cached Docker image $tag"
     return 0
   fi
-  docker build -q --label "linger.dockerfile.sha256=$sha" -t "$tag" "$dir" >/dev/null
+  if [[ -n "${DESKTOP_PACKAGING_IMAGE_PREFIX:-}" ]]; then
+    remote="${DESKTOP_PACKAGING_IMAGE_PREFIX%/}-${tag}:${sha}"
+    echo "desktop-release: pulling prebuilt Docker image $remote"
+    if docker pull "$remote" && docker tag "$remote" "$tag"; then
+      echo "desktop-release: using prebuilt Docker image $remote as $tag"
+      return 0
+    fi
+    echo "desktop-release: prebuilt image $remote unavailable; building $tag locally" >&2
+  fi
+  echo "desktop-release: building Docker image $tag from $dir/Dockerfile"
+  docker build --label "linger.dockerfile.sha256=$sha" -t "$tag" "$dir"
 }
 
 package_darwin() {
   local version="$1" pkg="$2" assets="$3" args=()
+  if [[ "${DESKTOP_REQUIRE_MACOS_SIGNING:-}" == true ]]; then
+    [[ -n "${MACOS_DEVELOPER_ID_P12:-}" && -n "${MACOS_DEVELOPER_ID_PASSWORD_FILE:-}" && -n "${MACOS_NOTARY_KEY:-}" ]] ||
+      die "MACOS_DEVELOPER_ID_P12, MACOS_DEVELOPER_ID_PASSWORD_FILE, and MACOS_NOTARY_KEY are required when DESKTOP_REQUIRE_MACOS_SIGNING=true (docs/desktop-release.md)"
+  fi
   ensure_docker_image dmgtool "$desktop/packaging/mac"
   args+=(--arch arm64 --rcodesign "${RCODESIGN:-rcodesign}" --out "$pkg")
   if [[ -n "${MACOS_DEVELOPER_ID_P12:-}" ]]; then
@@ -304,6 +329,9 @@ cmd_manifest() {
   [[ "$version" =~ $version_pattern ]] || die "manifest needs the release version"
   rm -f "$dir/manifest.json" "$dir/manifest.json.sig"
   if [[ -z "${DESKTOP_UPDATE_KEY:-}" ]]; then
+    if [[ "${DESKTOP_REQUIRE_UPDATE_KEY:-}" == true ]]; then
+      die "DESKTOP_UPDATE_KEY_PEM is required when DESKTOP_REQUIRE_UPDATE_KEY=true (docs/desktop-release.md)"
+    fi
     echo "::warning::DESKTOP_UPDATE_KEY_PEM is not set: this release has no update manifest, so installed apps will not update to $version (docs/desktop-release.md)."
     return 0
   fi
@@ -321,30 +349,40 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const [dir, version, keyFile, source, ...pairs] = process.argv.slice(2);
-const packages = {};
-for (let i = 0; i < pairs.length; i += 2) {
-  const bytes = fs.readFileSync(path.join(dir, pairs[i + 1]));
-  packages[pairs[i]] = {
-    file: pairs[i + 1],
-    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-    size: bytes.length,
-  };
+async function sha256Stream(filePath) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
 }
-const manifest = Buffer.from(
-  JSON.stringify({ schema: 2, version, packages }, null, 2) + "\n",
-);
-const key = crypto.createPrivateKey(fs.readFileSync(keyFile));
-const signature = crypto.sign(null, manifest, key);
-const builtIn = /-----BEGIN PUBLIC KEY-----[\s\S]+?-----END PUBLIC KEY-----/.exec(
-  fs.readFileSync(source, "utf8"),
-);
-if (!builtIn || !crypto.verify(null, manifest, crypto.createPublicKey(builtIn[0]), signature)) {
-  console.error("desktop-release: DESKTOP_UPDATE_KEY is not the key of UPDATE_PUBLIC_KEY in update-manifest.ts; installed apps would refuse this manifest");
+(async () => {
+  const packages = {};
+  for (let i = 0; i < pairs.length; i += 2) {
+    const filePath = path.join(dir, pairs[i + 1]);
+    packages[pairs[i]] = {
+      file: pairs[i + 1],
+      sha256: await sha256Stream(filePath),
+      size: fs.statSync(filePath).size,
+    };
+  }
+  const manifest = Buffer.from(
+    JSON.stringify({ schema: 2, version, packages }, null, 2) + "\n",
+  );
+  const key = crypto.createPrivateKey(fs.readFileSync(keyFile));
+  const signature = crypto.sign(null, manifest, key);
+  const builtIn = /-----BEGIN PUBLIC KEY-----[\s\S]+?-----END PUBLIC KEY-----/.exec(
+    fs.readFileSync(source, "utf8"),
+  );
+  if (!builtIn || !crypto.verify(null, manifest, crypto.createPublicKey(builtIn[0]), signature)) {
+    console.error("desktop-release: DESKTOP_UPDATE_KEY is not the key of UPDATE_PUBLIC_KEY in update-manifest.ts; installed apps would refuse this manifest");
+    process.exit(1);
+  }
+  fs.writeFileSync(path.join(dir, "manifest.json"), manifest);
+  fs.writeFileSync(path.join(dir, "manifest.json.sig"), signature.toString("base64") + "\n");
+  console.log(`desktop-release: signed manifest.json for ${version}: ${Object.keys(packages).sort().join(", ")}`);
+})().catch((error) => {
+  console.error(error);
   process.exit(1);
-}
-fs.writeFileSync(path.join(dir, "manifest.json"), manifest);
-fs.writeFileSync(path.join(dir, "manifest.json.sig"), signature.toString("base64") + "\n");
-console.log(`desktop-release: signed manifest.json for ${version}: ${Object.keys(packages).sort().join(", ")}`);
+});
 NODE
     die "could not write the update manifest"
 }

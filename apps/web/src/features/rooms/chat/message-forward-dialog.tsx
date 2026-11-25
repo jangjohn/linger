@@ -17,7 +17,11 @@ import {
   type TeamHubClient,
 } from "@/features/teamhub/teamhub-client";
 import type { TeamHubMessage } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
 import { tenantActorsQueryOptions } from "../room-queries";
+import { chatMessages } from "./chat.messages";
 
 type TargetKind = "agent" | "room";
 
@@ -38,6 +42,7 @@ export function MessageForwardDialog({
   const [query, setQuery] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const t = useT();
   const actors = useQuery(tenantActorsQueryOptions(client, tenantId));
   const rooms = useQuery({
     queryFn: () =>
@@ -92,8 +97,8 @@ export function MessageForwardDialog({
     } catch (forwardError) {
       setError(
         forwardError instanceof TeamHubError && forwardError.status === 409
-          ? "A target changed while forwarding. Refresh and try again."
-          : "The message could not be forwarded. You may not have permission to share one of its documents.",
+          ? translate(chatMessages.forwardTargetChanged)
+          : translate(chatMessages.forwardFailed),
       );
     } finally {
       setSending(false);
@@ -105,18 +110,18 @@ export function MessageForwardDialog({
       closeOnBackdrop
       onClose={onClose}
       size="lg"
-      title="Forward to"
+      title={t(chatMessages.forwardTo)}
       footer={
         <>
           <Button onClick={onClose} tone="ghost">
-            Cancel
+            {t(commonMessages.cancel)}
           </Button>
           <Button
             disabled={!selected.length}
             loading={sending}
             onClick={() => void forward()}
           >
-            <Icon icon={SentIcon} size={16} /> Forward
+            <Icon icon={SentIcon} size={16} /> {t(chatMessages.forward)}
           </Button>
         </>
       }
@@ -130,17 +135,17 @@ export function MessageForwardDialog({
           }}
         >
           <input
-            aria-label="Search forward targets"
+            aria-label={t(chatMessages.searchForwardTargets)}
             className="h-11 min-w-0 flex-1 rounded-md border border-app-border px-3 text-sm outline-none focus:border-app-focus"
             onChange={(event) => setSearchInput(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") setQuery(searchInput);
             }}
-            placeholder="Search"
+            placeholder={t(commonMessages.search)}
             value={searchInput}
           />
           <Button
-            aria-label="Search"
+            aria-label={t(commonMessages.search)}
             size="icon"
             tone="secondary"
             type="submit"
@@ -159,19 +164,22 @@ export function MessageForwardDialog({
               size="compact"
               tone={kind === targetKind ? "primary" : "secondary"}
             >
-              {targetKind === "agent" ? "Agents" : "Rooms"}
+              {targetKind === "agent"
+                ? t(chatMessages.forwardAgents)
+                : t(chatMessages.forwardRooms)}
             </Button>
           ))}
         </div>
         {selected.length ? (
           <div
-            aria-label="Selected forward targets"
+            aria-label={t(chatMessages.selectedForwardTargets)}
             className="mt-3 flex flex-wrap gap-2"
           >
             {selected.map((targetId) => {
               const target = targetById.get(targetId);
               return (
                 <button
+                  data-voice-risk="never"
                   aria-pressed="true"
                   className="inline-flex items-center gap-1 rounded-full bg-app-selected px-2.5 py-1 text-xs text-app-ink"
                   key={targetId}
@@ -180,7 +188,7 @@ export function MessageForwardDialog({
                       current.filter((id) => id !== targetId),
                     )
                   }
-                  title="Remove selected target"
+                  title={t(chatMessages.removeSelectedTarget)}
                   type="button"
                 >
                   <Icon icon={Tick02Icon} size={14} />{" "}
@@ -209,7 +217,9 @@ export function MessageForwardDialog({
               >
                 <span className="text-sm text-app-ink">{target.label}</span>
                 <span className="text-xs text-app-muted">
-                  {checked ? "Selected" : "Select"}
+                  {checked
+                    ? t(chatMessages.targetSelected)
+                    : t(chatMessages.selectTarget)}
                 </span>
               </button>
             );

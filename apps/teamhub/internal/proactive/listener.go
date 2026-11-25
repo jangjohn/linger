@@ -33,19 +33,26 @@ const (
 )
 
 type listenerApp struct {
-	name string
-	spec reminder.ListenerSpec
+	name  string
+	specs []reminder.ListenerSpec
 }
 
-// listenerApps maps each listenable provider to the listener AnotherMe gets on
+// listenerApps maps each listenable provider to the listeners AnotherMe gets on
 // a connection of it.
 var listenerApps = map[string]listenerApp{
 	// Inbox only: mail the Human sends is not news to them.
-	"gmail": {"Gmail inbox watch", reminder.ListenerSpec{Type: reminder.ListenerGmail, Match: &reminder.ListenerMatch{LabelID: "INBOX"}}},
-	// The Outlook poller reads the inbox only.
-	"outlook":         {"Outlook inbox watch", reminder.ListenerSpec{Type: reminder.ListenerOutlook}},
-	"google_calendar": {"Google Calendar watch", reminder.ListenerSpec{Type: reminder.ListenerGCal, Events: []string{"created", "updated", "cancelled"}}},
-	"slack":           {"Slack mention watch", reminder.ListenerSpec{Type: reminder.ListenerSlack, Channel: "*", Match: &reminder.ListenerMatch{Kind: "mention"}}},
+	"gmail": {"Gmail inbox watch", []reminder.ListenerSpec{{Type: reminder.ListenerGmail, Match: &reminder.ListenerMatch{LabelID: "INBOX"}}}},
+	// An Outlook connection covers both inbox mail and calendar events.
+	"outlook": {"Outlook watch", []reminder.ListenerSpec{
+		{Type: reminder.ListenerOutlook},
+		{Type: reminder.ListenerOutlookCalendar, Events: []string{"created", "updated", "cancelled"}},
+	}},
+	"google_calendar": {"Google Calendar watch", []reminder.ListenerSpec{{Type: reminder.ListenerGCal, Events: []string{"created", "updated", "cancelled"}}}},
+	// A calendar-only Outlook Calendar connection watches events without reading mail.
+	"outlook_calendar": {"Outlook Calendar watch", []reminder.ListenerSpec{{Type: reminder.ListenerOutlookCalendar, Events: []string{"created", "updated", "cancelled"}}}},
+	"slack":            {"Slack mention watch", []reminder.ListenerSpec{{Type: reminder.ListenerSlack, Channel: "*", Match: &reminder.ListenerMatch{Kind: "mention"}}}},
+	// Inbox only, like Gmail: TeamHub reads Feishu Mail itself.
+	"feishu_mail": {"Feishu Mail inbox watch", []reminder.ListenerSpec{{Type: reminder.ListenerFeishuMail}}},
 }
 
 // ListenerProviders lists the providers whose connections get a listener.
@@ -124,9 +131,12 @@ func InstallListenerTx(ctx context.Context, tx pgx.Tx, queries *store.Queries, t
 	if !ok {
 		return nil
 	}
-	spec := app.spec
-	spec.Account, spec.PollIntervalSeconds = connectionID, listenerPollSeconds
-	trigger, err := json.Marshal([]reminder.ListenerSpec{spec})
+	specs := make([]reminder.ListenerSpec, len(app.specs))
+	for i, spec := range app.specs {
+		spec.Account, spec.PollIntervalSeconds = connectionID, listenerPollSeconds
+		specs[i] = spec
+	}
+	trigger, err := json.Marshal(specs)
 	if err != nil {
 		return err
 	}
@@ -171,22 +181,39 @@ func RouteListenerEvents(ctx context.Context, tx pgx.Tx, record store.RoomRemind
 	return nil
 }
 
+// listenerAppNames are the app names an event wake shows for listened
+// sources; an event handed in by hand shows its source as given.
+var listenerAppNames = map[string]string{
+	reminder.ListenerGmail: "Gmail", reminder.ListenerOutlook: "Outlook Mail",
+	reminder.ListenerGCal: "Google Calendar", reminder.ListenerOutlookCalendar: "Outlook Calendar",
+	reminder.ListenerSlack: "Slack",
+}
+
+func appName(source string) string {
+	if name, ok := listenerAppNames[source]; ok {
+		return name
+	}
+	return source
+}
+
 // EventFromListener names the matter a listened event is about. A mail thread, a
 // calendar event, or a Slack thread is one matter; each new message or change
 // in it is a new state. OccursAt is when the matter happens; a receive time is
-// not one.
+// not one. The summary leads with the IDs the Agent needs to look the event up
+// in its app.
 func EventFromListener(listened reminder.ListenerEvent) (Event, bool) {
 	event := Event{Source: listened.Source, Grant: listened.Grant}
 	switch listened.Source {
-	case reminder.ListenerGmail, reminder.ListenerOutlook:
+	case reminder.ListenerGmail, reminder.ListenerOutlook, reminder.ListenerFeishuMail:
 		event.Kind = "new_mail"
 		event.ExternalID = firstNonEmpty(listened.ThreadID, listened.MessageID, listened.EventID)
 		event.State = firstNonEmpty(listened.MessageID, listened.EventID)
-		event.Summary = summaryLines([2]string{"From", listened.From}, [2]string{"To", listened.To}, [2]string{"Subject", listened.Subject}, [2]string{"Body", listened.Snippet})
-	case reminder.ListenerGCal:
+		event.Summary = lookupSummary([][2]string{{"Message ID", listened.MessageID}, {"Thread ID", listened.ThreadID}, {"Labels", strings.Join(listened.LabelIDs, ", ")}},
+			[2]string{"From", listened.From}, [2]string{"To", listened.To}, [2]string{"Subject", listened.Subject}, [2]string{"Body", listened.Snippet})
+	case reminder.ListenerGCal, reminder.ListenerOutlookCalendar:
 		event.Kind = "calendar_" + listened.EventKind
 		event.ExternalID = firstNonEmpty(listened.MessageID, listened.EventID)
-		event.Summary = summaryLines([2]string{"Event ID", listened.MessageID}, [2]string{"Status", listened.EventKind}, [2]string{"Event", listened.Summary}, [2]string{"Start", listened.Start}, [2]string{"End", listened.End}, [2]string{"Location", listened.Location}, [2]string{"Organizer", listened.Organizer}, [2]string{"Description", listened.Description})
+		event.Summary = summaryLines([2]string{"Change", listened.EventKind}, [2]string{"Event ID", listened.MessageID}, [2]string{"Event", listened.Summary}, [2]string{"Start", calendarText(listened.Start)}, [2]string{"End", calendarText(listened.End)}, [2]string{"Location", listened.Location}, [2]string{"Organizer", listened.Organizer}, [2]string{"Description", listened.Description})
 		// Dedup the evidence, not only the start time or a provider timestamp:
 		// place/instruction changes matter, an otherwise identical revision does not.
 		digest := sha256.Sum256([]byte(event.Summary))
@@ -200,15 +227,16 @@ func EventFromListener(listened reminder.ListenerEvent) (Event, bool) {
 		if listened.Channel != "" {
 			channel = "#" + listened.Channel
 		}
-		event.Summary = summaryLines([2]string{"Channel", channel}, [2]string{"Sender", listened.Sender}, [2]string{"Content", listened.Text})
+		event.Summary = lookupSummary([][2]string{{"Message ID", listened.MessageID}, {"Channel", channel}, {"Channel ID", listened.ChannelID}, {"Thread ID", listened.ThreadID}},
+			[2]string{"Sender", listened.Sender}, [2]string{"Content", listened.Text})
 	default:
 		return Event{}, false
 	}
 	return event, event.ExternalID != "" && event.Summary != ""
 }
 
-// calendarTime reads a Google Calendar start: a time, or an all-day date in
-// local time.
+// calendarTime reads a calendar event start: an RFC3339 instant, or an all-day
+// date in local time.
 func calendarTime(value string) *time.Time {
 	if at, err := time.Parse(time.RFC3339, value); err == nil {
 		return &at
@@ -217,6 +245,24 @@ func calendarTime(value string) *time.Time {
 		return &at
 	}
 	return nil
+}
+
+// calendarText writes a calendar instant in local time like every wake time;
+// a provider may report it in UTC. An all-day date stays as given.
+func calendarText(value string) string {
+	if at, err := time.Parse(time.RFC3339, value); err == nil {
+		return at.In(time.Local).Format(eventTimeLayout)
+	}
+	return value
+}
+
+// lookupSummary leads an event's content with the IDs to look it up by. IDs
+// alone are not something to judge, so an event without content stays empty.
+func lookupSummary(ids [][2]string, content ...[2]string) string {
+	if summaryLines(content...) == "" {
+		return ""
+	}
+	return summaryLines(append(ids, content...)...)
 }
 
 func summaryLines(parts ...[2]string) string {

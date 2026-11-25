@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -192,7 +193,7 @@ func (s *Service) pollBinding(ctx context.Context, provider *composio.Client, ro
 	}
 	// Each provider request and retry checks authority without holding a DB lock over I/O.
 	callCtx := composio.WithRequestAuthorization(ctx, func(ctx context.Context) error { return grant.Check(ctx, store.New(s.pool)) })
-	read, err := fetchListenerPoll(callCtx, provider, target.connection.UpstreamConnectionID, target.spec, cursor)
+	read, err := s.fetchListenerPoll(callCtx, provider, target.connection.UpstreamConnectionID, target.spec, cursor)
 	if err != nil {
 		if derr := s.delayPoll(ctx, bindingID, pollFailureDelay(interval, err)); derr != nil {
 			return derr
@@ -366,10 +367,11 @@ func routineSpecForBinding(ctx context.Context, queries *store.Queries, binding 
 type pollFetcher func(ctx context.Context, provider *composio.Client, connectedAccountID string, spec ListenerSpec, cursor pollCursor) (pollRead, error)
 
 var pollFetchers = map[string]pollFetcher{
-	ListenerSlack:   fetchSlack,
-	ListenerGmail:   fetchGmail,
-	ListenerOutlook: fetchOutlook,
-	ListenerGCal:    fetchGCal,
+	ListenerSlack:           fetchSlack,
+	ListenerGmail:           fetchGmail,
+	ListenerOutlook:         fetchOutlook,
+	ListenerGCal:            fetchGCal,
+	ListenerOutlookCalendar: fetchOutlookCalendar,
 }
 
 // Slack: per-channel conversations.history with oldest=cursor over every
@@ -633,9 +635,164 @@ func fetchGCal(ctx context.Context, provider *composio.Client, ca string, spec L
 	return read, nil
 }
 
-func fetchListenerPoll(ctx context.Context, provider *composio.Client, ca string, spec ListenerSpec, cursor pollCursor) (pollRead, error) {
+const (
+	// Microsoft Graph calendarView/delta binds its token to the initial time
+	// window. Start one day back and cover six months ahead, rolling forward once
+	// less than 30 days of future coverage remain.
+	outlookCalendarWindowPast    = 24 * time.Hour
+	outlookCalendarWindowFuture  = 180 * 24 * time.Hour
+	outlookCalendarWindowRefresh = 30 * 24 * time.Hour
+	// Exchange may stamp lastModifiedDateTime slightly after createdDateTime on a
+	// newly created event.
+	outlookCalendarCreateSkew = 2 * time.Second
+)
+
+// Outlook Calendar: Graph calendarView/delta. Bootstrap persists the
+// observation boundary and bounded window first, then pages to a deltaLink
+// emitting only events changed after the boundary; incremental polls emit
+// created, updated, and cancelled events.
+func fetchOutlookCalendar(ctx context.Context, provider *composio.Client, ca string, spec ListenerSpec, cursor pollCursor) (pollRead, error) {
+	calendarID := spec.CalendarID
+	if calendarID == "" {
+		calendarID = "primary"
+	}
+	channels := maps.Clone(cursor.Channels)
+	if channels == nil {
+		channels = map[string]string{}
+	}
+	cursor.Channels = channels
+	now := time.Now().UTC()
+	if cursor.Channels["since"] == "" {
+		cursor.Channels["since"] = now.Format(time.RFC3339Nano)
+		cursor.Channels["window_start"] = now.Add(-outlookCalendarWindowPast).Format(time.RFC3339)
+		cursor.Channels["window_end"] = now.Add(outlookCalendarWindowFuture).Format(time.RFC3339)
+		// Commit the boundary before any remote request can fail.
+		return pollRead{cursor: cursor, nextPoll: time.Minute}, nil
+	}
+	since, err := time.Parse(time.RFC3339Nano, cursor.Channels["since"])
+	if err != nil {
+		return pollRead{}, err
+	}
+	windowStart, hasStart := parseRFC3339OK(cursor.Channels["window_start"])
+	windowEnd, hasEnd := parseRFC3339OK(cursor.Channels["window_end"])
+	needsWindowRoll := !hasStart || !hasEnd || now.Add(outlookCalendarWindowRefresh).After(windowEnd)
+	if !hasStart || !hasEnd {
+		windowStart = now.Add(-outlookCalendarWindowPast)
+		windowEnd = now.Add(outlookCalendarWindowFuture)
+		cursor.Channels["window_start"] = windowStart.Format(time.RFC3339)
+		cursor.Channels["window_end"] = windowEnd.Format(time.RFC3339)
+	}
+
+	isInitialSync := cursor.V == ""
+	link := cursor.V
+	if cursor.PageToken != "" {
+		link = cursor.PageToken
+	}
+	changes, nextLink, deltaLink, err := provider.ListOutlookCalendarDelta(ctx, ca, calendarID, windowStart, windowEnd, link)
+	if errors.Is(err, composio.ErrOutlookDeltaExpired) {
+		// Retry a lost continuation from the committed delta; if that expires too,
+		// resync from the original observation boundary. Delivery receipts dedup it.
+		if cursor.PageToken != "" {
+			cursor.PageToken = ""
+		} else {
+			cursor.V = ""
+			cursor.Channels["window_start"] = now.Add(-outlookCalendarWindowPast).Format(time.RFC3339)
+			cursor.Channels["window_end"] = now.Add(outlookCalendarWindowFuture).Format(time.RFC3339)
+		}
+		return pollRead{cursor: cursor, nextPoll: time.Minute}, nil
+	}
+	if err != nil {
+		return pollRead{}, err
+	}
+
+	read := pollRead{cursor: cursor}
+	for _, ch := range changes {
+		if ch.ID == "" {
+			return pollRead{}, errors.New("calendar change missing identity")
+		}
+		if ch.Removed {
+			// Graph emits @removed with reason "changed" when an event moves
+			// outside the view window; only deletions represent cancellations.
+			if ch.RemovedReason != "" && !strings.EqualFold(ch.RemovedReason, "deleted") {
+				continue
+			}
+			if isInitialSync {
+				continue
+			}
+			read.events = append(read.events, ListenerEvent{
+				Source:    ListenerOutlookCalendar,
+				EventID:   ch.ID + ":cancelled",
+				EventKind: "cancelled",
+				MessageID: ch.ID,
+			})
+			continue
+		}
+		if isInitialSync && !ch.LastModified.After(since) && !ch.CreatedAt.After(since) {
+			continue
+		}
+		kind := "updated"
+		if ch.IsCancelled {
+			kind = "cancelled"
+		} else if !ch.CreatedAt.IsZero() && (ch.LastModified.IsZero() || ch.LastModified.Sub(ch.CreatedAt) <= outlookCalendarCreateSkew) {
+			kind = "created"
+		}
+		revision := ch.LastModified.UTC().Format(time.RFC3339Nano)
+		if ch.LastModified.IsZero() {
+			if kind == "cancelled" {
+				revision = "cancelled"
+			} else if !ch.CreatedAt.IsZero() {
+				revision = ch.CreatedAt.UTC().Format(time.RFC3339Nano)
+			} else {
+				revision = kind
+			}
+		}
+		read.events = append(read.events, ListenerEvent{
+			Source:      ListenerOutlookCalendar,
+			EventID:     ch.ID + ":" + revision,
+			EventKind:   kind,
+			Summary:     ch.Subject,
+			Start:       ch.Start,
+			End:         ch.End,
+			Description: ch.Description,
+			Location:    ch.Location,
+			Organizer:   ch.Organizer,
+			MessageID:   ch.ID,
+		})
+	}
+	cursor.PageToken = nextLink
+	if deltaLink != "" {
+		if !isInitialSync && needsWindowRoll {
+			// Roll the bounded delta window only after draining pending changes
+			// from the expiring delta so nothing in the last poll interval is lost.
+			cursor.V = ""
+			cursor.Channels["since"] = now.Format(time.RFC3339Nano)
+			cursor.Channels["window_start"] = now.Add(-outlookCalendarWindowPast).Format(time.RFC3339)
+			cursor.Channels["window_end"] = now.Add(outlookCalendarWindowFuture).Format(time.RFC3339)
+			read.nextPoll = time.Minute
+		} else {
+			cursor.V = deltaLink
+		}
+	} else {
+		read.nextPoll = time.Minute
+	}
+	read.cursor = cursor
+	return read, nil
+}
+
+func parseRFC3339OK(raw string) (time.Time, bool) {
+	parsed, err := time.Parse(time.RFC3339, raw)
+	return parsed, err == nil
+}
+
+func (s *Service) fetchListenerPoll(ctx context.Context, provider *composio.Client, ca string, spec ListenerSpec, cursor pollCursor) (pollRead, error) {
 	if len(cursor.Pending) > 0 {
 		return pollRead{cursor: cursor, nextPoll: time.Minute}, nil
+	}
+	if spec.Type == ListenerFeishuMail {
+		if s.feishuMail == nil {
+			return pollRead{}, errors.New("Feishu Mail listeners are not configured")
+		}
+		return fetchFeishuMail(ctx, s.feishuMail, ca, cursor)
 	}
 	fetch := pollFetchers[spec.Type]
 	if fetch == nil {
@@ -650,4 +807,77 @@ func pollFailureDelay(interval time.Duration, cause error) time.Duration {
 		return max(time.Minute, limited.RetryAfter)
 	}
 	return interval + listenerErrorBackoff*time.Second
+}
+
+// FeishuInboxMessage is one inbox message a Feishu Mail listener reports.
+// Body is cleaned and bounded like other listener mail bodies.
+type FeishuInboxMessage struct {
+	ID, ThreadID, From, To, Subject, Body string
+	Received                              time.Time
+}
+
+// FeishuMailFeed reads a Feishu inbox for its listener. TeamHub runs Feishu
+// itself, so the feed comes from the connection service, not Composio.
+type FeishuMailFeed interface {
+	// FeishuInboxSince returns inbox mail received at or after since, newest
+	// first, from pageToken as far as a bounded number of pages reach. next
+	// is where to read on when mail newer than since remains unread.
+	FeishuInboxSince(ctx context.Context, upstreamID string, since time.Time, pageToken string) (messages []FeishuInboxMessage, next string, err error)
+}
+
+// SetFeishuMailFeed lets Feishu Mail listeners read their inboxes.
+func (s *Service) SetFeishuMailFeed(feed FeishuMailFeed) { s.feishuMail = feed }
+
+// Feishu Mail: the inbox has no delta API, so each poll reads the newest
+// inbox mail since a received-time watermark. The first poll only records the
+// watermark, so mail from before the listener is not news. Mail received in
+// the watermark's own millisecond is read again; delivery receipts dedup it.
+// A backlog larger than one read is read on from its page over the next
+// polls, and the watermark moves to the backlog's newest mail only once all
+// of it is read, so no mail newer than the old watermark is skipped.
+func fetchFeishuMail(ctx context.Context, feed FeishuMailFeed, ca string, cursor pollCursor) (pollRead, error) {
+	if cursor.Channels == nil {
+		cursor.Channels = map[string]string{}
+	}
+	if cursor.Channels["since"] == "" {
+		cursor.Channels["since"] = time.Now().UTC().Format(time.RFC3339Nano)
+		return pollRead{cursor: cursor, nextPoll: time.Minute}, nil
+	}
+	since, err := time.Parse(time.RFC3339Nano, cursor.Channels["since"])
+	if err != nil {
+		return pollRead{}, err
+	}
+	// newest is the newest mail this backlog has shown, across its polls.
+	newest := since
+	if seen := cursor.Channels["backlog_newest"]; seen != "" {
+		if newest, err = time.Parse(time.RFC3339Nano, seen); err != nil {
+			return pollRead{}, err
+		}
+	}
+	messages, next, err := feed.FeishuInboxSince(ctx, ca, since, cursor.Channels["backlog_page"])
+	if err != nil {
+		return pollRead{}, err
+	}
+	read := pollRead{cursor: cursor}
+	for _, m := range messages {
+		if m.Received.Before(since) {
+			continue
+		}
+		newest = maxTime(newest, m.Received)
+		read.events = append(read.events, ListenerEvent{
+			Source: ListenerFeishuMail, EventID: m.ID, EventKind: "message",
+			From: m.From, To: m.To, Subject: m.Subject, Snippet: m.Body,
+			MessageID: m.ID, ThreadID: m.ThreadID,
+		})
+	}
+	if next != "" {
+		read.cursor.Channels["backlog_page"] = next
+		read.cursor.Channels["backlog_newest"] = newest.UTC().Format(time.RFC3339Nano)
+		read.nextPoll = time.Minute
+		return read, nil
+	}
+	delete(read.cursor.Channels, "backlog_page")
+	delete(read.cursor.Channels, "backlog_newest")
+	read.cursor.Channels["since"] = newest.UTC().Format(time.RFC3339Nano)
+	return read, nil
 }

@@ -12,6 +12,12 @@ output schema and write validation use the same scope. The file system still pro
 `timeline/weekly/`; the current version in PostgreSQL is the query authority. Period reports are read through the
 Memory browsing entry and do not enter OpenWiki's native graph.
 
+When reading existing Markdown, metadata parsing first tries the recorded YAML
+and then the repair for unquoted colon-bearing values. If neither parses, the
+reader uses the body heading and summary with empty metadata. A damaged report
+therefore remains readable without blocking other reports in the Memory browser;
+the reader does not rewrite the file. Publication validation remains strict.
+
 ## Search
 
 Memory keeps one index, `memory_index.sources` and `chunks`: Room Sessions, recordings, My pages, imported
@@ -79,6 +85,10 @@ validator owns these checks and loads no graph schema. If any file fails, nothin
 Daily and Weekly models return one JSON object of report fields (title,
 description, `source_refs`, one array per section, Weekly `work_intensity`)
 under a strict JSON schema; they never write Markdown, paths or headings. The
+field text is in the main language the represented Human uses: Daily reads it
+from that day's conversations and Pocket Note, and Weekly from the week's
+Daily items. Neither takes it from the prompt, an earlier report or another
+participant, so a Chinese-speaking Human gets Chinese reports. The
 application renders the whole file: YAML frontmatter, the fixed English H2
 headings (`DAILY_REPORT_SECTIONS` / `WEEKLY_REPORT_SECTIONS` in
 `@linger/knowledge-format/sections`), one bullet per item, `None observed.`
@@ -155,6 +165,8 @@ Core configuration:
 - Business dates use the process's local time zone (`TZ`): the collection window, Session dates, meeting
   directories, Pocket Note reads and calendar scheduling all use it, and there is no separate time zone variable.
   Compose containers default to UTC; set `TZ` in `.env` when needed.
+  Explicit dates must name an actual calendar day in `YYYY-MM-DD` form. Invalid `--date` and
+  `--week-start` values are rejected before collection instead of being normalized to another day.
 - These features are always on, with no switch: the in-process scheduled sync (hourly Wiki, daily Daily and weekly
   Weekly), the targeted refresh after a Room is quiet for 10 minutes, the separate Session refresh of formal
   recording transcripts, Session fact extraction and fact recall, the nightly tracking-item pass, and the nightly
@@ -767,7 +779,7 @@ superseded by a newer scan, but the closing dependencies of Daily/Weekly must st
 The two kinds of automatic retry each have a final or persistent failure state, shown by one read-only endpoint
 (skips of source triggers are recorded only in logs):
 
-- Calendar tasks (Session/Daily/Weekly) retry only the failed subjects, after 15 s, 1 min, 3 min, 10 min and 1 h; the sixth failure moves the task to the calendar's `failed` list. Dependencies are isolated per subject: subjects still failing in the prerequisite are held in Daily/Weekly while the others run; when the prerequisite is exhausted, only those subjects' downstream tasks stop with `Dependency exhausted` and an ERROR `memory_calendar_dependency_exhausted` log. A failure that cannot be attributed to subjects still blocks the whole downstream task.
+- Calendar tasks (Session/Daily/Weekly) retry only the failed subjects, after 15 s, 1 min, 3 min, 10 min and 1 h; the sixth failure moves the task to the calendar's `failed` list. A model call the Computer reports `unavailable` (disconnected, draining, or unable to reach the network its model needs, as when the network is cut overnight) spends no attempt: the task asks again every 5 minutes for up to 24 hours, so a Daily that missed midnight runs once the network returns; a Computer away longer moves the task to the `failed` list. Dependencies are isolated per subject: subjects still failing in the prerequisite are held in Daily/Weekly while the others run; when the prerequisite is exhausted, only those subjects' downstream tasks stop with `Dependency exhausted` and an ERROR `memory_calendar_dependency_exhausted` log. A failure that cannot be attributed to subjects still blocks the whole downstream task.
 - A failed Raw Chunk source is recorded as `state='failed'` (including documents never stored that have only a
   normalization failure record); the hourly reconciliation and start-up keep retrying it automatically, with no manual
   action.

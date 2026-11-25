@@ -66,10 +66,12 @@ import (
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/taskdelegation"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/taskexecution"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/typedcard"
+	"github.com/simplexai-labs/linger/apps/teamhub/internal/urlpreview"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicecaptureqa"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicekey"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicemedia"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicequicknotes"
+	"github.com/simplexai-labs/linger/apps/teamhub/internal/websearch"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/workitem"
 	httpapi "github.com/simplexai-labs/linger/contracts-go/teamhubpublic"
 )
@@ -120,6 +122,10 @@ type App struct {
 	voiceMedia               voicemedia.Plane
 	// voiceKeys resolves the Soniox and xAI keys at each use.
 	voiceKeys *voicekey.Service
+	// webSearch runs the Agents' web searches with the saved keys.
+	webSearch *websearch.Service
+	// urlPreview reads sites' framing rules for the Web link preview panel.
+	urlPreview *urlpreview.Prober
 	// reconcileVoiceWorkers wakes the Node Services voice workers after a key
 	// is saved and reports whether they are ready; nil without a Node Services
 	// link.
@@ -218,7 +224,10 @@ type Deps struct {
 	VoiceMedia             voicemedia.Plane
 	// VoiceKeyChecker checks a voice provider key before it is saved; nil
 	// asks the provider's API.
-	VoiceKeyChecker     voicekey.Checker
+	VoiceKeyChecker voicekey.Checker
+	// WebSearch points web search at fake providers; zero fields use the
+	// providers' APIs.
+	WebSearch           websearch.Endpoints
 	PersonalProfile     personalprofile.Generator
 	PersonalInsight     personalinsight.Generator
 	ProactiveEventJudge proactive.EventJudge
@@ -525,11 +534,17 @@ func (a *App) registerFeatures(ctx context.Context, cfg config.Config, deps Deps
 	if err := a.registerVoice(cfg, deps, core.artifacts); err != nil {
 		return err
 	}
+	if err := a.registerWebSearch(cfg, deps); err != nil {
+		return err
+	}
+	a.urlPreview = urlpreview.New()
 	a.reminders = reminder.New(a.pool)
 	agentAuthorization := a.registerAgentAuthorization()
 	if err := a.registerExternalApps(ctx, cfg.ExternalApps, deps.Composio, agentAuthorization); err != nil {
 		return err
 	}
+	// Feishu Mail listeners read their inbox through the connection service.
+	a.reminders.SetFeishuMailFeed(a.externalSources)
 	a.registerTasks()
 	a.registerPersonalData(cfg, deps, core.models)
 	if err := a.registerProactive(cfg, deps); err != nil {
@@ -545,7 +560,7 @@ func (a *App) registerFeatures(ctx context.Context, cfg config.Config, deps Deps
 
 func (a *App) registerAgentAuthorization() *agentauth.Service {
 	agentAuthorization := agentauth.New(a.pool)
-	agentAuthorization.SetConnectedApps(a.connectedAppsConfigured)
+	agentAuthorization.SetConnectedApps(a.connectionProvidersConfigured)
 	a.agentAuth = agentAuthorization
 	return agentAuthorization
 }

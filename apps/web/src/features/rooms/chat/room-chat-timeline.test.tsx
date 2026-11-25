@@ -391,7 +391,7 @@ describe("Room Chat", () => {
         expect.objectContaining({
           kind: "agentActivity",
           actorId: "actor-codex",
-          title: "Activity · Codex",
+          title: "Codex",
         }),
       ),
     );

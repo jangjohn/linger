@@ -108,6 +108,17 @@ describe("windowsElevated", () => {
   });
 });
 
+describe("prepareNativeDatabase start", () => {
+  it("restarts a server an earlier release left running from another archive", async () => {
+    run.mockImplementation(async () => ok("1"));
+    await prepareNativeDatabase(options);
+    expect(vi.mocked(startNativeProcess).mock.calls[0]![0]).toMatchObject({
+      name: "postgres",
+      restartOnConfigurationChange: true,
+    });
+  });
+});
+
 describe("prepareNativeDatabase on Windows", () => {
   it("runs the .exe programs from the private PostgreSQL", async () => {
     asWindows();
@@ -132,24 +143,102 @@ describe("prepareNativeDatabase on Windows", () => {
     ]);
     expect(vi.mocked(startNativeProcess).mock.calls[0]![0]).toMatchObject({
       executable: path.join(options.postgresBin, "postgres.exe"),
+      withoutAdministrators: false,
     });
     expect(vi.mocked(inspectNativeProcess)).toHaveBeenCalled();
   });
 
-  it("stops before initdb when Linger runs as administrator", async () => {
+  it("starts postgres with Administrators disabled when Linger runs as administrator", async () => {
     asWindows();
-    run.mockResolvedValue(
-      ok('"Mandatory Label\\High Mandatory Level","Label","S-1-16-12288",""'),
+    run.mockImplementation(async (command) =>
+      command.endsWith("whoami.exe")
+        ? ok(
+            '"Mandatory Label\\High Mandatory Level","Label","S-1-16-12288",""',
+          )
+        : ok(),
     );
-    await expect(prepareNativeDatabase(options)).rejects.toThrow(
-      /cannot run as administrator/,
-    );
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(startNativeProcess).not.toHaveBeenCalled();
+    await prepareNativeDatabase(options);
+    expect(vi.mocked(startNativeProcess).mock.calls[0]![0]).toMatchObject({
+      executable: path.join(options.postgresBin, "postgres.exe"),
+      withoutAdministrators: true,
+    });
   });
 });
 
 describe("prepareNativeDatabase initdb", () => {
+  it("says what the program reported, without the password", async () => {
+    run.mockImplementation(async (command) =>
+      path.basename(command) === "initdb"
+        ? {
+            code: 1,
+            stdout: "",
+            stderr:
+              "initdb: error: could not change permissions of directory\nsecret\n",
+          }
+        : ok(),
+    );
+    const failure = await prepareNativeDatabase(options).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain("could not change permissions");
+    expect(message).toContain("Inspect the instance log.");
+    expect(message).not.toContain("secret");
+  });
+
+  it("keeps the last lines in view and caps a long one", async () => {
+    run.mockImplementation(async (command) =>
+      path.basename(command) === "initdb"
+        ? {
+            code: 1,
+            stdout: "",
+            stderr: `${"x".repeat(5_000)}\nFATAL: data directory is not empty\ncleaning up\n`,
+          }
+        : ok(),
+    );
+    const first = await prepareNativeDatabase(options).catch(
+      (error: unknown) => error,
+    );
+    // The FATAL line survives the cleanup lines that follow it.
+    expect((first as Error).message).toContain(
+      "FATAL: data directory is not empty",
+    );
+
+    vi.clearAllMocks();
+    run.mockImplementation(async (command) =>
+      path.basename(command) === "initdb"
+        ? { code: 1, stdout: "", stderr: `${"y".repeat(5_000)}\n` }
+        : ok(),
+    );
+    const second = await prepareNativeDatabase(options).catch(
+      (error: unknown) => error,
+    );
+    // The long line is copied but capped at 240 characters.
+    expect((second as Error).message).toContain("y".repeat(239));
+    expect((second as Error).message).not.toContain("y".repeat(241));
+  });
+
+  it("shows exactly the last five lines, in any language", async () => {
+    run.mockImplementation(async (command) =>
+      path.basename(command) === "initdb"
+        ? {
+            code: 1,
+            stdout: "",
+            stderr:
+              "line 1\nline 2\nline 3\nline 4\n\u521d\u59cb\u5316\u5931\u8d25\nline 6\nline 7\n",
+          }
+        : ok(),
+    );
+    const failure = await prepareNativeDatabase(options).catch(
+      (error: unknown) => error,
+    );
+    const message = (failure as Error).message;
+    expect(message).toContain("line 3");
+    expect(message).toContain("line 7");
+    expect(message).toContain("\u521d\u59cb\u5316\u5931\u8d25");
+    expect(message).not.toContain("line 2");
+  });
   const data = path.join(instance.root, "native/postgres-data");
   const pending = `${data}.partial`;
   const pgdata = () =>
@@ -273,5 +362,62 @@ describe("prepareNativeDatabase with an existing TeamHub schema", () => {
     expect(stopNativeProcess).not.toHaveBeenCalled();
     expect(setAsideLegacyData).not.toHaveBeenCalled();
     expect(startNativeProcess).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("prepareNativeDatabase readiness wait", () => {
+  it("logs progress and succeeds when PostgreSQL becomes ready past 30s", async () => {
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const logs: string[] = [];
+    let checks = 0;
+    run.mockImplementation(async (command) => {
+      if (path.basename(command) === "pg_isready") {
+        checks += 1;
+        // Advance 20s per check so readiness passes the old 30s cutoff at 40s.
+        now += 20_000;
+        return checks < 3
+          ? {
+              code: 1,
+              stdout: "",
+              stderr: "the database system is starting up",
+            }
+          : ok();
+      }
+      return ok("1");
+    });
+    try {
+      await prepareNativeDatabase({
+        ...options,
+        onOutput: (chunk) => logs.push(chunk),
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+    expect(checks).toBe(3);
+    expect(
+      logs.some((line) =>
+        /Waiting for native PostgreSQL to become ready/.test(line),
+      ),
+    ).toBe(true);
+  });
+
+  it("reports deadline seconds and pg_isready exit code when readiness times out at 120s", async () => {
+    let now = 2_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    run.mockImplementation(async (command) => {
+      if (path.basename(command) === "pg_isready") {
+        now += 30_000;
+        return { code: 2, stdout: "", stderr: "no response" };
+      }
+      return ok("1");
+    });
+    try {
+      await expect(prepareNativeDatabase(options)).rejects.toThrow(
+        "Native PostgreSQL did not become ready within 120s (pg_isready exit 2); inspect its instance log.",
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

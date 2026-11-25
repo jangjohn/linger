@@ -9,7 +9,7 @@ import {
 } from "@testing-library/react";
 import { Suspense } from "react";
 import { MemoryRouter, Route, Routes } from "react-router";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { teamHubData } from "@/features/teamhub/teamhub-api";
 
@@ -538,6 +538,224 @@ describe("ComputersPage", () => {
         },
       }),
     );
+  });
+
+  it("shows the active BYOK model-source runtime pill instead of defaulting to Claude Code", async () => {
+    const fixture = await authenticatedFixture();
+    const multiRuntime = replacementComputerInventory();
+    multiRuntime.items[0]!.runtimes = [
+      { models: [], status: "ready", type: "claude" },
+      { models: [], status: "ready", type: "codex" },
+      { models: [], status: "ready", type: "pi" },
+    ];
+    fixture.seed.localComputers = multiRuntime.items;
+    fixture.server.on(
+      "GET",
+      "/v0/tenants/{tenantId}/local-computers/{computerId}/model-source",
+      ({ params }) =>
+        Response.json({
+          computer_id: params.computerId,
+          online: true,
+          status: {
+            byok: {
+              base_url: "http://127.0.0.1:18100",
+              configured: true,
+              endpoint: "/chat/completions",
+              key_saved: true,
+              model_id: "Spark-X2.6-4B-Q8_0",
+              path: "/v1",
+              protocol: "openai-chat",
+            },
+            mode: "byok",
+            runtime: "pi",
+            runtime_model: "localmodels-byok",
+          },
+          viewer_is_owner: true,
+        }),
+    );
+
+    await renderPage(fixture);
+
+    const detail = await screen.findByRole("region", {
+      name: "New Build Mac details",
+    });
+    expect(
+      await within(detail).findByText("Agents use Pi here"),
+    ).toBeInTheDocument();
+    expect(
+      within(detail).queryByText("Agents use Claude Code here"),
+    ).not.toBeInTheDocument();
+    expect(
+      fixture.server.requestsTo(
+        "GET",
+        "/v0/tenants/{tenantId}/local-computers/{computerId}/local-models",
+      ),
+    ).toHaveLength(0);
+  });
+
+  describe("CLI download visibility in the desktop app", () => {
+    afterEach(() => {
+      delete (window as { lingerDesktop?: unknown }).lingerDesktop;
+    });
+
+    it("hides CLI connect entries when showing the desktop app's own local server even while localAccount is not ready", async () => {
+      const owned = vi.fn(async () => true);
+      const available = vi.fn(async () => false);
+      (window as { lingerDesktop?: unknown }).lingerDesktop = {
+        localServer: { owned },
+        localAccount: { available },
+      };
+      const fixture = await authenticatedFixture();
+      fixture.seed.localComputers = [
+        {
+          ...fixture.seed.localComputers[0]!,
+          status: "offline",
+        },
+      ];
+      fixture.server.on("GET", "/v0/tenants/{tenantId}/agents", () => ({
+        items: [localAgentFixture("computer-jenny-mac")],
+        page: { has_more: false },
+      }));
+
+      await renderPage(fixture);
+
+      const detail = await screen.findByRole("region", {
+        name: "Jenny's Mac details",
+      });
+      await vi.waitFor(() => expect(owned).toHaveBeenCalled());
+      expect(available).not.toHaveBeenCalled();
+      expect(
+        screen.queryByRole("button", { name: "Connect a Local Computer" }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(detail).queryByRole("button", { name: "Reconnect" }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(detail).queryByText("Start the app"),
+      ).not.toBeInTheDocument();
+
+      fireEvent.click(within(detail).getByRole("button", { name: "Advanced" }));
+      expect(
+        within(detail).queryByText("Troubleshoot"),
+      ).not.toBeInTheDocument();
+      for (const tool of [
+        "Status",
+        "Restart",
+        "Re-check",
+        "Reconnect",
+        "Stop",
+      ]) {
+        expect(
+          within(detail).queryByRole("button", { name: tool }),
+        ).not.toBeInTheDocument();
+      }
+      fireEvent.click(within(detail).getByRole("button", { name: "Remove" }));
+      const removeDialog = await screen.findByRole("dialog", {
+        name: "Remove Local Computer",
+      });
+      expect(removeDialog).toHaveTextContent("Local Reviewer");
+      expect(
+        within(removeDialog).queryByRole("button", {
+          name: "Connect a computer",
+        }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("hides CLI upgrade button and modal when upgrade_required is set on the desktop local server", async () => {
+      (window as { lingerDesktop?: unknown }).lingerDesktop = {
+        localServer: { owned: vi.fn(async () => true) },
+      };
+      const fixture = await authenticatedFixture();
+      fixture.seed.localComputers = [
+        {
+          ...fixture.seed.localComputers[0]!,
+          daemon_version: "0.1.0",
+          recommended_version: "0.2.0",
+          status: "online",
+          upgrade_required: true,
+        },
+      ];
+
+      await renderPage(fixture);
+
+      const detail = await screen.findByRole("region", {
+        name: "Jenny's Mac details",
+      });
+      expect(
+        within(detail).queryByRole("button", { name: "Update" }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(within(detail).getByRole("button", { name: "Advanced" }));
+      expect(
+        within(detail).queryByRole("button", {
+          name: /0\.2\.0 available|Update/,
+        }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("falls back to localAccount.available in older desktop builds without localServer.owned", async () => {
+      const available = vi.fn(async () => true);
+      (window as { lingerDesktop?: unknown }).lingerDesktop = {
+        localAccount: { available },
+      };
+      const fixture = await authenticatedFixture();
+
+      await renderPage(fixture);
+
+      await vi.waitFor(() => expect(available).toHaveBeenCalled());
+      expect(
+        screen.queryByRole("button", { name: "Connect a Local Computer" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("hides CLI setup button on the empty Computers view for the desktop local server", async () => {
+      (window as { lingerDesktop?: unknown }).lingerDesktop = {
+        localAccount: { available: vi.fn(async () => true) },
+      };
+      const emptyFixture = await authenticatedFixture();
+      emptyFixture.seed.localComputers = [];
+
+      await renderPage(emptyFixture);
+
+      expect(
+        await screen.findByText("Run Agents on your computer"),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole("button", { name: "Connect a computer" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("hides CLI setup commands on an unavailable Computer view for the desktop local server", async () => {
+      (window as { lingerDesktop?: unknown }).lingerDesktop = {
+        localAccount: { available: vi.fn(async () => true) },
+      };
+      const unavailableFixture = await authenticatedFixture();
+      await renderPage(
+        unavailableFixture,
+        "/t/tenant-northstar/computers?computer=computer-gone",
+      );
+
+      expect(await screen.findByText("Computer unavailable")).toBeVisible();
+      expect(
+        screen.queryByRole("button", { name: "Setup commands" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps CLI connect entries when the desktop app points at a remote server", async () => {
+      (window as { lingerDesktop?: unknown }).lingerDesktop = {
+        localAccount: { available: vi.fn(async () => false) },
+      };
+      const fixture = await authenticatedFixture();
+
+      await renderPage(fixture);
+
+      const connect = await screen.findByRole("button", {
+        name: "Connect a Local Computer",
+      });
+      fireEvent.click(connect);
+      expect(
+        await screen.findByRole("dialog", { name: "Connect Local Computer" }),
+      ).toBeVisible();
+    });
   });
 });
 

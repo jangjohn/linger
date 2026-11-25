@@ -11,7 +11,9 @@ import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { FormFeedback } from "@/components/ui/form-feedback";
 import { Icon } from "@/components/ui/icon";
+import { useT } from "@/i18n/use-translation";
 
+import { authMessages as m } from "./auth.messages";
 import { AuthShell } from "./auth-shell";
 import { safeAuthenticationReturnTo } from "./authentication-return-to";
 import {
@@ -37,13 +39,14 @@ export function TeamHubLoginPage({
     returnTo,
   });
   const localAccount = useDesktopLocalAccount();
+  const t = useT();
   const authenticationNotice =
     searchParams.get("reason") === "session-expired"
-      ? "Your session has expired. Sign in again to continue."
+      ? t(m.sessionExpired)
       : null;
 
   return (
-    <AuthShell subtitle="Welcome back to Linger." title="Log in">
+    <AuthShell subtitle={t(m.loginSubtitle)} title={t(m.loginTitle)}>
       {authenticationNotice ? (
         <div className="mb-4">
           <FormFeedback tone="danger">{authenticationNotice}</FormFeedback>
@@ -67,6 +70,7 @@ function LocalAccountSignIn({
   account: DesktopLocalAccount;
   authentication: AuthenticationController;
 }) {
+  const t = useT();
   return (
     <div className="auth-local-account">
       <Button
@@ -80,11 +84,11 @@ function LocalAccountSignIn({
         type="button"
       >
         <Icon icon={ComputerIcon} size={16} />
-        <span>Sign in with this computer's account</span>
+        <span>{t(m.localAccountSignIn)}</span>
       </Button>
       <div className="auth-divider">
         <span />
-        <span>or</span>
+        <span>{t(m.or)}</span>
         <span />
       </div>
     </div>
@@ -98,6 +102,7 @@ function AuthenticationForm({
 }) {
   const { email, error, isSubmitting, password } = authentication.state;
   const { changeField, handleSubmit } = authentication;
+  const t = useT();
 
   return (
     <form
@@ -109,7 +114,7 @@ function AuthenticationForm({
     >
       <Field
         autoComplete="email"
-        label="Email"
+        label={t(m.email)}
         onChange={(event) => changeField("email", event.target.value)}
         placeholder="you@company.com"
         type="email"
@@ -117,20 +122,20 @@ function AuthenticationForm({
       />
       <PasswordField
         autoComplete="current-password"
-        label="Password"
+        label={t(m.password)}
         onChange={(value) => changeField("password", value)}
         value={password}
       />
       {error ? <FormFeedback tone="danger">{error}</FormFeedback> : null}
       <Button
-        aria-label="Sign in"
+        aria-label={t(m.signIn)}
         className="auth-submit w-full"
         disabled={isSubmitting}
         size="large"
         type="submit"
         tone="primary"
       >
-        <span>{isSubmitting ? "Working..." : "Log in"}</span>
+        <span>{t(isSubmitting ? m.working : m.logIn)}</span>
         {!isSubmitting ? <Icon icon={ArrowRight02Icon} size={16} /> : null}
       </Button>
     </form>
@@ -149,6 +154,7 @@ function PasswordField({
   value: string;
 }) {
   const [visible, setVisible] = useState(false);
+  const t = useT();
 
   return (
     <Field
@@ -157,7 +163,7 @@ function PasswordField({
       onChange={(event) => onChange(event.target.value)}
       suffix={
         <button
-          aria-label={`${visible ? "Hide" : "Show"} ${label.toLowerCase()}`}
+          aria-label={t(visible ? m.hidePassword : m.showPassword)}
           className="grid size-7 place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => setVisible((current) => !current)}
           type="button"

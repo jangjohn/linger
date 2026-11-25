@@ -2,22 +2,32 @@
   "platform": "darwin",
   "arch": "arm64",
   "localmodelsTool": {
-    "url": "https://d2ikbbcl3j6jz9.cloudfront.net/cli/localmodels/0.1.0.dev44/darwin-arm64.tgz",
+    "url": "https://d2ikbbcl3j6jz9.cloudfront.net/cli/localmodels/0.1.0.dev57/darwin-arm64.tgz",
     "mirrors": [
-      "https://registry.npmjs.org/@simplexai/localmodels-darwin-arm64/-/localmodels-darwin-arm64-0.1.0-dev.44.tgz",
-      "https://cdn.npmmirror.com/packages/@simplexai/localmodels-darwin-arm64/0.1.0-dev.44/localmodels-darwin-arm64-0.1.0-dev.44.tgz"
+      "https://registry.npmjs.org/@simplexai/localmodels-darwin-arm64/-/localmodels-darwin-arm64-0.1.0-dev.57.tgz",
+      "https://cdn.npmmirror.com/packages/@simplexai/localmodels-darwin-arm64/0.1.0-dev.57/localmodels-darwin-arm64-0.1.0-dev.57.tgz"
     ],
-    "sha256": "9e12715913a23ad869caa03c47b4141cd74665ba149130c4e4e8e9d92f63ed25",
-    "bytes": 14967824,
-    "sourceCommit": "416f7b2938cf5f00333192a1015fb55c737c7a45",
-    "manifestSha256": "a1009ef2d09496feba2d91544ae2294053a4034322a6d940b1cdbd978ec61973"
+    "sha256": "ea12b65b4ec502e34f7928675c743e9fd8c2d5ae44810769a3716209e05c7265",
+    "bytes": 15060383,
+    "sourceCommit": "0aafada9017943d22a4b3cecb879ddc59f805a68",
+    "manifestSha256": "55846c3f51f0e970927d08f834a1926cba3f5285a1e70c0f16107dbc3c9b2a40",
+    "runtimeVersions": {
+      "claude": "2.1.325",
+      "codex": "0.171.0",
+      "pi": "1.5.2"
+    },
+    "runtimeBaselines": {
+      "claude": "2.1.282",
+      "codex": "0.166.0",
+      "pi": "1.2.0"
+    }
   },
   "nativeSources": [
     {
       "target": "darwin-arm64",
-      "file": "native/postgres-17.10-pgvector-0.8.6-darwin-arm64-b6f41d3d99572303e7c51f1c3de82f8a98a9f74d071362f1291625e3311b3b44.tar.gz",
-      "sha256": "b6f41d3d99572303e7c51f1c3de82f8a98a9f74d071362f1291625e3311b3b44",
-      "bytes": 9846138,
+      "file": "native/postgres-17.10-pgvector-0.8.6-darwin-arm64-8bbe3290a22cb3b068f48ad8cfe33b8d5accdfdc5d9a9f721445ef9cc7c40d1d.tar.gz",
+      "sha256": "8bbe3290a22cb3b068f48ad8cfe33b8d5accdfdc5d9a9f721445ef9cc7c40d1d",
+      "bytes": 10234037,
       "postgresVersion": "17.10",
       "pgvectorVersion": "0.8.6"
     }
@@ -25,9 +35,9 @@
   "voiceTools": [
     {
       "target": "darwin-arm64",
-      "file": "native/voice-tools-livekit-1.13.6-ffmpeg-8.1.2-darwin-arm64-2ac0a1e4dc9114d747988876c41ae0e2a2d5dbee4c0e4e9bd8308f7c2ec2c825.tar.gz",
-      "sha256": "2ac0a1e4dc9114d747988876c41ae0e2a2d5dbee4c0e4e9bd8308f7c2ec2c825",
-      "bytes": 42124532,
+      "file": "native/voice-tools-livekit-1.13.6-ffmpeg-8.1.2-darwin-arm64-fa96a6032240e105d37affb40e4e5d61b4297dbd354c5632a1807fc217b7dccf.tar.gz",
+      "sha256": "fa96a6032240e105d37affb40e4e5d61b4297dbd354c5632a1807fc217b7dccf",
+      "bytes": 42203484,
       "livekitVersion": "1.13.6",
       "ffmpegVersion": "8.1.2"
     }

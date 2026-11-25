@@ -13,6 +13,7 @@ import type { TeamHubClient } from "@/features/teamhub/teamhub-client";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type { TeamHubDocumentTreeSummary } from "@/features/teamhub/teamhub-types";
 import { MeetingsPanel } from "@/features/memory/meetings-panel";
+import { useT } from "@/i18n/use-translation";
 
 import {
   CopyToMyDocumentsDialog,
@@ -23,6 +24,7 @@ import { RecentDocumentCards } from "./library-document-results";
 import { LibraryDocumentsHeader } from "./library-documents-header";
 import { NewFolderDialog } from "./library-folder-browser";
 import { LibraryFolderListing } from "./library-folder-listing";
+import { libraryMessages as m } from "./library.messages";
 import { readDroppedUploadSources } from "./library-upload-queue";
 import {
   type WorkspaceTab,
@@ -56,6 +58,7 @@ const RECENT_CARD_LIMIT = 4;
 
 export function LibraryDocumentsPage() {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const params = useParams();
   const tenantId = requireRoomRouteParam(params.tenantId, "Tenant");
   const [searchParams, setSearchParams] = useSearchParams();
@@ -98,8 +101,12 @@ export function LibraryDocumentsPage() {
     0,
     RECENT_CARD_LIMIT,
   );
-  const activeView =
+  const view =
     workspaceTabs.find((candidate) => candidate.id === tab) ?? workspaceTabs[0];
+  const activeView = {
+    empty: view.empty ? t(view.empty) : "",
+    label: t(view.label),
+  };
   const documentActions = (
     document: TeamHubDocumentTreeSummary,
   ): RoomDocumentMenuActions => ({
@@ -141,7 +148,7 @@ export function LibraryDocumentsPage() {
       {rename.dialog}
       {creatingFolder ? (
         <NewFolderDialog
-          defaultName={nextFolderName(treeItems, ownedFolderId)}
+          defaultName={nextFolderName(treeItems, ownedFolderId, t)}
           onCancel={() => setCreatingFolder(false)}
           onCreate={async (name) => {
             await treeModel.onCreateNamedFolder(name, ownedFolderId);
@@ -178,7 +185,9 @@ export function LibraryDocumentsPage() {
         }
         outlined
         testId="workspace-file-drop-target"
-        title={`Release to upload to ${(ownedFolderId && trail.at(-1)?.name) || "My pages"}`}
+        title={t(m.releaseToUploadTo, {
+          folder: (ownedFolderId && trail.at(-1)?.name) || t(m.myPages),
+        })}
       >
         <main
           className="workspace-content-viewport workspace-scrollbar min-w-0 flex-1 overflow-y-auto bg-app-surface [scrollbar-gutter:stable]"
@@ -279,6 +288,7 @@ function DocumentHistoryDialog({
   onClose: () => void;
   tenantId: string;
 }) {
+  const t = useT();
   return (
     <Suspense
       fallback={
@@ -287,7 +297,7 @@ function DocumentHistoryDialog({
           role="status"
         >
           <Spinner size={16} />
-          Loading history…
+          {t(m.loadingHistory)}
         </div>
       }
     >

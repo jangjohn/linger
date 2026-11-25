@@ -1,4 +1,10 @@
-import { AiChipIcon } from "@hugeicons/core-free-icons";
+import {
+  AiChipIcon,
+  Alert02Icon,
+  ArrowDown01Icon,
+  InformationCircleIcon,
+  RefreshIcon,
+} from "@hugeicons/core-free-icons";
 import {
   useMutation,
   useMutationState,
@@ -6,13 +12,21 @@ import {
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 
+import { AutoHeight } from "@/components/ui/auto-height";
 import { Button } from "@/components/ui/button";
 import { FormFeedback } from "@/components/ui/form-feedback";
 import { Icon } from "@/components/ui/icon";
-import { Select, SelectItem } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { relativeTime } from "@/features/local-computer/computer-relative-time";
 import { useDesktopComputer } from "@/features/local-computer/desktop-computer";
 import { localComputersQueryOptions } from "@/features/local-computer/local-computer-queries";
@@ -32,7 +46,16 @@ import type {
   TeamHubLocalComputerPage,
   TeamHubTenantAgent,
 } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import { RichMessage, useT, useTranslation } from "@/i18n/use-translation";
+import { cn } from "@/lib/cn";
 
+import { ComputerPicker, type ComputerPickerOption } from "./computer-picker";
+import {
+  readLastModelsComputer,
+  writeLastModelsComputer,
+} from "./last-models-computer";
 import {
   type AssignableLocalModelAgent,
   assignableLocalModelAgents,
@@ -40,6 +63,7 @@ import {
   isAgentUsingModel,
   usedByAgentNames,
 } from "./local-model-agents";
+import { FeaturedModelSpotlight } from "./featured-model-spotlight";
 import { AdvancedDialog } from "./local-model-details";
 import { ModelRow } from "./local-model-row";
 import {
@@ -48,13 +72,22 @@ import {
   UnloadModelDialog,
 } from "./local-model-dialogs";
 import {
+  UpdateDriverDialog,
+  type DriverUpdateReason,
+} from "./local-model-driver-dialog";
+import { useDesktopDriverUpdate } from "./desktop-driver-update";
+import {
   actionErrorCopy,
+  debugBannerCopy,
+  hostBlockerCopy,
   libraryUnavailableCopy,
   memoryGuidanceCopy,
   modelSourceReadErrorCopy,
 } from "./local-models-copy";
+import { localModelsMessages as m } from "./local-models.messages";
 import {
   actOnLocalComputerModel,
+  invalidateOfflineComputer,
   localModelActionMutationKey,
   localModelsQueryKey,
   localModelsQueryOptions,
@@ -62,18 +95,25 @@ import {
   refreshLocalComputerModels,
   type LocalModelAction,
   type LocalModelActionInput,
+  type LocalModelsRefreshAccepted,
   type LocalModelsView,
 } from "./local-models-queries";
 import {
+  buildModelGroups,
   downloadStopped,
   formatGigabytes,
+  hasReadyLocalModels,
+  hostBlocker,
+  joinList,
   loadCheck,
   localSwitchTargets,
   memoryGuidance,
+  memorySegments,
   memorySummary,
   modelEntries,
   poolFreeBytes,
   poolOf,
+  type ModelCardGroup,
   type ModelEntry,
   type ModelStatus,
 } from "./local-models-rules";
@@ -89,13 +129,27 @@ import {
   modelSourceQueryKey,
   modelSourceQueryOptions,
   type ModelSourceStatus,
+  type ModelSourceView,
 } from "./model-source-queries";
+
+const offlinePollIntervalMs = 5_000;
+
+function isModelSourceOffline(
+  data: ModelSourceView | undefined,
+  error: Error | null,
+) {
+  return (
+    data?.online === false ||
+    (error instanceof TeamHubError && error.code === "LOCAL_COMPUTER_OFFLINE")
+  );
+}
 
 type Dialog =
   | { kind: "advanced" }
   | { kind: "makeRoom"; modelId: string }
   | { kind: "remove"; modelId: string }
-  | { kind: "unload"; modelId: string };
+  | { kind: "unload"; modelId: string }
+  | { kind: "updateDriver"; modelId?: string; reason: DriverUpdateReason };
 
 /**
  * The model states each confirmed action applies to, as the row offers it. A
@@ -119,6 +173,7 @@ type InventoryComputer = TeamHubLocalComputerPage["items"][number];
  * and a browser the first one.
  */
 export function ModelsPage() {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
   const { data: inventory } = useSuspenseQuery(
@@ -128,16 +183,35 @@ export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const computers = inventory.items;
   const linkedId = searchParams.get("computer");
-  const requestedId = linkedId ?? desktop?.status?.computerId;
-  const owned = computers.find((item) => item.computer_id === requestedId);
+  const linkedOwned = linkedId
+    ? computers.find((item) => item.computer_id === linkedId)
+    : undefined;
+  const savedId = readLastModelsComputer(tenantId);
+  const savedOwned = savedId
+    ? computers.find((item) => item.computer_id === savedId)
+    : undefined;
+  const desktopOwned = desktop?.status?.computerId
+    ? computers.find((item) => item.computer_id === desktop.status?.computerId)
+    : undefined;
   const defaultComputer =
     computers.find((item) => item.status === "online") ?? computers[0];
   // A linked Computer the viewer does not own may be another member's: the
   // library API, not the owned inventory, decides whether they may read it.
-  const sharedId = linkedId && !owned ? linkedId : undefined;
-  const computer = sharedId ? undefined : (owned ?? defaultComputer);
+  const sharedId = linkedId && !linkedOwned ? linkedId : undefined;
+  const computer = sharedId
+    ? undefined
+    : (linkedOwned ?? savedOwned ?? desktopOwned ?? defaultComputer);
+
+  useEffect(() => {
+    if (linkedOwned) {
+      writeLastModelsComputer(tenantId, linkedOwned.computer_id);
+    }
+  }, [linkedOwned, tenantId]);
 
   function select(computerId: string) {
+    if (computers.some((item) => item.computer_id === computerId)) {
+      writeLastModelsComputer(tenantId, computerId);
+    }
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current);
@@ -169,6 +243,10 @@ export function ModelsPage() {
           computer={computer}
           computerId={computer.computer_id}
           displayName={computer.display_name}
+          isLocalDesktop={Boolean(
+            desktop?.status?.computerId &&
+            desktop.status.computerId === computer.computer_id,
+          )}
           key={computer.computer_id}
           onSelectComputer={select}
           ownedComputers={computers}
@@ -176,16 +254,16 @@ export function ModelsPage() {
         />
       ) : (
         <>
-          <h1 className="text-2xl text-foreground">Models</h1>
-          <EmptyState title="No computers yet">
-            Connect a computer in{" "}
-            <Link
-              className="text-foreground underline underline-offset-2"
-              to={computersPath(tenantId)}
-            >
-              Computers
-            </Link>{" "}
-            to download and run models on it.
+          <h1 className="text-2xl text-foreground">{t(m.title)}</h1>
+          <EmptyState title={t(m.noComputersTitle)}>
+            <RichMessage
+              message={m.noComputersBody}
+              tags={{
+                link: (text) => (
+                  <ComputersLink tenantId={tenantId}>{text}</ComputersLink>
+                ),
+              }}
+            />
           </EmptyState>
         </>
       )}
@@ -205,12 +283,12 @@ function EmptyState({
   return (
     <section
       aria-label={title}
-      className="mt-6 flex flex-col items-center px-4 pt-12 text-center"
+      className="mt-6 flex flex-col items-center rounded-xl border border-border bg-card px-6 py-12 text-center"
     >
-      <span className="flex size-16 items-center justify-center rounded-[20%] bg-muted text-foreground">
-        <Icon icon={AiChipIcon} size={28} />
+      <span className="flex size-14 items-center justify-center rounded-2xl bg-muted text-foreground shadow-outline">
+        <Icon icon={AiChipIcon} size={24} />
       </span>
-      <h2 className="mt-6 text-xl">{title}</h2>
+      <h2 className="mt-5 text-lg text-foreground">{title}</h2>
       <p className="mt-1.5 max-w-md text-sm text-muted-foreground">
         {children}
       </p>
@@ -219,14 +297,178 @@ function EmptyState({
   );
 }
 
-function Notice({ children }: { children: ReactNode }) {
+/** The link to Settings › Computers inside a sentence. */
+function ComputersLink({
+  children,
+  tenantId,
+}: {
+  children: ReactNode;
+  tenantId: string;
+}) {
   return (
-    <p
-      className="mt-6 rounded-xl bg-muted px-3.5 py-3 text-sm text-muted-foreground"
-      role="status"
+    <Link
+      className="font-medium text-app-link underline-offset-2 hover:underline"
+      to={computersPath(tenantId)}
     >
       {children}
-    </p>
+    </Link>
+  );
+}
+
+function Notice({ children }: { children: ReactNode }) {
+  return (
+    <div
+      className="mt-5 flex items-start gap-2.5 rounded-xl border border-border bg-muted/60 px-4 py-3 text-sm text-muted-foreground"
+      role="status"
+    >
+      <Icon
+        className="mt-0.5 shrink-0 text-muted-foreground"
+        icon={InformationCircleIcon}
+        size={16}
+      />
+      <p className="min-w-0 flex-1">{children}</p>
+    </div>
+  );
+}
+
+const memorySegmentColors = [
+  "bg-rain-500",
+  "bg-lichen-500",
+  "bg-sun-500",
+] as const;
+
+function MemorySummaryCard({
+  canRecheck,
+  onDetails,
+  onRecheck,
+  rechecking,
+  summary,
+  view,
+}: {
+  canRecheck: boolean;
+  onDetails: () => void;
+  onRecheck: () => void;
+  rechecking: boolean;
+  summary: ReturnType<typeof memorySummary>;
+  view: LocalModelsView;
+}) {
+  const translation = useTranslation();
+  const { t } = translation;
+  const { componentBytes, models, otherBytes, unaccountedBytes } =
+    memorySegments(view);
+  const pct = (bytes: number) =>
+    `${summary.totalBytes ? Math.min(100, (bytes / summary.totalBytes) * 100) : 0}%`;
+
+  return (
+    <div className="mt-5 rounded-xl border border-border bg-card px-4 py-3.5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium tabular-nums text-foreground">
+            {t(summary.gpu ? m.gpuMemoryInUse : m.memoryInUse, {
+              total: formatGigabytes(summary.totalBytes, t),
+              used: formatGigabytes(summary.usedBytes, t),
+            })}
+          </p>
+          <p className="mt-0.5 text-xs tabular-nums text-muted-foreground">
+            {view.observed_at
+              ? t(m.memoryFreeChecked, {
+                  free: formatGigabytes(summary.freeBytes, t),
+                  time: relativeTime(view.observed_at, translation),
+                })
+              : t(m.memoryFree, {
+                  free: formatGigabytes(summary.freeBytes, t),
+                })}
+          </p>
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {canRecheck ? (
+            <Button loading={rechecking} onClick={onRecheck} size="compact">
+              {rechecking ? null : <Icon icon={RefreshIcon} size={14} />}
+              {t(m.recheckMemory)}
+            </Button>
+          ) : null}
+          <Button onClick={onDetails} size="compact">
+            {t(m.details)}
+          </Button>
+        </div>
+      </div>
+      <div
+        aria-hidden
+        className="mt-3 flex h-1.5 w-full overflow-hidden rounded-full bg-muted"
+      >
+        {models.map((item, index) => (
+          <span
+            className={cn(
+              "h-full border-r-2 border-card transition-[width] duration-200 last:border-r-0 motion-reduce:transition-none",
+              memorySegmentColors[index % memorySegmentColors.length],
+            )}
+            key={item.id}
+            style={{ width: pct(item.bytes) }}
+            title={`${item.name} · ${formatGigabytes(item.bytes, t)}`}
+          />
+        ))}
+        {componentBytes > 0 ? (
+          <span
+            className="h-full border-r-2 border-card bg-muted-foreground/45 transition-[width] duration-200 last:border-r-0 motion-reduce:transition-none"
+            style={{ width: pct(componentBytes) }}
+          />
+        ) : null}
+        {otherBytes > 0 ? (
+          <span
+            className="h-full bg-muted-foreground/25 transition-[width] duration-200 motion-reduce:transition-none"
+            style={{ width: pct(otherBytes) }}
+            title={t(m.otherAppsSize, {
+              size: formatGigabytes(otherBytes, t),
+            })}
+          />
+        ) : null}
+        {unaccountedBytes > 0 ? (
+          <span
+            className="h-full bg-muted-foreground/15 transition-[width] duration-200 motion-reduce:transition-none"
+            style={{ width: pct(unaccountedBytes) }}
+            title={t(m.systemAndEngineSize, {
+              size: formatGigabytes(unaccountedBytes, t),
+            })}
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ModelsLoadingSkeleton({ label }: { label: string }) {
+  return (
+    <div aria-busy="true" className="mt-5 space-y-3" role="status">
+      <span className="sr-only">{label}</span>
+      <div className="rounded-xl border border-border bg-card px-4 py-3.5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-56" />
+            <Skeleton className="h-3 w-36" />
+          </div>
+          <div className="flex gap-2">
+            <Skeleton className="h-7 w-28 rounded-full" />
+            <Skeleton className="h-7 w-16 rounded-full" />
+          </div>
+        </div>
+        <Skeleton className="mt-3 h-1.5 w-full rounded-full" />
+      </div>
+      <div className="space-y-2">
+        {[0, 1, 2].map((index) => (
+          <div
+            className="flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3"
+            key={index}
+          >
+            <Skeleton className="size-10 shrink-0 rounded-lg" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <Skeleton className="h-4 w-40" />
+              <Skeleton className="h-3 w-52" />
+            </div>
+            <Skeleton className="h-7 w-20 rounded-full" />
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -235,6 +477,7 @@ function ComputerModels({
   computerId,
   defaultComputerName,
   displayName,
+  isLocalDesktop = false,
   onOpenDefaultComputer,
   onSelectComputer,
   ownedComputers,
@@ -245,31 +488,74 @@ function ComputerModels({
   defaultComputerName?: string;
   /** Absent for a Computer outside the viewer's own inventory. */
   displayName?: string;
+  isLocalDesktop?: boolean;
   onOpenDefaultComputer?: () => void;
   onSelectComputer: (computerId: string) => void;
   ownedComputers: readonly InventoryComputer[];
   tenantId: string;
 }) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
-  const query = useQuery(localModelsQueryOptions(client, tenantId, computerId));
+  // Only the owner switches sources, and only their own Computers carry a
+  // display name here.
+  const hasOwnedSource = displayName !== undefined;
+  const source = useQuery({
+    ...modelSourceQueryOptions(client, tenantId, computerId),
+    enabled: hasOwnedSource,
+    refetchInterval: (state) =>
+      isModelSourceOffline(state.state.data, state.state.error)
+        ? offlinePollIntervalMs
+        : false,
+  });
+  const sourceOffline = isModelSourceOffline(source.data, source.error);
+  const query = useQuery({
+    ...localModelsQueryOptions(client, tenantId, computerId),
+    refetchInterval: (state) =>
+      state.state.data?.computer.status === "offline" || sourceOffline
+        ? offlinePollIntervalMs
+        : false,
+  });
   const view = query.data;
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const summary = view?.available ? memorySummary(view) : undefined;
-  // Only the owner switches sources, and only their own Computers carry a
-  // display name here.
-  const source = useQuery({
-    ...modelSourceQueryOptions(client, tenantId, computerId),
-    enabled: displayName !== undefined,
-  });
-  const offline = view?.computer.status === "offline";
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const reportedOffline = view
+    ? view.computer.status === "offline"
+    : computer?.status === "offline";
+  const offline = reportedOffline || sourceOffline;
+  const [wasOffline, setWasOffline] = useState(offline);
+  if (wasOffline !== offline) {
+    setWasOffline(offline);
+    if (!offline) {
+      setRefreshError(null);
+    }
+  }
+  const previousInventoryStatusRef = useRef(computer?.status);
+  useEffect(() => {
+    const nextStatus = computer?.status;
+    if (
+      previousInventoryStatusRef.current !== undefined &&
+      nextStatus !== undefined &&
+      previousInventoryStatusRef.current !== nextStatus
+    ) {
+      void queryClient.invalidateQueries({
+        queryKey: localModelsQueryKey(tenantId, computerId),
+      });
+      if (hasOwnedSource) {
+        void queryClient.invalidateQueries({
+          queryKey: modelSourceQueryKey(tenantId, computerId),
+        });
+      }
+    }
+    previousInventoryStatusRef.current = nextStatus;
+  }, [computer?.status, computerId, hasOwnedSource, queryClient, tenantId]);
   const onlineRefetchTriggeredRef = useRef(false);
   useEffect(() => {
     if (
-      displayName !== undefined &&
-      view?.computer.status === "online" &&
-      source.data !== undefined &&
-      !source.data.online &&
+      hasOwnedSource &&
+      !reportedOffline &&
+      sourceOffline &&
       !source.isFetching &&
       !onlineRefetchTriggeredRef.current
     ) {
@@ -279,17 +565,18 @@ function ComputerModels({
       });
       return;
     }
-    if (source.data?.online || view?.computer.status === "offline") {
+    if ((!sourceOffline && source.data?.online) || reportedOffline) {
       onlineRefetchTriggeredRef.current = false;
     }
   }, [
     computerId,
-    displayName,
+    hasOwnedSource,
     queryClient,
-    source.data,
+    reportedOffline,
+    source.data?.online,
     source.isFetching,
+    sourceOffline,
     tenantId,
-    view?.computer.status,
   ]);
   const status = source.data?.status;
   const [tab, setTab] = useState<ModelSourceMode | null>(null);
@@ -297,7 +584,7 @@ function ComputerModels({
   // off it; the Subscription tab is not offered.
   const shownTab = tab ?? (status?.mode === "byok" ? "byok" : "local");
   const computerName =
-    displayName ?? view?.computer.display_name ?? "this computer";
+    displayName ?? view?.computer.display_name ?? t(m.thisComputer);
   const { feedback, switcher } = useModelSourceSwitch({
     computerId,
     computerName,
@@ -305,54 +592,111 @@ function ComputerModels({
   });
   const switching = switcher.pending !== undefined;
   const switchTargets = view?.available ? localSwitchTargets(view) : [];
-  const [refreshError, setRefreshError] = useState<string | null>(null);
-  const refresh = useMutation({
+  const refresh = useMutation<
+    LocalModelsRefreshAccepted,
+    Error,
+    { automatic?: boolean; reconnected?: boolean } | undefined
+  >({
     mutationFn: () => refreshLocalComputerModels(client, tenantId, computerId),
     mutationKey: localModelsRefreshMutationKey(tenantId, computerId),
-    onError: (error) =>
-      setRefreshError(
-        error instanceof TeamHubError ? error.code : "REFRESH_FAILED",
-      ),
+    onError: (error, options) => {
+      const code =
+        error instanceof TeamHubError ? error.code : "REFRESH_FAILED";
+      if (!options?.automatic) {
+        setRefreshError(code);
+      }
+      if (code === "LOCAL_COMPUTER_OFFLINE") {
+        return invalidateOfflineComputer(queryClient, tenantId, computerId);
+      }
+      return undefined;
+    },
     onMutate: () => setRefreshError(null),
-    onSettled: () =>
-      queryClient.invalidateQueries({
+    onSettled: (_data, error) => {
+      if (
+        error instanceof TeamHubError &&
+        error.code === "LOCAL_COMPUTER_OFFLINE"
+      ) {
+        return undefined;
+      }
+      return queryClient.invalidateQueries({
         queryKey: localModelsQueryKey(tenantId, computerId),
-      }),
+      });
+    },
+    onSuccess: (_data, options) => {
+      if (options?.reconnected && hasOwnedSource) {
+        void queryClient.invalidateQueries({
+          queryKey: modelSourceQueryKey(tenantId, computerId),
+        });
+      }
+    },
   });
+  const { mutate: triggerRefresh } = refresh;
+  function recheckMemory() {
+    if (refresh.isPending) return;
+    triggerRefresh(undefined);
+  }
   const canRecheck = Boolean(
-    view?.available &&
-    view.viewer_is_owner &&
-    view.computer.status === "online",
+    view?.available && view.viewer_is_owner && !offline,
   );
-  const guidance = view?.available ? memoryGuidance(view) : null;
+  const autoRefreshRef = useRef({
+    computerId,
+    didMountRefresh: false,
+    wasOffline: false,
+  });
+  useEffect(() => {
+    if (autoRefreshRef.current.computerId !== computerId) {
+      autoRefreshRef.current = {
+        computerId,
+        didMountRefresh: false,
+        wasOffline: false,
+      };
+    }
+    if (offline) {
+      autoRefreshRef.current.wasOffline = true;
+      return;
+    }
+    if (!canRecheck) return;
+    if (
+      autoRefreshRef.current.didMountRefresh &&
+      !autoRefreshRef.current.wasOffline
+    ) {
+      return;
+    }
+    const reconnected = autoRefreshRef.current.wasOffline;
+    autoRefreshRef.current.didMountRefresh = true;
+    autoRefreshRef.current.wasOffline = false;
+    triggerRefresh({ automatic: true, reconnected });
+  }, [canRecheck, computerId, offline, triggerRefresh]);
+  const blocker = view?.available ? hostBlocker(view) : null;
+  const guidance = view?.available && !blocker ? memoryGuidance(view) : null;
   const queryErrorCode =
     query.error instanceof TeamHubError ? query.error.code : undefined;
   const showComputerPicker =
     displayName !== undefined
       ? ownedComputers.length > 1
       : Boolean(view && ownedComputers.length > 0);
+  const computerPickerOptions: ComputerPickerOption[] = [
+    ...(displayName === undefined && view
+      ? [
+          {
+            computerId,
+            displayName: view.computer.display_name,
+            online: view.computer.status === "online",
+          },
+        ]
+      : []),
+    ...ownedComputers.map((item) => ({
+      computerId: item.computer_id,
+      displayName: item.display_name,
+      online: item.status === "online",
+    })),
+  ];
   const computerPicker = showComputerPicker ? (
-    <Select
-      aria-label="Computer"
-      onValueChange={onSelectComputer}
+    <ComputerPicker
+      onSelect={onSelectComputer}
+      options={computerPickerOptions}
       value={computerId}
-      variant="pill"
-    >
-      {displayName === undefined && view ? (
-        <SelectItem value={computerId}>
-          {view.computer.status === "online"
-            ? view.computer.display_name
-            : `${view.computer.display_name} · Offline`}
-        </SelectItem>
-      ) : null}
-      {ownedComputers.map((item) => (
-        <SelectItem key={item.computer_id} value={item.computer_id}>
-          {item.status === "online"
-            ? item.display_name
-            : `${item.display_name} · Offline`}
-        </SelectItem>
-      ))}
-    </Select>
+    />
   ) : null;
 
   function changeTab(next: ModelSourceMode) {
@@ -361,52 +705,51 @@ function ComputerModels({
     switcher.clearFeedback();
   }
 
+  const hasMemorySummary = Boolean(view?.available && summary?.totalBytes);
+  const showHeaderUtilities =
+    Boolean(view?.available) &&
+    !(shownTab === "local" && hasMemorySummary) &&
+    shownTab !== "byok";
+
   return (
     <>
       <header className="flex flex-wrap items-start justify-between gap-3 sm:gap-4">
         <div className="min-w-48 flex-1">
-          <h1 className="text-2xl text-foreground">Models</h1>
+          <h1 className="text-2xl text-foreground">{t(m.title)}</h1>
           {status ? (
             <p className="mt-1.5 text-sm text-muted-foreground">
-              Agents on {computerName} use {activeSourceLabel(status)}
+              {t(m.agentsUse, {
+                computer: computerName,
+                source: activeSourceLabel(status, t),
+              })}
             </p>
           ) : null}
-          {summary?.totalBytes ? (
-            <>
-              <p className="mt-1.5 text-sm text-muted-foreground">
-                {formatGigabytes(summary.usedBytes)} of{" "}
-                {formatGigabytes(summary.totalBytes)}{" "}
-                {summary.gpu ? "GPU memory" : "memory"} in use
-              </p>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {formatGigabytes(summary.freeBytes)} free
-                {view?.observed_at
-                  ? ` · Checked ${relativeTime(view.observed_at)}`
-                  : ""}
-              </p>
-            </>
-          ) : null}
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {computerPicker}
-          {canRecheck ? (
-            <Button
-              loading={refresh.isPending}
-              onClick={() => refresh.mutate()}
-              size="compact"
-            >
-              Recheck memory
-            </Button>
-          ) : null}
-          {view?.available ? (
-            <Button
-              onClick={() => setDialog({ kind: "advanced" })}
-              size="compact"
-            >
-              Details
-            </Button>
-          ) : null}
-        </div>
+        {computerPicker || showHeaderUtilities ? (
+          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+            {computerPicker}
+            {showHeaderUtilities && canRecheck ? (
+              <Button
+                loading={refresh.isPending}
+                onClick={recheckMemory}
+                size="compact"
+              >
+                {refresh.isPending ? null : (
+                  <Icon icon={RefreshIcon} size={14} />
+                )}
+                {t(m.recheckMemory)}
+              </Button>
+            ) : null}
+            {showHeaderUtilities ? (
+              <Button
+                onClick={() => setDialog({ kind: "advanced" })}
+                size="compact"
+              >
+                {t(m.details)}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </header>
 
       {status ? (
@@ -425,6 +768,7 @@ function ComputerModels({
                   source.error instanceof TeamHubError
                     ? source.error.code
                     : undefined,
+                  t,
                 )}
               </span>
               <button
@@ -433,7 +777,7 @@ function ComputerModels({
                 onClick={() => void source.refetch()}
                 type="button"
               >
-                {source.isFetching ? "Retrying…" : "Retry"}
+                {t(source.isFetching ? m.retrying : commonMessages.retry)}
               </button>
             </span>
           </FormFeedback>
@@ -447,13 +791,13 @@ function ComputerModels({
       {refreshError ? (
         <div className="mt-4">
           <FormFeedback tone="danger">
-            {actionErrorCopy(refreshError)}
+            {actionErrorCopy(refreshError, t)}
           </FormFeedback>
         </div>
       ) : null}
       {switching ? (
         <p className="mt-4 text-sm text-muted-foreground" role="status">
-          Switching {computerName}. This can take a few minutes the first time.
+          {t(m.switchingComputer, { computer: computerName })}
         </p>
       ) : null}
       {feedback}
@@ -461,21 +805,12 @@ function ComputerModels({
         <>
           {offline && view ? (
             <Notice>
-              <span className="text-foreground">
-                {view.computer.display_name} is offline
-                {view.computer.last_seen_at
-                  ? ` (last seen ${relativeTime(view.computer.last_seen_at)})`
-                  : ""}
-                .
-              </span>{" "}
-              Reconnect it in{" "}
-              <Link
-                className="text-foreground underline underline-offset-2"
-                to={computersPath(tenantId)}
-              >
-                Computers
-              </Link>{" "}
-              to test or change its model source.
+              <OfflineMessage
+                lastSeenAt={view.computer.last_seen_at}
+                messages={[m.offlineByok, m.offlineByokLastSeen]}
+                name={view.computer.display_name}
+                tenantId={tenantId}
+              />
             </Notice>
           ) : null}
           <ByokPanel
@@ -489,6 +824,16 @@ function ComputerModels({
         </>
       ) : view ? (
         <>
+          {view.available && summary?.totalBytes ? (
+            <MemorySummaryCard
+              canRecheck={canRecheck}
+              onDetails={() => setDialog({ kind: "advanced" })}
+              onRecheck={recheckMemory}
+              rechecking={refresh.isPending}
+              summary={summary}
+              view={view}
+            />
+          ) : null}
           {status && status.mode !== "local" ? (
             <SwitchToLocalNotice
               disabled={switching || offline}
@@ -497,10 +842,14 @@ function ComputerModels({
             />
           ) : null}
           <Library
+            blocker={blocker}
             computer={computer}
             dialog={dialog}
             guidance={guidance}
-            onRefresh={() => refresh.mutate()}
+            isLocalDesktop={isLocalDesktop}
+            offline={offline}
+            onRefresh={recheckMemory}
+            onSwitchToByok={status ? () => changeTab("byok") : undefined}
             onUseForAgents={(modelId) =>
               switcher.request({ local_model_id: modelId, mode: "local" })
             }
@@ -527,32 +876,78 @@ function ComputerModels({
                   size="compact"
                   tone="primary"
                 >
-                  Open {defaultComputerName ?? "my computers"}
+                  {defaultComputerName
+                    ? t(m.openComputer, { name: defaultComputerName })
+                    : t(m.openMyComputers)}
                 </Button>
               ) : null}
               <Button onClick={() => void query.refetch()} size="compact">
-                Try again
+                {t(commonMessages.tryAgain)}
               </Button>
             </div>
           }
-          title={`Couldn't load the models of ${displayName ?? "this computer"}`}
+          title={
+            displayName === undefined
+              ? t(m.loadFailedTitleThisComputer)
+              : t(m.loadFailedTitle, { name: displayName })
+          }
         >
-          {actionErrorCopy(queryErrorCode)}
+          {actionErrorCopy(queryErrorCode, t)}
         </EmptyState>
       ) : (
-        <p className="mt-6 text-sm text-muted-foreground" role="status">
-          Loading models
-        </p>
+        <ModelsLoadingSkeleton label={t(m.loadingModels)} />
       )}
     </>
   );
 }
 
+/**
+ * A Computer is offline, with when it was last seen once known. `messages`
+ * holds the sentence without and with that time.
+ */
+function OfflineMessage({
+  lastSeenAt,
+  messages,
+  name,
+  tenantId,
+}: {
+  lastSeenAt: string | null | undefined;
+  messages:
+    | readonly [typeof m.offlineByok, typeof m.offlineByokLastSeen]
+    | readonly [typeof m.offlineLibrary, typeof m.offlineLibraryLastSeen]
+    | readonly [typeof m.offlineReadOnly, typeof m.offlineReadOnlyLastSeen];
+  name: string;
+  tenantId: string;
+}) {
+  const translation = useTranslation();
+  const tags = {
+    link: (text: ReactNode) => (
+      <ComputersLink tenantId={tenantId}>{text}</ComputersLink>
+    ),
+    strong: (text: ReactNode) => (
+      <span className="text-foreground">{text}</span>
+    ),
+  };
+  return lastSeenAt ? (
+    <RichMessage
+      message={messages[1]}
+      tags={tags}
+      values={{ name, time: relativeTime(lastSeenAt, translation) }}
+    />
+  ) : (
+    <RichMessage message={messages[0]} tags={tags} values={{ name }} />
+  );
+}
+
 function Library({
+  blocker,
   computer,
   dialog,
   guidance,
+  isLocalDesktop = false,
+  offline: computerOffline,
   onRefresh,
+  onSwitchToByok,
   onUseForAgents,
   rechecking,
   setDialog,
@@ -562,10 +957,14 @@ function Library({
   tenantId,
   view,
 }: {
+  blocker: ReturnType<typeof hostBlocker>;
   computer?: InventoryComputer;
   dialog: Dialog | null;
   guidance: ReturnType<typeof memoryGuidance>;
+  isLocalDesktop?: boolean;
+  offline: boolean;
   onRefresh: () => void;
+  onSwitchToByok?: () => void;
   onUseForAgents: (modelId: string) => void;
   rechecking: boolean;
   setDialog: (dialog: Dialog | null) => void;
@@ -575,11 +974,12 @@ function Library({
   tenantId: string;
   view: LocalModelsView;
 }) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
   const computerId = view.computer.computer_id;
   const name = view.computer.display_name;
-  const offline = view.computer.status === "offline";
+  const offline = computerOffline || view.computer.status === "offline";
   const readOnly = !view.viewer_is_owner;
   const canManageAgents = !readOnly;
   const piReady =
@@ -592,7 +992,12 @@ function Library({
     canManageAgents &&
     piReady &&
     (!status?.mode || status.mode === "local");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [selectedVariants, setSelectedVariants] = useState<
+    Record<string, string>
+  >({});
+  const [unavailableOpen, setUnavailableOpen] = useState(false);
+  const unavailablePanelId = useId();
   const [failure, setFailure] = useState<{
     code?: string;
     modelId: string;
@@ -664,6 +1069,15 @@ function Library({
     () => (view.available ? modelEntries(view) : []),
     [view],
   );
+  const sections = useMemo(() => buildModelGroups(entries), [entries]);
+  const hasUsableModels =
+    sections.onComputer.length > 0 ||
+    sections.available.length > 0 ||
+    Boolean(
+      sections.spotlight &&
+      sections.spotlight.defaultEntry.status !== "unavailable",
+    );
+  const showUnavailable = !hasUsableModels || unavailableOpen;
   const find = (modelId: string) =>
     entries.find((entry) => entry.model.id === modelId);
   const mutationKey = localModelActionMutationKey(tenantId, computerId);
@@ -732,9 +1146,7 @@ function Library({
     onError: (error, variables) => {
       if (!variables.preserveError) {
         setAssignError(
-          error instanceof Error
-            ? error.message
-            : "Couldn't switch the Agent to this model. Try again.",
+          error instanceof Error ? error.message : translate(m.assignFailed),
         );
       }
       void Promise.all([
@@ -880,7 +1292,13 @@ function Library({
     const targets = matching.filter((agent) => !agent.busy);
     setPendingSwitch(null);
     const busyMessage = busySkipped.length
-      ? `Couldn't switch ${busySkipped.map((agent) => agent.name).join(", ")} to ${target.model.name} while working. Switch once the current turn finishes.`
+      ? translate(m.assignBusy, {
+          agents: joinList(
+            busySkipped.map((agent) => agent.name),
+            translate,
+          ),
+          model: target.model.name,
+        })
       : null;
     if (busyMessage) {
       setAssignError(busyMessage);
@@ -895,9 +1313,18 @@ function Library({
         .filter((_, index) => results[index]?.status === "rejected")
         .map((agent) => agent.name);
       const failureMessage = failedNames.length
-        ? `Couldn't switch ${failedNames.join(", ")} to ${target.model.name}. Try again.`
+        ? translate(m.assignFailedNamed, {
+            agents: joinList(failedNames, translate),
+            model: target.model.name,
+          })
         : null;
-      const combined = [busyMessage, failureMessage].filter(Boolean).join(" ");
+      const combined =
+        busyMessage && failureMessage
+          ? translate(m.sentences, {
+              first: busyMessage,
+              second: failureMessage,
+            })
+          : (busyMessage ?? failureMessage);
       if (combined) setAssignError(combined);
     });
   }, [
@@ -921,7 +1348,9 @@ function Library({
     !downloadStopped(entry.model) &&
     actionStatuses[action].includes(entry.status);
   const dialogEntry =
-    dialog && dialog.kind !== "advanced" ? find(dialog.modelId) : undefined;
+    dialog && "modelId" in dialog && dialog.modelId
+      ? find(dialog.modelId)
+      : undefined;
   const dialogPool = dialogEntry
     ? poolOf(view, dialogEntry.model.pool)
     : undefined;
@@ -939,9 +1368,13 @@ function Library({
           : null))
       : null;
   const failedEntry = failure ? find(failure.modelId) : undefined;
+  const debugCopy =
+    view.available && view.debug ? debugBannerCopy(view.debug, t) : undefined;
+  const blockerCopy =
+    view.available && blocker ? hostBlockerCopy(blocker, t) : undefined;
   const guidanceCopy =
     !offline && view.available && guidance
-      ? memoryGuidanceCopy(guidance)
+      ? memoryGuidanceCopy(guidance, t)
       : undefined;
 
   function act(input: LocalModelActionInput) {
@@ -971,7 +1404,7 @@ function Library({
 
   const unavailable = view.available
     ? undefined
-    : libraryUnavailableCopy(view.reason?.code, name);
+    : libraryUnavailableCopy(view.reason?.code, name, t);
   const canRetryUnavailable =
     !offline && !readOnly && view.reason?.code === "TOOL_FAILED";
   const pendingSwitchTarget = pendingSwitch
@@ -985,39 +1418,166 @@ function Library({
     }
   }
 
+  const canUseModelForAgents = (entry: ModelEntry) =>
+    !offline &&
+    !readOnly &&
+    status?.mode === "local" &&
+    entry.status === "loaded" &&
+    entry.model.pi_model !== status.runtime_model &&
+    entry.model.id !== status.runtime_model;
+
+  const hasReadyModels = hasReadyLocalModels(entries);
+  const desktopDriver = useDesktopDriverUpdate(
+    isLocalDesktop && !offline && !readOnly,
+  );
+  const driverInstallState = desktopDriver?.installState;
+  const [driverBannerDismissed, setDriverBannerDismissed] = useState(false);
+  const resumedDriverVersionRef = useRef<string | null>(null);
+  const onRefreshRef = useRef(onRefresh);
+  useEffect(() => {
+    onRefreshRef.current = onRefresh;
+  }, [onRefresh]);
+
+  useEffect(() => {
+    if (
+      !isLocalDesktop ||
+      offline ||
+      readOnly ||
+      driverInstallState?.phase !== "completed"
+    ) {
+      return;
+    }
+    if (resumedDriverVersionRef.current === driverInstallState.version) return;
+    resumedDriverVersionRef.current = driverInstallState.version;
+    onRefreshRef.current();
+  }, [driverInstallState, isLocalDesktop, offline, readOnly]);
+
+  const resumeModelEntry =
+    driverInstallState?.phase === "completed" &&
+    driverInstallState.resumeModelId
+      ? find(driverInstallState.resumeModelId)
+      : undefined;
+  const resumeModelDownloadable = Boolean(
+    resumeModelEntry &&
+    resumeModelEntry.model.state === "absent" &&
+    resumeModelEntry.model.availability.downloadable,
+  );
+  const showDriverResumeBanner =
+    !driverBannerDismissed &&
+    (driverInstallState?.phase === "completed" ||
+      driverInstallState?.phase === "reboot_required");
+
+  function dismissDriverBanner() {
+    setDriverBannerDismissed(true);
+    void desktopDriver?.api.clearInstallState?.().catch(() => undefined);
+  }
+
+  const renderModelGroup = (group: ModelCardGroup, inSpotlight = false) => {
+    const selectedId = selectedVariants[group.key];
+    const entry =
+      (selectedId
+        ? group.variants.find((variant) => variant.model.id === selectedId)
+        : undefined) ?? group.defaultEntry;
+    const modelId = entry.model.id;
+    const canUseForAgents = canUseModelForAgents(entry);
+    const driverReason =
+      entry.status === "unavailable" &&
+      entry.model.availability.reason?.code === "DRIVER_UPDATE_REQUIRED"
+        ? entry.model.availability.reason
+        : undefined;
+    return (
+      <ModelRow
+        anotherMeChatHref={anotherMeChatHref}
+        assignableAgents={assignableAgents}
+        assigningAgentId={assigningAgentId}
+        computer={computer}
+        disabled={offline || readOnly || switching || busy(modelId)}
+        entry={entry}
+        expanded={expandedKey === group.key}
+        hasReadyAlternatives={hasReadyModels}
+        inSpotlight={inSpotlight}
+        key={group.key}
+        onAssignAgent={
+          entry.model.pi_model && canSwitchAgents
+            ? (agent) =>
+                assignMutation.mutate({
+                  agent,
+                  piModel: entry.model.pi_model!,
+                })
+            : undefined
+        }
+        onCancel={() => act({ action: "cancel", modelId })}
+        onDownload={() => act({ action: "download", modelId })}
+        onLoad={() => load(entry)}
+        onRecheck={!offline && !readOnly ? onRefresh : undefined}
+        onRemove={() => setDialog({ kind: "remove", modelId })}
+        onSelectVariant={
+          group.variants.length > 1
+            ? (nextModelId) =>
+                setSelectedVariants((current) => ({
+                  ...current,
+                  [group.key]: nextModelId,
+                }))
+            : undefined
+        }
+        onToggle={() =>
+          setExpandedKey((current) =>
+            current === group.key ? null : group.key,
+          )
+        }
+        onUnload={() => unload(entry)}
+        onUpdateDriver={
+          driverReason
+            ? () =>
+                setDialog({
+                  kind: "updateDriver",
+                  modelId,
+                  reason: driverReason,
+                })
+            : undefined
+        }
+        onUseForAgents={
+          canUseForAgents ? () => onUseForAgents(modelId) : undefined
+        }
+        rechecking={rechecking}
+        requested={requests.get(modelId)}
+        showEngineBadge={sections.showEngineBadge}
+        switchingForAgents={switchingModelId === modelId}
+        variants={group.variants}
+        view={view}
+      />
+    );
+  };
+
+  const spotlightNode = (
+    <FeaturedModelSpotlight>
+      {sections.spotlight ? renderModelGroup(sections.spotlight, true) : null}
+    </FeaturedModelSpotlight>
+  );
+  const unavailableLabel = t(
+    sections.unavailableAllMemory
+      ? m.sectionNeedsMoreMemory
+      : m.sectionUnavailable,
+    { count: sections.unavailable.length },
+  );
+
   return (
     <>
       {offline ? (
         <Notice>
-          <span className="text-foreground">
-            {name} is offline
-            {view.computer.last_seen_at
-              ? ` (last seen ${relativeTime(view.computer.last_seen_at)})`
-              : ""}
-            .
-          </span>{" "}
-          This is what it last reported.
-          {readOnly ? null : (
-            <>
-              {" "}
-              Reconnect it in{" "}
-              <Link
-                className="text-foreground underline underline-offset-2"
-                to={computersPath(tenantId)}
-              >
-                Computers
-              </Link>{" "}
-              to manage its models.
-            </>
-          )}
+          <OfflineMessage
+            lastSeenAt={view.computer.last_seen_at}
+            messages={
+              readOnly
+                ? [m.offlineReadOnly, m.offlineReadOnlyLastSeen]
+                : [m.offlineLibrary, m.offlineLibraryLastSeen]
+            }
+            name={name}
+            tenantId={tenantId}
+          />
         </Notice>
       ) : null}
-      {readOnly ? (
-        <Notice>
-          Only the person who connected {name} can download, load or remove its
-          models.
-        </Notice>
-      ) : null}
+      {readOnly ? <Notice>{t(m.readOnlyNotice, { name })}</Notice> : null}
 
       {unavailable ? (
         <EmptyState
@@ -1029,7 +1589,7 @@ function Library({
                 onClick={onRefresh}
                 size="compact"
               >
-                Try again
+                {t(commonMessages.tryAgain)}
               </Button>
             ) : undefined
           }
@@ -1042,8 +1602,12 @@ function Library({
           {failure ? (
             <div className="mt-6">
               <FormFeedback tone="danger">
-                {failedEntry ? `${failedEntry.model.name}: ` : null}
-                {actionErrorCopy(failure.code)}
+                {failedEntry
+                  ? t(m.modelFailure, {
+                      name: failedEntry.model.name,
+                      reason: actionErrorCopy(failure.code, t),
+                    })
+                  : actionErrorCopy(failure.code, t)}
               </FormFeedback>
             </div>
           ) : null}
@@ -1055,23 +1619,211 @@ function Library({
           {pendingSwitchTarget && pendingSwitchNames.length ? (
             <div className="mt-6">
               <FormFeedback tone="info">
-                Will switch {pendingSwitchNames.join(", ")} to{" "}
-                {pendingSwitchTarget.model.name} once it finishes loading.
+                {t(m.willSwitch, {
+                  agents: joinList(pendingSwitchNames, t),
+                  model: pendingSwitchTarget.model.name,
+                })}
               </FormFeedback>
             </div>
           ) : null}
-          {guidanceCopy ? (
+          {showDriverResumeBanner && driverInstallState ? (
             <aside
-              aria-label="Memory guidance"
-              className="mt-6 flex flex-col items-start justify-between gap-3 rounded-xl border border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)] px-4 py-3 sm:flex-row"
+              aria-label={t(m.driverResumeBannerRegion)}
+              className={cn(
+                "mt-5 flex flex-col items-start justify-between gap-3 rounded-xl border px-4 py-3.5 sm:flex-row sm:items-center",
+                driverInstallState.phase === "completed"
+                  ? "border-[var(--app-status-success-border)] bg-[var(--app-status-success-surface)]"
+                  : "border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)]",
+              )}
             >
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-app-warning">
-                  {guidanceCopy.title}
+                <p
+                  className={cn(
+                    "text-sm font-medium",
+                    driverInstallState.phase === "completed"
+                      ? "text-app-success"
+                      : "text-app-warning",
+                  )}
+                >
+                  {driverInstallState.phase === "completed"
+                    ? t(m.driverResumeReadyTitle, {
+                        version: driverInstallState.version,
+                      })
+                    : t(m.driverResumeRebootTitle)}
                 </p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {guidanceCopy.body}
+                <p className="mt-0.5 text-sm text-muted-foreground">
+                  {driverInstallState.phase === "completed"
+                    ? resumeModelEntry && resumeModelDownloadable
+                      ? t(m.driverResumeReadyModelBody, {
+                          model: resumeModelEntry.model.name,
+                        })
+                      : t(m.driverResumeReadyBody)
+                    : t(m.driverResumeRebootBody, {
+                        version: driverInstallState.version,
+                      })}
                 </p>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                {driverInstallState.phase === "completed" &&
+                resumeModelEntry &&
+                resumeModelDownloadable ? (
+                  <Button
+                    onClick={() => {
+                      dismissDriverBanner();
+                      act({
+                        action: "download",
+                        modelId: resumeModelEntry.model.id,
+                      });
+                    }}
+                    size="compact"
+                    tone="primary"
+                  >
+                    {t(m.driverResumeDownloadModel, {
+                      model: resumeModelEntry.model.name,
+                    })}
+                  </Button>
+                ) : null}
+                <Button
+                  data-voice-close
+                  onClick={dismissDriverBanner}
+                  size="compact"
+                  tone="secondary"
+                >
+                  {t(m.driverResumeDismiss)}
+                </Button>
+              </div>
+            </aside>
+          ) : null}
+          {debugCopy ? (
+            <aside
+              aria-label={t(m.debugBannerRegion)}
+              className="mt-5 flex flex-col items-start justify-between gap-3 rounded-xl border border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)] px-4 py-3.5 sm:flex-row sm:items-center"
+            >
+              <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                <Icon
+                  className="mt-0.5 shrink-0 text-app-warning"
+                  icon={Alert02Icon}
+                  size={16}
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-app-warning">
+                    {debugCopy.title}
+                  </p>
+                  <p className="mt-0.5 text-sm text-muted-foreground">
+                    {debugCopy.body}
+                  </p>
+                </div>
+              </div>
+            </aside>
+          ) : null}
+          {blocker && blockerCopy ? (
+            <aside
+              aria-label={t(m.hostBlockerRegion)}
+              className={cn(
+                "mt-5 flex flex-col items-start justify-between gap-3 rounded-xl border px-4 py-3.5 sm:flex-row sm:items-center",
+                blocker.code === "GPU_UNSUPPORTED"
+                  ? "border-border bg-muted/60"
+                  : "border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)]",
+              )}
+            >
+              <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                <Icon
+                  className={cn(
+                    "mt-0.5 shrink-0",
+                    blocker.code === "GPU_UNSUPPORTED"
+                      ? "text-muted-foreground"
+                      : "text-app-warning",
+                  )}
+                  icon={
+                    blocker.code === "GPU_UNSUPPORTED"
+                      ? InformationCircleIcon
+                      : Alert02Icon
+                  }
+                  size={16}
+                />
+                <div className="min-w-0 flex-1">
+                  <p
+                    className={cn(
+                      "text-sm font-medium",
+                      blocker.code === "GPU_UNSUPPORTED"
+                        ? "text-foreground"
+                        : "text-app-warning",
+                    )}
+                  >
+                    {blockerCopy.title}
+                  </p>
+                  <p className="mt-0.5 text-sm text-muted-foreground">
+                    {blockerCopy.body}
+                  </p>
+                </div>
+              </div>
+              {blocker.code === "GPU_UNSUPPORTED" ? (
+                onSwitchToByok && !readOnly ? (
+                  <Button
+                    className="shrink-0"
+                    onClick={onSwitchToByok}
+                    size="compact"
+                    tone="primary"
+                  >
+                    {t(m.switchToByok)}
+                  </Button>
+                ) : null
+              ) : blocker.code === "DRIVER_UPDATE_REQUIRED" ? (
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <Button
+                    onClick={() =>
+                      setDialog({
+                        kind: "updateDriver",
+                        reason: blocker,
+                      })
+                    }
+                    size="compact"
+                    tone="primary"
+                  >
+                    {t(m.updateDriverAction)}
+                  </Button>
+                  {!offline && !readOnly ? (
+                    <Button
+                      loading={rechecking}
+                      onClick={onRefresh}
+                      size="compact"
+                      tone="secondary"
+                    >
+                      {t(m.recheckMemory)}
+                    </Button>
+                  ) : null}
+                </div>
+              ) : !offline && !readOnly ? (
+                <Button
+                  className="shrink-0"
+                  loading={rechecking}
+                  onClick={onRefresh}
+                  size="compact"
+                >
+                  {t(m.recheckMemory)}
+                </Button>
+              ) : null}
+            </aside>
+          ) : null}
+          {guidanceCopy ? (
+            <aside
+              aria-label={t(m.memoryGuidance)}
+              className="mt-5 flex flex-col items-start justify-between gap-3 rounded-xl border border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)] px-4 py-3.5 sm:flex-row sm:items-center"
+            >
+              <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                <Icon
+                  className="mt-0.5 shrink-0 text-app-warning"
+                  icon={Alert02Icon}
+                  size={16}
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-app-warning">
+                    {guidanceCopy.title}
+                  </p>
+                  <p className="mt-0.5 text-sm text-muted-foreground">
+                    {guidanceCopy.body}
+                  </p>
+                </div>
               </div>
               {readOnly ? null : (
                 <Button
@@ -1080,66 +1832,78 @@ function Library({
                   onClick={onRefresh}
                   size="compact"
                 >
-                  Recheck memory
+                  {t(m.recheckMemory)}
                 </Button>
               )}
             </aside>
           ) : null}
           {entries.length === 0 ? (
-            <EmptyState title="No local models available">
-              {name} didn&apos;t list any models for this hardware yet.
-            </EmptyState>
+            <>
+              <div className="mt-5">
+                <FeaturedModelSpotlight />
+              </div>
+              <EmptyState title={t(m.noModelsTitle)}>
+                {t(m.noModelsBody, { name })}
+              </EmptyState>
+            </>
           ) : (
-            <section aria-label="Models" className="mt-6 grid gap-2">
-              {entries.map((entry) => {
-                const modelId = entry.model.id;
-                const canUseForAgents =
-                  !offline &&
-                  !readOnly &&
-                  status?.mode === "local" &&
-                  entry.status === "loaded" &&
-                  entry.model.pi_model !== status.runtime_model &&
-                  entry.model.id !== status.runtime_model;
-                return (
-                  <ModelRow
-                    anotherMeChatHref={anotherMeChatHref}
-                    assignableAgents={assignableAgents}
-                    assigningAgentId={assigningAgentId}
-                    computer={computer}
-                    disabled={offline || readOnly || switching || busy(modelId)}
-                    entry={entry}
-                    expanded={expandedId === modelId}
-                    key={modelId}
-                    onAssignAgent={
-                      entry.model.pi_model && canSwitchAgents
-                        ? (agent) =>
-                            assignMutation.mutate({
-                              agent,
-                              piModel: entry.model.pi_model!,
-                            })
-                        : undefined
-                    }
-                    onCancel={() => act({ action: "cancel", modelId })}
-                    onDownload={() => act({ action: "download", modelId })}
-                    onLoad={() => load(entry)}
-                    onRemove={() => setDialog({ kind: "remove", modelId })}
-                    onToggle={() =>
-                      setExpandedId((current) =>
-                        current === modelId ? null : modelId,
-                      )
-                    }
-                    onUnload={() => unload(entry)}
-                    onUseForAgents={
-                      canUseForAgents
-                        ? () => onUseForAgents(modelId)
-                        : undefined
-                    }
-                    requested={requests.get(modelId)}
-                    switchingForAgents={switchingModelId === modelId}
-                    view={view}
-                  />
-                );
-              })}
+            <section aria-label={t(m.title)} className="mt-5 grid gap-4">
+              {sections.spotlightPosition === "top" ? spotlightNode : null}
+              {sections.onComputer.length > 0 ? (
+                <div className="grid gap-2.5">
+                  <h2 className="text-xs font-medium text-muted-foreground">
+                    {t(m.sectionOnComputer)}
+                  </h2>
+                  {sections.onComputer.map((group) => renderModelGroup(group))}
+                </div>
+              ) : null}
+              {sections.available.length > 0 ? (
+                <div className="grid gap-2.5">
+                  <h2 className="text-xs font-medium text-muted-foreground">
+                    {t(m.sectionAvailable)}
+                  </h2>
+                  {sections.available.map((group) => renderModelGroup(group))}
+                </div>
+              ) : null}
+              {sections.spotlightPosition === "afterAvailable"
+                ? spotlightNode
+                : null}
+              {sections.unavailable.length > 0 ? (
+                <div className="grid gap-2.5">
+                  {hasUsableModels ? (
+                    <button
+                      aria-controls={unavailablePanelId}
+                      aria-expanded={showUnavailable}
+                      className="flex items-center gap-1.5 self-start rounded-md py-1 text-xs font-medium text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+                      onClick={() => setUnavailableOpen((current) => !current)}
+                      type="button"
+                    >
+                      <Icon
+                        className={cn(
+                          "shrink-0 transition-transform duration-200 motion-reduce:transition-none",
+                          !showUnavailable && "-rotate-90",
+                        )}
+                        icon={ArrowDown01Icon}
+                        size={14}
+                      />
+                      <span>{unavailableLabel}</span>
+                    </button>
+                  ) : (
+                    <h2 className="text-xs font-medium text-muted-foreground">
+                      {unavailableLabel}
+                    </h2>
+                  )}
+                  {showUnavailable ? (
+                    <AutoHeight appear={hasUsableModels}>
+                      <div className="grid gap-2.5" id={unavailablePanelId}>
+                        {sections.unavailable.map((group) =>
+                          renderModelGroup(group),
+                        )}
+                      </div>
+                    </AutoHeight>
+                  ) : null}
+                </div>
+              ) : null}
             </section>
           )}
         </>
@@ -1147,6 +1911,18 @@ function Library({
 
       {dialog?.kind === "advanced" ? (
         <AdvancedDialog onClose={() => setDialog(null)} view={view} />
+      ) : null}
+      {dialog?.kind === "updateDriver" ? (
+        <UpdateDriverDialog
+          isLocalDesktop={isLocalDesktop}
+          model={dialogEntry?.model}
+          offline={offline}
+          onClose={() => setDialog(null)}
+          onRecheck={!offline && !readOnly ? onRefresh : undefined}
+          reason={dialog.reason}
+          rechecking={rechecking}
+          view={view}
+        />
       ) : null}
       {dialogEntry && makeRoom ? (
         <MakeRoomDialog

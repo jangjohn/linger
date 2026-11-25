@@ -3,59 +3,59 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # >>> release pin
-$StackVersion = '0.1.0.dev44'
-$StackSourceCommit = '416f7b2938cf5f00333192a1015fb55c737c7a45'
-$StackNpmVersion = '0.1.0-dev.44'
+$StackVersion = '0.1.0.dev57'
+$StackSourceCommit = '0aafada9017943d22a4b3cecb879ddc59f805a68'
+$StackNpmVersion = '0.1.0-dev.57'
 $StackKits = @{
-    'darwin-arm64' = '9e12715913a23ad869caa03c47b4141cd74665ba149130c4e4e8e9d92f63ed25'
-    'darwin-x64' = '7b6cac9647e23306d88c7169dd145c0db2fab5b89b378cecff77ee76cd128ecc'
-    'linux-arm64' = 'a944b05fc5bb823a6a9d048404750a2039af2d6f28ff75d593efd7e0ae8fa25e'
-    'linux-x64' = '32d39989c7631a10d3cd912993b75c4c4e609cf0285398d3efe6f905e87af20f'
-    'win32-x64' = 'f99f6cc30a8a3d0a486ef13070b81e49eadc97de25402897134aea0f25e26e58'
+    'darwin-arm64' = 'ea12b65b4ec502e34f7928675c743e9fd8c2d5ae44810769a3716209e05c7265'
+    'darwin-x64' = 'ab6a06ae0ef80ee12d6d08c7a9ae89e3e5b403b22bc414c008512c3157b052fe'
+    'linux-arm64' = '0989134b4a14cb51874cd1d25e631ebad040474532e4157573bd057d1ff1feb7'
+    'linux-x64' = '5fc58ea8f2f025d691df3f458abc5df06b2c5298b6aaed0838a1d9383ce10122'
+    'win32-x64' = '25287ac23fa0ac6224f6fab44bdca4b54313220c51269867996cf7d86ad419a0'
 }
 $StackBootstrap = @{
     'darwin-arm64' = @{
-        manifest = 'a1009ef2d09496feba2d91544ae2294053a4034322a6d940b1cdbd978ec61973'
-        inventory = '07c6175dbcec4df0f9f8e31e688fd0e76e525816166e0dbb3c1997f313580b72'
-        bytes = '14967824'
-        files = '1370'
-        entries = '1510'
+        manifest = '55846c3f51f0e970927d08f834a1926cba3f5285a1e70c0f16107dbc3c9b2a40'
+        inventory = 'ad0e9fb4070719a2428c3652fd5d534e1115c500a84cebebf54cbfdcfaaef1a2'
+        bytes = '15060383'
+        files = '1384'
+        entries = '1524'
         python = 'python/bin/python3.12'
         modules = 'modules'
     }
     'darwin-x64' = @{
-        manifest = '39050dca49428b1bbb453e77d57ebbb0143df36ae35d6f0caf63d97f09a39dd5'
-        inventory = '8a2198f2f5dfd4227519dc5bdbc05d868b5fd04636dddbc200f9198bb58d5ae1'
-        bytes = '14800680'
-        files = '1367'
-        entries = '1506'
+        manifest = '990ffc25d00cfc9669dd39d95963394e67cf4a8ee362cb821382a9fc7cb65481'
+        inventory = '5ac3ad9e53652f1139393d8b6d8807bc3ab816c5802b9a60733f84b5d5d52d53'
+        bytes = '14892171'
+        files = '1381'
+        entries = '1520'
         python = 'python/bin/python3.12'
         modules = 'modules'
     }
     'linux-arm64' = @{
-        manifest = '03f81b817b735416dfeeec2c09f0a51d980527667219b1a109f85317c034bc08'
-        inventory = 'e31f90359dc976b1d62c8f199f914b120ab4d1c90493708b5f0ef5264e927f9a'
-        bytes = '17478315'
-        files = '4241'
-        entries = '4425'
+        manifest = '2941655ec75139be9d521698cc54782bd13d14072ff47324d0de18344fb4be4f'
+        inventory = 'a3ea4f35ecd6f4cae7a3c8f9e01d70e91c202bee541d21bc266c5ee968d6189a'
+        bytes = '17570845'
+        files = '4255'
+        entries = '4439'
         python = 'python/bin/python3.12'
         modules = 'modules'
     }
     'linux-x64' = @{
-        manifest = 'c19ae354443ea4f1201d0d747889e4c47da009809deee9859acd33b95d8d127c'
-        inventory = '75c34503a4a9280af4f0926f1f3522840da28865bea5af416fa98d696b384811'
-        bytes = '20806807'
-        files = '4241'
-        entries = '4425'
+        manifest = '27cb1838d811356b1e568725cb49f4a4073759d5dcdddee4de850258504161bc'
+        inventory = 'b25313f91b92bb00b6979aac65e9b78f1d9936ad1549e3979e4d62eb2614b003'
+        bytes = '20898741'
+        files = '4255'
+        entries = '4439'
         python = 'python/bin/python3.12'
         modules = 'modules'
     }
     'win32-x64' = @{
-        manifest = '4beb7edf264095c74f3d6379a0343bf22b3fe4aad6e59491a4739de3b09640fd'
-        inventory = '2a457645d1f96fc2ef46e7daa18ffa667aa3ac991008e0ebc65e53d9c5f2c386'
-        bytes = '23204073'
-        files = '3411'
-        entries = '3678'
+        manifest = '79e52cb5d036e3913ad3c54ea381fd734ec5132cc1c273ea49534bd18fdb58aa'
+        inventory = '741804e86ef7b0095145f3ca42ec3ef8d6d75ba6c501df3206bfe9e37f6916dc'
+        bytes = '23298638'
+        files = '3425'
+        entries = '3692'
         python = 'python/python.exe'
         modules = 'modules'
     }
@@ -240,11 +240,11 @@ function Assert-Kit([string]$Directory) {
             # The tree walk checks every private ancestor once, before its descendants.
             Assert-WindowsPrivate $item.FullName $false $false $true
         } else {
-            $modes = if (($item -is [IO.DirectoryInfo])) { @('500') } else { @('400', '500') }
+            $modes = if (($item -is [IO.DirectoryInfo])) { @('700') } else { @('600', '700') }
             Assert-PosixMode $item.FullName $modes
         }
     }
-    if (-not $onWindows) { Assert-PosixMode (Join-Path $Directory $pin.python) @('500') }
+    if (-not $onWindows) { Assert-PosixMode (Join-Path $Directory $pin.python) @('700') }
     $inventory = Join-Path $Directory 'bootstrap.sha256'
     $manifest = Join-Path $Directory 'tool.json'
     if ((Get-Digest $inventory) -ne $pin.inventory -or (Get-Digest $manifest) -ne $pin.manifest) { Stop-Stack 'kit metadata checksum mismatch' }
@@ -292,11 +292,11 @@ function Set-KitMode([string]$Directory) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Stack 'linked kit path' }
         if ($onWindows) {
             Assert-WindowsPrivate $item.FullName $true $false $true
-            if (-not ($item -is [IO.DirectoryInfo])) { $item.IsReadOnly = $true }
+            if (-not ($item -is [IO.DirectoryInfo])) { $item.IsReadOnly = $false }
         } else {
-            $mode = if (($item -is [IO.DirectoryInfo])) { '500' } else { 'a-w,go-rwx' }
+            $mode = if (($item -is [IO.DirectoryInfo])) { '700' } else { 'u+rw,go-rwx' }
             & chmod $mode -- $item.FullName
-            if ($LASTEXITCODE -ne 0) { Stop-Stack 'could not seal kit' }
+            if ($LASTEXITCODE -ne 0) { Stop-Stack 'could not protect kit' }
         }
     }
 }
@@ -541,7 +541,7 @@ function Install-Kit {
         $null = [IO.Directory]::CreateDirectory($unpacked)
         if ((Invoke-Native 'tar' @('-xzf', $archive, '--strip-components=1', '-C', $unpacked)) -ne 0) { Stop-Stack 'could not unpack kit' }
         if (-not $onWindows) {
-            & chmod 755 -- (Join-Path $unpacked $pin.python) (Join-Path $unpacked 'kit.py')
+            & chmod 700 -- (Join-Path $unpacked $pin.python) (Join-Path $unpacked 'kit.py')
             if ($LASTEXITCODE -ne 0) { Stop-Stack 'could not restore executables' }
         }
         Set-KitMode $unpacked
@@ -550,9 +550,7 @@ function Install-Kit {
             if (-not $onWindows) { & chmod 700 -- $final }
             [IO.Directory]::Move($final, (Join-Path $stage 'invalid'))
         }
-        if (-not $onWindows) { & chmod 700 -- $unpacked }
         [IO.Directory]::Move($unpacked, $final)
-        if (-not $onWindows) { & chmod 500 -- $final }
     } finally {
         if ($stage -and (Test-Path -LiteralPath $stage)) {
             try { Remove-KitStage $stage $true } catch { }

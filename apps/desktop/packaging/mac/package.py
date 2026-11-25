@@ -15,9 +15,14 @@ Without --developer-id the app gets an ad-hoc signature and macOS asks the
 user to confirm the first launch. --developer-id signs the app, its helpers
 and the DMG with that Developer ID Application certificate, with the hardened
 runtime and entitlements.plist. --notary-key, the App Store Connect
-API key from `rcodesign encode-app-store-connect-api-key`, then notarizes the
-app and the DMG and staples both tickets, so Gatekeeper opens the DMG
-directly. Key and password files are only passed to rcodesign.
+API key from `rcodesign encode-app-store-connect-api-key`, then notarizes and
+staples the DMG in one Apple submission (which also notarizes the nested
+Linger.app). When --update-archive is set, the already-issued ticket is stapled
+onto Linger.app before packing the update archive. Linger.app inside the DMG is
+notarized by Apple but not separately stapled, so dragging it out of the DMG
+and launching it for the first time completely offline relies on online ticket
+lookup (or macOS's DMG ticket). Key and password files are only passed to
+rcodesign.
 
 The Go daemon goes to Contents/Resources/computer/ and is signed with the
 app like every other Mach-O file. The browser and computer-control tools it
@@ -39,7 +44,6 @@ signed app the installed app replaces itself with. The release's signed
 manifest lists it (scripts/ci/desktop-release.sh manifest).
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import plistlib
@@ -48,7 +52,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -59,9 +65,12 @@ from archive import sha256, tar_gz  # noqa: E402
 import computer_tools  # noqa: E402
 from native_bundle import check_runtime, check_teamhub, refresh  # noqa: E402
 BUNDLE_ID = "com.simplexai.linger.desktop.preview"
-# Prompt text for the privacy permissions tasks need. Without
+# Prompt text for the privacy permissions tasks and voice need. Without
 # NSAppleEventsUsageDescription macOS refuses Apple Events without asking.
+# The microphone text replaces Electron's generic one; the prompt itself also
+# needs the audio-input entitlement in entitlements.plist.
 PRIVACY_USAGE = {
+    "NSMicrophoneUsageDescription": "Linger uses the microphone for voice conversations and meeting recordings you start.",
     "NSAppleEventsUsageDescription": "Tasks you send to Linger can control apps on this Mac for you.",
     "NSDownloadsFolderUsageDescription": "Tasks you send to Linger can read and organize your downloads.",
     "NSDocumentsFolderUsageDescription": "Tasks you send to Linger can read and edit your documents.",
@@ -224,7 +233,8 @@ def bundled_node(path):
             and parts[6].startswith("runtime-") and parts[7:] == ["node", "bin", "node"])
 
 
-MACHO_MAGIC = {b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"}
+FAT_MAGIC = b"\xca\xfe\xba\xbe"
+MACHO_MAGIC = {b"\xcf\xfa\xed\xfe", FAT_MAGIC}
 
 
 def macho_files(app):
@@ -239,6 +249,83 @@ def macho_files(app):
                 if source.read(4) in MACHO_MAGIC:
                     found.append(os.path.relpath(path, app))
     return sorted(found)
+
+
+def _be32(data, at):
+    return int.from_bytes(data[at:at + 4], "big")
+
+
+def _le32(data, at):
+    return int.from_bytes(data[at:at + 4], "little")
+
+
+def developer_id_signed(data):
+    """Whether every slice of the Mach-O in data has a certificate signature
+    with the hardened runtime, which notarization requires. A linker's ad-hoc
+    signature has neither."""
+    if data[:4] == FAT_MAGIC:
+        entries = [8 + 20 * index for index in range(_be32(data, 4))]
+        images = [data[_be32(data, at + 8):_be32(data, at + 8) + _be32(data, at + 12)] for at in entries]
+    else:
+        images = [data]
+    for image in images:
+        if image[:4] != b"\xcf\xfa\xed\xfe":
+            return False
+        signature, cursor = b"", 32
+        for _ in range(_le32(image, 16)):
+            if _le32(image, cursor) == 0x1D:  # LC_CODE_SIGNATURE
+                start = _le32(image, cursor + 8)
+                signature = image[start:start + _le32(image, cursor + 12)]
+            cursor += _le32(image, cursor + 4)
+        if _be32(signature, 0) != 0xFADE0CC0:  # embedded signature superblob
+            return False
+        blobs = {_be32(signature, 12 + 8 * index): signature[_be32(signature, 16 + 8 * index):]
+                 for index in range(_be32(signature, 8))}
+        flags = _be32(blobs.get(0, b""), 12)  # the CodeDirectory's flags
+        cms = blobs.get(0x10000, b"")  # the CMS signature blob, empty when ad-hoc
+        if flags & 0x2 or not flags & 0x10000 or _be32(cms, 4) <= 8:
+            return False
+    return True
+
+
+def unsigned_archive_files(archive):
+    """Mach-O files in the tar.gz archive that lack a Developer ID signature."""
+    unsigned = []
+    with tarfile.open(archive) as tar:
+        for member in tar:
+            if member.isfile():
+                data = tar.extractfile(member).read()
+                if data[:4] in MACHO_MAGIC and not developer_id_signed(data):
+                    unsigned.append(member.name)
+    return unsigned
+
+
+def check_bundled_archives(app):
+    """Apple inspects the archives inside the app and refuses to notarize it
+    while one holds a Mach-O file without a Developer ID signature."""
+    native = os.path.join(app, NATIVE)
+    for name in sorted(os.listdir(native)) if os.path.isdir(native) else []:
+        if name.endswith(".tar.gz"):
+            unsigned = unsigned_archive_files(os.path.join(native, name))
+            if unsigned:
+                sys.exit(f"{name} holds {len(unsigned)} Mach-O files without a Developer ID signature "
+                         f"(first: {unsigned[0]}); run the Sign macOS native archives workflow on this "
+                         "branch and commit the pins it produces (docs/desktop-release.md#bundled-archives)")
+
+
+def signing_scopes(app, path):
+    """rcodesign scopes that select every architecture of the Mach-O at path.
+
+    rcodesign reads the text after the last "@" of a scope as an architecture
+    selector, so a path under an npm scope (node_modules/@img/...) names each
+    slice explicitly instead; rcodesign numbers a thin file's only slice 0.
+    """
+    if "@" not in path:
+        return [path]
+    with open(os.path.join(app, path), "rb") as source:
+        header = source.read(8)
+    slices = _be32(header, 4) if header[:4] == FAT_MAGIC else 1
+    return [f"{path}@{index}" for index in range(slices)]
 
 
 class Signing:
@@ -273,12 +360,13 @@ class Signing:
         scoped = []
         for path in macho_files(app):
             javascript = path.startswith("Contents/MacOS/") or ".app/Contents/MacOS/" in path
-            if self.developer_id:
-                scoped += ["--code-signature-flags", f"{path}:runtime"]
-            if bundled_node(path):
-                scoped += ["--entitlements-xml-file", f"{path}:{node_entitlements}"]
-            elif self.developer_id and javascript:
-                scoped += ["--entitlements-xml-file", f"{path}:{entitlements}"]
+            for scope in signing_scopes(app, path):
+                if self.developer_id:
+                    scoped += ["--code-signature-flags", f"{scope}:runtime"]
+                if bundled_node(path):
+                    scoped += ["--entitlements-xml-file", f"{scope}:{node_entitlements}"]
+                elif self.developer_id and javascript:
+                    scoped += ["--entitlements-xml-file", f"{scope}:{entitlements}"]
         check = ["--for-notarization"] if self.notary_key else []
         depth = ["--shallow"] if shallow else []
         return [self.rcodesign, "sign", *self._identity(), *check, *depth, *scoped,
@@ -315,6 +403,19 @@ class Signing:
             run(self.rcodesign, "notary-submit", "--api-key-file", self.notary_key,
                 "--wait", "--max-wait-seconds", "3600", "--staple", path)
 
+    def staple(self, path, attempts=5, delay_seconds=5):
+        """Attaches Apple's already-issued notarization ticket to path."""
+        if not self.notary_key:
+            return
+        for attempt in range(1, attempts + 1):
+            try:
+                run(self.rcodesign, "staple", path)
+                return
+            except subprocess.CalledProcessError:
+                if attempt == attempts:
+                    raise
+                time.sleep(delay_seconds)
+
 
 def build_dmg(stage, workdir, output, volume_name):
     size = sum(os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(stage)
@@ -339,13 +440,36 @@ def build_dmg(stage, workdir, output, volume_name):
         'dmg dmg vol.hfs out.dmg'
     )
     dmgtool(workdir, "sh", "-ec", script, "_", volume_name)
-    shutil.move(os.path.join(workdir, "out.dmg"), output)
+    # The container writes out.dmg as root; a copy is this user's to sign.
+    shutil.copyfile(os.path.join(workdir, "out.dmg"), output)
+    os.remove(os.path.join(workdir, "out.dmg"))
 
 
 def update_archive(app, output):
     """The signed bundle as Linger.app/ in a tar.gz; tar keeps its symlinks."""
     tar_gz(os.path.dirname(app), os.path.basename(app), output)
     print(f"{output} {os.path.getsize(output)} sha256={sha256(output)}", flush=True)
+
+
+def emit_outputs(stage, app, workdir, out_dir, version, arch, signing, include_update_archive):
+    """Produces the signed/notarized DMG and optional update archive.
+
+    Submits only the DMG to Apple's notary service (notarizing both the DMG
+    and its nested Linger.app in one pass and stapling the DMG). When
+    --update-archive is set, staples that already-issued ticket onto Linger.app
+    before packing the update archive. Linger.app inside the DMG is notarized
+    by Apple but does not carry a separately stapled ticket.
+    """
+    output = os.path.join(out_dir, f"Linger-{version}-{arch}.dmg")
+    build_dmg(stage, workdir, output, f"Linger {version}")
+    signing.sign_dmg(output)
+    signing.notarize(output)
+    print(f"{output} {os.path.getsize(output)} sha256={sha256(output)}", flush=True)
+    if include_update_archive:
+        signing.staple(app)
+        archive = os.path.join(out_dir, f"Linger-{version}-{arch}.app.tar.gz")
+        update_archive(app, archive)
+        computer_tools.check_archive(archive, "Linger.app/Contents/Resources/", f"darwin-{arch}")
 
 
 def main():
@@ -379,31 +503,11 @@ def main():
         workdir = tempfile.mkdtemp(prefix=f"linger-dmg-{arch}-")
         try:
             stage, app = stage_app(arch, version, electron_version, workdir, args.cache)
+            if args.notary_key:
+                check_bundled_archives(app)
             signing.sign_app(app, f"darwin-{arch}")
-            # The stapled app carries its ticket into the DMG and the update.
-            signing.notarize(app)
             computer_tools.check(os.path.join(app, RESOURCES), f"darwin-{arch}")
-            output = os.path.join(args.out, f"Linger-{version}-{arch}.dmg")
-
-            def make_dmg():
-                build_dmg(stage, workdir, output, f"Linger {version}")
-                signing.sign_dmg(output)
-                signing.notarize(output)
-                print(f"{output} {os.path.getsize(output)} sha256={sha256(output)}", flush=True)
-
-            def make_update():
-                archive = os.path.join(args.out, f"Linger-{version}-{arch}.app.tar.gz")
-                update_archive(app, archive)
-                computer_tools.check_archive(archive, "Linger.app/Contents/Resources/", f"darwin-{arch}")
-
-            if args.update_archive:
-                # Both only read the signed, stapled bundle.
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    futures = [pool.submit(make_dmg), pool.submit(make_update)]
-                    for future in futures:
-                        future.result()
-            else:
-                make_dmg()
+            emit_outputs(stage, app, workdir, args.out, version, arch, signing, args.update_archive)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 

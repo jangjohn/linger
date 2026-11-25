@@ -1,7 +1,9 @@
 import { ModalDialog } from "@/components/ui/modal-dialog";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { useT } from "@/i18n/use-translation";
 
 import { SCOPES } from "./global-search-model";
+import { searchMessages as m } from "./global-search.messages";
 import {
   GlobalSearchField,
   GlobalSearchFooter,
@@ -33,6 +35,7 @@ export function GlobalSearchDialog({
   tenantId: string;
 }) {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const {
     debounced,
     enterScope,
@@ -109,7 +112,7 @@ export function GlobalSearchDialog({
 
   return (
     <ModalDialog
-      ariaLabel="Search"
+      ariaLabel={t(m.dialogLabel)}
       className="global-search flex flex-col overflow-hidden"
       closeOnBackdrop
       onClose={onClose}

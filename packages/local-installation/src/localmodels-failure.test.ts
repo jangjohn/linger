@@ -1,6 +1,8 @@
 import { expect, it } from "vitest";
 import {
+  formatLocalmodelsFailureMessage,
   localmodelsFailure,
+  normalizeFailurePunctuation,
   redactLocalmodelsOutput,
 } from "./localmodels-failure.js";
 
@@ -139,4 +141,172 @@ it("keeps the end of long output within bounded log events", () => {
   expect(failure.log[1]).toBe("[earlier output omitted]");
   expect(failure.log.at(-1)).toMatch(/final cause$/);
   expect(failure.cause).toMatch(/final cause$/);
+});
+
+it("turns localmodels.stack-error/v1 JSON from uncaptured stack apply output into a readable cause and causeCode", () => {
+  const stackArgs = ["stack", "apply", "/private/plan.json", "--jsonl"];
+  const replan = localmodelsFailure(stackArgs, {
+    code: 2,
+    stdout: "",
+    stderr: `${JSON.stringify({
+      schema: "localmodels.stack-error/v1",
+      event: "error",
+      code: "STACK_APPLY_FAILED",
+      category: "guard",
+      causeCode: "STACK_REPLAN_FAILED",
+    })}\n`,
+  });
+  expect(replan).toMatchObject({
+    code: "STACK_APPLY_FAILED",
+    causeCode: "STACK_REPLAN_FAILED",
+    cause:
+      "The saved local model plan no longer fits this computer's current memory or model catalog.",
+  });
+  expect(replan.cause).not.toContain("{");
+  expect(replan.log.join("")).toContain("STACK_REPLAN_FAILED");
+
+  const changed = localmodelsFailure(stackArgs, {
+    code: 2,
+    stdout: "",
+    stderr: `${JSON.stringify({
+      schema: "localmodels.stack-error/v1",
+      event: "error",
+      code: "STACK_APPLY_FAILED",
+      category: "guard",
+      causeCode: "STACK_PLAN_CHANGED",
+      changedFields: ["llm", "budget"],
+    })}\n`,
+  });
+  expect(changed).toMatchObject({
+    code: "STACK_APPLY_FAILED",
+    causeCode: "STACK_PLAN_CHANGED",
+    cause:
+      "This computer's state or local model runtime changed since the plan was approved (llm, budget).",
+  });
+});
+
+it("turns a failed stack apply JSONL result event into a readable cause", () => {
+  const failure = localmodelsFailure(["stack", "apply"], {
+    code: 1,
+    stdout: "",
+    stderr: `${JSON.stringify({
+      event: "result",
+      ok: false,
+      components: [
+        { component: "tools", status: "ok" },
+        { component: "llm", status: "failed" },
+      ],
+      causeCode: "STACK_COMPONENT_FAILED",
+    })}\n`,
+  });
+  expect(failure).toMatchObject({
+    code: "STACK_APPLY_FAILED",
+    causeCode: "STACK_COMPONENT_FAILED",
+    cause: "Local model setup failed at: llm.",
+  });
+});
+
+it("turns a pretty-printed localmodels.stack-up/v1 failure report into a redacted cause", () => {
+  const failure = localmodelsFailure(["stack", "up"], {
+    code: 1,
+    stdout: JSON.stringify(
+      {
+        schema: "localmodels.stack-up/v1",
+        plan_id: "a".repeat(64),
+        ok: false,
+        parts: [
+          {
+            name: "spark-x2.6-1.7b-18100",
+            task: "chat",
+            action: "failed",
+            state: "inactive",
+            health: "down",
+            detail:
+              "failed with token=sk-ant-0123456789abcdefghij while starting",
+          },
+        ],
+        gateway: "started",
+        notes: [],
+      },
+      null,
+      1,
+    ),
+    stderr: "",
+  });
+  expect(failure.code).toBe("STACK_UP_FAILED");
+  expect(failure.cause).toContain("spark-x2.6-1.7b-18100:");
+  expect(failure.cause).not.toContain("sk-ant-0123456789abcdefghij");
+  expect(failure.cause).not.toContain('"schema"');
+});
+
+it("extracts structured causeCode from localmodels.stack-plan-error/v1 while keeping redacted stderr cause", () => {
+  const failure = localmodelsFailure(["stack", "plan", "--json"], {
+    code: 2,
+    stdout: `${JSON.stringify({
+      schema: "localmodels.stack-plan-error/v1",
+      event: "error",
+      code: "HUB_UNREACHABLE",
+      hosts: ["huggingface.co", "hf-mirror.com"],
+    })}\n`,
+    stderr:
+      "stack: cannot reach huggingface.co (timed out) or hf-mirror.com (SSL EOF) to look up the model files\n",
+  });
+  expect(failure).toMatchObject({
+    code: "HUB_UNREACHABLE",
+    causeCode: "HUB_UNREACHABLE",
+    cause:
+      "stack: cannot reach huggingface.co (timed out) or hf-mirror.com (SSL EOF) to look up the model files",
+  });
+  expect(failure.log.join("")).toContain("HUB_UNREACHABLE");
+});
+
+it("collapses accidental double periods while preserving ellipses", () => {
+  expect(
+    normalizeFailurePunctuation(
+      "  Restore the existing install and try again.. Existing resources were preserved.  ",
+    ),
+  ).toBe(
+    "Restore the existing install and try again. Existing resources were preserved.",
+  );
+  expect(normalizeFailurePunctuation("Waiting...")).toBe("Waiting...");
+  expect(normalizeFailurePunctuation("Failed..")).toBe("Failed.");
+});
+
+it("joins failure messages with single terminal punctuation and redacts secrets", () => {
+  expect(
+    formatLocalmodelsFailureMessage(
+      "The upstream tool could not verify the local stack binding",
+      "Pi's configuration or this computer's state cannot be read safely. Restore the existing install and try again.",
+      "Existing resources were preserved.",
+    ),
+  ).toBe(
+    "The upstream tool could not verify the local stack binding: Pi's configuration or this computer's state cannot be read safely. Restore the existing install and try again. Existing resources were preserved.",
+  );
+  expect(
+    formatLocalmodelsFailureMessage(
+      "The upstream tool could not verify the local stack binding.",
+      "upstream text",
+      "Existing resources were preserved.",
+    ),
+  ).toBe(
+    "The upstream tool could not verify the local stack binding: upstream text. Existing resources were preserved.",
+  );
+  expect(
+    formatLocalmodelsFailureMessage(
+      "The upstream tool could not verify the local stack binding",
+      undefined,
+      "Existing resources were preserved.",
+    ),
+  ).toBe(
+    "The upstream tool could not verify the local stack binding. Existing resources were preserved.",
+  );
+  expect(
+    formatLocalmodelsFailureMessage(
+      "The upstream tool could not verify the local stack binding",
+      "Restore the existing install and try again.. Bearer secret-token-123",
+      "Existing resources were preserved.",
+    ),
+  ).toBe(
+    "The upstream tool could not verify the local stack binding: Restore the existing install and try again. Bearer [REDACTED]. Existing resources were preserved.",
+  );
 });

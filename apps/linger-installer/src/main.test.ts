@@ -93,6 +93,31 @@ it("reports the real start failure and points at permissions only for access err
   );
 });
 
+// A folder the ACL program refused, as windowsPrivatePath throws it.
+const refused = () =>
+  Object.assign(
+    new Error(
+      "Windows private path validation failed: D:\\Apps\\Linger is inside a folder.",
+    ),
+    {
+      code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+      reason: "UNSAFE_PARENT_ACCESS",
+      path: "D:\\Apps\\Linger",
+    },
+  );
+
+it("tells the desktop client by code why a refused folder stopped the start", async () => {
+  const { startFailureLine } = await import("./main.js");
+  expect(startFailureLine(refused())).toBe(
+    '{"startFailure":{"code":"WINDOWS_PRIVATE_PATH_UNSAFE","reason":"UNSAFE_PARENT_ACCESS"}}\n',
+  );
+  expect(
+    startFailureLine(
+      Object.assign(new Error("busy"), { code: "INSTALLER_BUSY" }),
+    ),
+  ).toBeUndefined();
+});
+
 it("keeps every line of a start failure", async () => {
   const { startFailure } = await import("./main.js");
   expect(
@@ -229,6 +254,31 @@ it("does not migrate legacy installations during inspection", async () => {
     stderr.mockRestore();
     vi.doUnmock("@linger/local-installation/legacy-migration");
     vi.doUnmock("@linger/local-installation/setup-plan");
+    vi.resetModules();
+  }
+});
+
+it("tells the desktop client by code why a refused folder kept the keys unsaved", async () => {
+  vi.resetModules();
+  vi.doMock("@linger/local-installation/user-environment", () => ({
+    updateUserKeys: () => Promise.reject(refused()),
+  }));
+  try {
+    const { saveUserKeys } = await import("./main.js");
+    expect(
+      await saveUserKeys(
+        { home: path.join(os.tmpdir(), "linger-refused"), instanceName: "d" },
+        JSON.stringify({ XAI_API_KEY: "xai-1" }),
+      ),
+    ).toEqual({
+      error: refused().message,
+      refusal: {
+        code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+        reason: "UNSAFE_PARENT_ACCESS",
+      },
+    });
+  } finally {
+    vi.doUnmock("@linger/local-installation/user-environment");
     vi.resetModules();
   }
 });

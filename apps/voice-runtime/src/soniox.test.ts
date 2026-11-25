@@ -99,13 +99,12 @@ describe("Soniox streaming", () => {
     20_000,
   );
 
-  it("keeps the API key in the first JSON config and omits language hints by default", () => {
+  it("keeps the API key out of the start request and omits language hints by default", () => {
     const config = sonioxRealtimeSessionConfig({
-      apiKey: "soniox-secret",
       model: "stt-rt-v6",
     });
+    expect(config).not.toHaveProperty("api_key");
     expect(config).toMatchObject({
-      api_key: "soniox-secret",
       model: "stt-rt-v6",
       audio_format: "pcm_s16le",
       sample_rate: 16000,
@@ -119,7 +118,6 @@ describe("Soniox streaming", () => {
     expect(config).not.toHaveProperty("max_endpoint_delay_ms");
     expect(
       sonioxRealtimeSessionConfig({
-        apiKey: "soniox-secret",
         model: "stt-rt-v6",
         dictation: true,
       }),
@@ -131,7 +129,6 @@ describe("Soniox streaming", () => {
     });
     expect(
       sonioxRealtimeSessionConfig({
-        apiKey: "soniox-secret",
         model: "stt-rt-v6",
         diarization: true,
       }),
@@ -142,14 +139,12 @@ describe("Soniox streaming", () => {
     );
     expect(
       sonioxRealtimeSessionConfig({
-        apiKey: "soniox-secret",
         model: "stt-rt-v6",
         diarization: true,
       }),
     ).not.toHaveProperty("enable_endpoint_detection");
     expect(
       sonioxRealtimeSessionConfig({
-        apiKey: "soniox-secret",
         model: "stt-rt-v6",
         languageHints: ["zh", "en"],
       }).language_hints,
@@ -162,7 +157,9 @@ describe("Soniox streaming", () => {
     const configs: object[] = [];
     const audio: Buffer[] = [];
     let ended = false;
-    server.on("connection", (socket) => {
+    let authorization: string | undefined;
+    server.on("connection", (socket, request) => {
+      authorization = request.headers.authorization;
       socket.on("message", (raw, isBinary) => {
         if (isBinary) {
           audio.push(Buffer.from(raw as Buffer));
@@ -220,12 +217,14 @@ describe("Soniox streaming", () => {
       await events;
       expect(configs).toEqual([
         sonioxRealtimeSessionConfig({
-          apiKey: "soniox-secret",
           model: "stt-rt-v6",
           languageHints: ["zh"],
           dictation: true,
         }),
       ]);
+      // The key goes with the connection, never in the start request.
+      expect(authorization).toBe("Bearer soniox-secret");
+      expect(JSON.stringify(configs)).not.toContain("soniox-secret");
       expect(ended).toBe(true);
       expect(Buffer.concat(audio)).toEqual(Buffer.from(frame.buffer));
       const final = seen.find((event) => event.kind === "final");
@@ -591,7 +590,7 @@ describe("Soniox streaming", () => {
     try {
       expect(result).toBeInstanceOf(VoiceFailure);
       expect(result).toMatchObject({
-        code: "asr_provider_401",
+        code: "asr_auth_rejected",
         recoverable: false,
         message: "Soniox ASR rejected the stream with code 401",
       });
@@ -604,6 +603,9 @@ describe("Soniox streaming", () => {
   });
 
   it.each([
+    [401, "asr_auth_rejected"],
+    [402, "asr_balance_exhausted"],
+    [403, "asr_permission_denied"],
     [503, "asr_provider_503"],
     ["503x", "unknown"],
     [-1, "unknown"],
@@ -636,11 +638,16 @@ describe("Soniox streaming", () => {
     }
   });
 
-  it("reports an unexpected handshake status as a typed failure", async () => {
+  it.each([
+    [401, "asr_auth_rejected"],
+    [402, "asr_balance_exhausted"],
+    [403, "asr_permission_denied"],
+    [503, "asr_http_503"],
+  ])("reports handshake status %s as %s", async (status, expected) => {
     const server = new WebSocketServer({
       port: 0,
       host: "127.0.0.1",
-      verifyClient: (_info, done) => done(false, 401),
+      verifyClient: (_info, done) => done(false, status),
     });
     const port = await listen(server);
     try {
@@ -656,9 +663,40 @@ describe("Soniox streaming", () => {
         (error: unknown) => error,
       );
       expect(result).toBeInstanceOf(VoiceFailure);
-      expect(voiceTrackFailureCode(result)).toBe("asr_http_401");
+      expect(voiceTrackFailureCode(result)).toBe(expected);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("reports a connection that never reaches Soniox by its network cause", async () => {
+    const closed = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    const closedPort = await listen(closed);
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    // A plain WebSocket server answers a TLS ClientHello with HTTP bytes.
+    const plain = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    const plainPort = await listen(plain);
+    const connectFailure = (webSocketUrl: string) =>
+      SonioxASRStream.connect(
+        { apiKey: "test", model: "stt-rt-v6", webSocketUrl },
+        new AbortController().signal,
+      ).then(
+        () => "connected",
+        (error: unknown) => voiceTrackFailureCode(error),
+      );
+    try {
+      await expect(
+        connectFailure(`ws://127.0.0.1:${closedPort}`),
+      ).resolves.toBe("network_refused");
+      await expect(
+        connectFailure(`wss://127.0.0.1:${plainPort}`),
+      ).resolves.toBe("network_tls");
+      // The reserved .invalid domain never resolves.
+      await expect(
+        connectFailure("wss://soniox.invalid/transcribe-websocket"),
+      ).resolves.toBe("network_dns");
+    } finally {
+      await new Promise<void>((resolve) => plain.close(() => resolve()));
     }
   });
 

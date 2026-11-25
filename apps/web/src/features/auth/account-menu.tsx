@@ -13,7 +13,11 @@ import {
 } from "@/features/auth/desktop-update";
 import { ActorAvatar } from "@/features/rooms/members/actor-avatar";
 import type { TeamHubCurrentIdentity } from "@/features/teamhub/teamhub-types";
+import type { Translate } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
 import { cn } from "@/lib/cn";
+
+import { accountMenuMessages } from "./account-menu.messages";
 
 interface UpdatePresentation {
   // One line under the version; none while nothing is happening.
@@ -27,40 +31,52 @@ interface UpdatePresentation {
 }
 
 // What the account menu shows for the desktop app's updater state.
-function updatePresentation(state: DesktopUpdate["state"]): UpdatePresentation {
+function updatePresentation(
+  state: DesktopUpdate["state"],
+  t: Translate,
+): UpdatePresentation {
   switch (state?.kind) {
     case "checking":
-      return { status: "Checking for updates…", attention: false };
+      return { status: t(accountMenuMessages.checking), attention: false };
     case "downloading":
       return {
-        status: `Downloading Linger ${state.version}…`,
+        status: t(accountMenuMessages.downloading, { version: state.version }),
         attention: false,
       };
     case "ready":
       return {
-        status: `Linger ${state.version} is ready to install`,
-        action: { label: "Restart to Update", run: "install" },
+        status: t(accountMenuMessages.ready, { version: state.version }),
+        action: {
+          label: t(accountMenuMessages.restartToUpdate),
+          run: "install",
+        },
         attention: true,
       };
     case "waiting":
       return {
-        status: `Updating to ${state.version} when tasks finish`,
+        status: t(accountMenuMessages.waiting, { version: state.version }),
         attention: false,
       };
     case "installing":
-      return { status: `Updating to ${state.version}…`, attention: false };
+      return {
+        status: t(accountMenuMessages.installing, { version: state.version }),
+        attention: false,
+      };
     case "available":
       return {
-        status: `Linger ${state.version} is available`,
-        action: { label: "Download Update", run: "install" },
+        status: t(accountMenuMessages.available, { version: state.version }),
+        action: {
+          label: t(accountMenuMessages.downloadUpdate),
+          run: "install",
+        },
         attention: true,
       };
     case "failed":
       return {
-        status: `Update failed: ${state.error}`,
+        status: t(accountMenuMessages.failed, { error: state.error }),
         tone: "danger",
         detail: state.error,
-        action: { label: "Try Again", run: "check" },
+        action: { label: t(accountMenuMessages.tryAgain), run: "check" },
         attention: false,
       };
     default:
@@ -92,7 +108,8 @@ export function AccountMenu({
   const identifier = identity.account.email;
   const inSettings = settingsOpen;
   const desktop = useDesktopUpdate();
-  const update = updatePresentation(desktop?.state);
+  const t = useT();
+  const update = updatePresentation(desktop?.state, t);
   const action = desktop && update.action;
   const updateItems: ActionMenuItem[] = action
     ? [
@@ -114,7 +131,7 @@ export function AccountMenu({
     : [];
   return (
     <ActionMenu
-      label="Account menu"
+      label={t(accountMenuMessages.label)}
       placement="top-start"
       buttonClassName={`flex size-11 items-center justify-center rounded-full outline-none transition-colors hover:bg-sidebar-muted aria-expanded:bg-sidebar-muted focus-visible:ring-2 focus-visible:ring-ring md:size-8 ${inSettings ? "bg-sidebar-muted" : ""}`}
       trigger={
@@ -144,7 +161,9 @@ export function AccountMenu({
           </p>
           {desktop ? (
             <div className="mt-2 text-xs">
-              <p className="text-app-muted">Version {desktop.version}</p>
+              <p className="text-app-muted">
+                {t(accountMenuMessages.version, { version: desktop.version })}
+              </p>
               {update.status ? (
                 <p
                   className={cn(
@@ -167,7 +186,7 @@ export function AccountMenu({
       items={[
         ...updateItems,
         {
-          label: "Settings",
+          label: t(accountMenuMessages.settings),
           icon: <Icon icon={Settings01Icon} size={14} />,
           separatorBefore: updateItems.length > 0,
           onSelect: () => {
@@ -176,7 +195,12 @@ export function AccountMenu({
           },
         },
         {
-          label: isPending ? "Logging out..." : "Log out",
+          voiceRisk: "never",
+          label: t(
+            isPending
+              ? accountMenuMessages.loggingOut
+              : accountMenuMessages.logOut,
+          ),
           icon: <Icon icon={Logout01Icon} size={14} />,
           disabled: isPending,
           separatorBefore: true,

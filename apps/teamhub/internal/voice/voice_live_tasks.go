@@ -18,6 +18,7 @@ import (
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/store"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/taskdelegation"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/taskexecution"
+	"github.com/simplexai-labs/linger/apps/teamhub/internal/tenantmembership"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/typedcard"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicelive"
 	"github.com/simplexai-labs/linger/contracts-go/teamhubinternal"
@@ -123,7 +124,7 @@ func alterEgoContextKeyPrefix(agentManagementID string) string {
 // startVoiceLiveTask starts the work as its own delegated Task of the Room's
 // Agent, so several tasks run side by side. Irreversible work
 // starts only from a confirmation the user gave in a later turn.
-func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Session, request teamhubinternal.VoiceLiveToolCall) (string, error) {
+func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Session, request teamhubinternal.VoiceLiveToolCall) (output string, callErr error) {
 	var args voicelive.StartTaskArguments
 	if voicelive.DecodeArguments(request.Arguments, &args) != nil {
 		return "", voicelive.ErrInvalid
@@ -154,7 +155,7 @@ func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Sess
 		}); err != nil {
 			return "", err
 		}
-		return voicelive.Output(map[string]string{"status": "needs_confirmation", "goal": goal, "confirmation_id": id}), nil
+		return voicelive.Output(map[string]string{"status": "needs_confirmation", "goal": goal, "confirmation_id": id, "next": "Ask for spoken confirmation once and wait for the next user turn. This request has no chat card."}), nil
 	}
 	computer, err := s.queries.GetVoiceLiveAgentComputer(ctx, store.GetVoiceLiveAgentComputerParams{ActorID: session.Agent.ID, TenantID: session.TenantID})
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && computer.AgentManagementID == "" {
@@ -187,7 +188,16 @@ func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Sess
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback(ctx)
+	// A successful rollback proves that the task never started. A commit
+	// with a lost response stays uncertain and must not be retried blindly.
+	defer func() {
+		if rollbackErr := tx.Rollback(context.WithoutCancel(ctx)); rollbackErr == nil && callErr != nil && !errors.Is(callErr, voicelive.ErrInvalid) {
+			if s.logger != nil {
+				s.logger.ErrorContext(ctx, "voice.task_start_failed", "call_id", request.CallId, "error", callErr)
+			}
+			output, callErr = voicelive.ErrorOutput("task_not_started"), nil
+		}
+	}()
 	queries := store.New(tx)
 	// Numbering and repeats are per Room and user.
 	if err := queries.AcquireAdvisoryTransactionLock(ctx, "voice-live-task|"+session.RoomID+"|"+session.HumanActorID); err != nil {
@@ -197,17 +207,23 @@ func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Sess
 		RoomID: session.RoomID, OwnerActorID: session.HumanActorID, Goal: goal,
 		Since: pgtype.Timestamptz{Time: time.Now().Add(-voicelive.RepeatedTaskWithin), Valid: true},
 	}); err == nil {
-		return voicelive.Output(map[string]string{"status": "started", "task_id": voicelive.TaskID(ordinal)}), nil
+		return voicelive.Output(map[string]string{"status": "started", "task_id": voicelive.TaskID(ordinal), "next": voicelive.StartedNext}), nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	// Take per-Agent advisory locks before the room-mutation fence: Work Room
+	// creation takes tenantmembership.LockAgent, and Room deletion takes it
+	// before room-mutation.
+	if err := tenantmembership.LockAgent(ctx, queries, session.Agent.ID); err != nil {
+		return "", err
+	}
+	// Counted under the per-Agent lock Task creation uses, so the cap holds.
+	if err := queries.AcquireAdvisoryTransactionLock(ctx, "task-delegation|"+session.Agent.ID); err != nil {
 		return "", err
 	}
 	if _, err := queries.LockActiveRoomForMutation(ctx, session.RoomID); errors.Is(err, pgx.ErrNoRows) {
 		return voicelive.ErrorOutput("room_unavailable"), nil
 	} else if err != nil {
-		return "", err
-	}
-	// Counted under the per-Agent lock Task creation uses, so the cap holds.
-	if err := queries.AcquireAdvisoryTransactionLock(ctx, "task-delegation|"+session.Agent.ID); err != nil {
 		return "", err
 	}
 	running, err := queries.CountRunningDelegatedTasksForAgent(ctx, store.CountRunningDelegatedTasksForAgentParams{
@@ -262,7 +278,7 @@ func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Sess
 		return "", err
 	}
 	// Task creation publishes its wake transactionally.
-	return voicelive.Output(map[string]string{"status": "started", "task_id": voicelive.TaskID(ordinal)}), nil
+	return voicelive.Output(map[string]string{"status": "started", "task_id": voicelive.TaskID(ordinal), "next": voicelive.StartedNext}), nil
 }
 
 // replyToVoiceLiveTask gives the user's answer or change to the task's own

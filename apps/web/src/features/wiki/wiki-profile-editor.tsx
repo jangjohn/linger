@@ -1,6 +1,10 @@
 import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { FormFeedback } from "@/components/ui/form-feedback";
+import { commonMessages } from "@/i18n/common.messages";
+import { RichMessage, useT } from "@/i18n/use-translation";
+
+import { wikiMessages as m } from "./wiki.messages";
 
 /** Edits the whole Profile as its Markdown; TeamHub reads it back into the
  * Profile's sections, so the layout hint names what the headings mean. */
@@ -18,25 +22,25 @@ export function WikiProfileEditor({
   pending: boolean;
 }) {
   const [draft, setDraft] = useState(markdown);
+  const t = useT();
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     onSave(draft);
   };
   return (
     <form
-      aria-label="Edit Profile"
+      aria-label={t(m.editProfileForm)}
       className="wiki-profile-edit"
       onSubmit={submit}
     >
       <p className="wiki-profile-edit-hint">
-        Keep the five <code>##</code> sections. Under Background,{" "}
-        <code>### Timeline</code> lists <code>- years · organization</code>{" "}
-        entries with years only (<code>2019</code> start, <code>–2013</code>{" "}
-        end, <code>≤2013</code> ended by then, <code>Present</code> ongoing);
-        any other <code>###</code> starts a point.
+        <RichMessage
+          message={m.editHint}
+          tags={{ code: (text) => <code>{text}</code> }}
+        />
       </p>
       <textarea
-        aria-label="Profile Markdown"
+        aria-label={t(m.profileMarkdown)}
         className="wiki-profile-edit-markdown ui-field-control"
         disabled={pending}
         onChange={(event) => setDraft(event.target.value)}
@@ -47,7 +51,7 @@ export function WikiProfileEditor({
         {error ? <FormFeedback tone="danger">{error}</FormFeedback> : null}
         <div className="wiki-profile-edit-buttons">
           <Button disabled={pending} onClick={onCancel}>
-            Cancel
+            {t(commonMessages.cancel)}
           </Button>
           <Button
             disabled={draft === markdown}
@@ -55,7 +59,7 @@ export function WikiProfileEditor({
             tone="primary"
             type="submit"
           >
-            Save
+            {t(commonMessages.save)}
           </Button>
         </div>
       </div>

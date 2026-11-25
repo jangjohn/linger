@@ -16,6 +16,7 @@ import type {
   TeamHubRunStatus,
   TeamHubRuntimePresentationEventRecord,
 } from "@/features/teamhub/teamhub-types";
+import { translate } from "@/i18n/language";
 
 import {
   AgentStreamingStatusDock,
@@ -2120,6 +2121,36 @@ describe("Room Message timeline cards", () => {
     expect(shownStatus()).not.toMatch(/Run failed/);
   });
 
+  it("tells an interrupted Run with an unconfirmed follow-up to resend it", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <AgentStreamingStatusDock
+            runStatuses={[runStatus({ status: "aborted" })]}
+            runtimePresentationEventsByRunStatusId={{
+              "run-status-1": [
+                {
+                  ...runtimeTerminalStatusRecord("2", "failed"),
+                  event: {
+                    type: "status.changed",
+                    status: "stopped",
+                    outcome: "failed",
+                    failure: { code: "interrupted" },
+                    unconfirmed_input_ids: ["follow-up"],
+                  },
+                },
+              ],
+            }}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(shownStatus()).toMatch(
+      /^Codex: The Run stopped before it finished .* Follow-up delivery unconfirmed\. Resend it if the Agent did not answer\.$/,
+    );
+    expect(shownStatus()).not.toMatch(/Run failed/);
+  });
+
   it("shows the latest failure below the composer and clears it after success", () => {
     const failed = runStatus({ id: "failed", status: "aborted" });
     const { rerender } = render(
@@ -3222,6 +3253,7 @@ describe("Runtime timeline projection reuse", () => {
         "run-status-1": firstEvents,
         "run-status-2": secondEvents,
       },
+      t: translate,
     });
 
     const next = buildRuntimeTimelineViews({
@@ -3234,6 +3266,7 @@ describe("Runtime timeline projection reuse", () => {
           runtimeStatusRecord("2", "working", "Writing"),
         ],
       },
+      t: translate,
     });
     expect(next).toHaveLength(2);
     expect(next[0]).toBe(firstView);
@@ -3243,6 +3276,7 @@ describe("Runtime timeline projection reuse", () => {
       cache,
       runStatuses: [{ ...first, revision: 2 }],
       runtimePresentationEventsByRunStatusId: { "run-status-1": firstEvents },
+      t: translate,
     });
     expect(revised[0]).not.toBe(firstView);
     // A Run that leaves the list leaves the cache too.

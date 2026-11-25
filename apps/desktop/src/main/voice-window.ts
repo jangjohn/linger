@@ -8,6 +8,38 @@ import type { BrowserWindow, WebContents } from "electron";
 
 export type VoiceWindowPlatform = NodeJS.Platform;
 
+export interface VoiceWindowSize {
+  readonly width: number;
+  readonly height: number;
+}
+
+interface Area extends VoiceWindowSize {
+  readonly x: number;
+  readonly y: number;
+}
+
+// The smallest the window gets: the one-row minimized state still fits.
+export const VOICE_WINDOW_MIN: VoiceWindowSize = { width: 240, height: 96 };
+// The gap the window keeps from the screen's edges when it opens.
+const VOICE_WINDOW_MARGIN = 24;
+
+// Where the window opens: the bottom right of the main window's screen, as a
+// browser places its picture-in-picture window. A window larger than the
+// screen keeps its title bar on the screen.
+export const voiceWindowPosition = (
+  window: VoiceWindowSize,
+  workArea: Area,
+): { readonly x: number; readonly y: number } => ({
+  x: Math.max(
+    workArea.x,
+    workArea.x + workArea.width - window.width - VOICE_WINDOW_MARGIN,
+  ),
+  y: Math.max(
+    workArea.y,
+    workArea.y + workArea.height - window.height - VOICE_WINDOW_MARGIN,
+  ),
+});
+
 // Hiding or minimizing the main window would otherwise throttle the page's
 // timers, which keep the call and the recording going. A window is counted
 // from when it is adopted to when it closes, so a closing window cannot lift

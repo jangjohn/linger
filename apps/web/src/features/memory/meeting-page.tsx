@@ -29,6 +29,7 @@ import { DocumentTableOfContents } from "@/components/document-table-of-contents
 import { useDocumentAnchorLinks } from "@/components/document-anchor-links";
 import { resolveMemoryDocumentLink } from "./memory-document-links";
 import { Button } from "@/components/ui/button";
+import { libraryMessages } from "@/features/library/library.messages";
 import {
   WORKSPACE_TREE_ID,
   useWorkspaceTree,
@@ -36,10 +37,14 @@ import {
 import { requireRoomRouteParam } from "@/features/rooms/room-route-params";
 import { teamHubData } from "@/features/teamhub/teamhub-api";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { useT } from "@/i18n/use-translation";
+
+import { meetingsMessages as m } from "./meetings.messages";
 
 /** One read-only meeting, named by the `entry` query of `/library/meetings`. */
 export function MeetingPage() {
   const { client } = useTeamHubRuntime();
+  const t = useT();
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -76,18 +81,20 @@ export function MeetingPage() {
           <Button
             aria-controls={WORKSPACE_TREE_ID}
             aria-expanded={workspaceTree.open}
-            aria-label="Open Owned by Me"
+            aria-label={t(m.openOwnedByMe)}
             className="sm:hidden"
             onClick={() => workspaceTree.setOpen(true)}
             size="icon"
-            title="Owned by Me"
+            title={t(libraryMessages.ownedByMe)}
             tone="ghost"
           >
             <Icon icon={SidebarLeftIcon} size={16} />
           </Button>
           <div className="flex items-center gap-2">
             <Icon icon={BookOpen01Icon} className="text-app-muted" size={16} />
-            <h1 className="text-[15px] font-semibold text-app-ink">Meetings</h1>
+            <h1 className="text-[15px] font-semibold text-app-ink">
+              {t(m.pageTitle)}
+            </h1>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -95,11 +102,11 @@ export function MeetingPage() {
             <Button
               aria-controls="meeting-table-of-contents"
               aria-expanded={tocOpen}
-              aria-label="Table of contents"
+              aria-label={t(m.tableOfContents)}
               aria-pressed={tocOpen}
               onClick={() => setTocOpen((value) => !value)}
               size="icon"
-              title="Table of contents"
+              title={t(m.tableOfContents)}
               tone="ghost"
             >
               <Icon icon={LeftToRightListBulletIcon} size={16} />
@@ -110,7 +117,7 @@ export function MeetingPage() {
 
       <div className="relative flex min-h-0 flex-1">
         <section
-          aria-label="Meeting content"
+          aria-label={t(m.content)}
           className="workspace-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto"
           ref={contentRef}
           onClickCapture={openAnchor}
@@ -129,16 +136,16 @@ export function MeetingPage() {
               className="flex min-h-[420px] items-center justify-center gap-2 text-sm text-app-muted"
             >
               <Icon icon={Loading03Icon} className="animate-spin" size={16} />
-              Loading meeting...
+              {t(m.loadingMeeting)}
             </div>
           ) : listed && selected.error ? (
             <div
-              aria-label={selected.error.message || "Meeting is unavailable."}
+              aria-label={selected.error.message || t(m.unavailable)}
               className="mx-auto max-w-3xl px-6 py-10"
               role="alert"
             >
               <p className="text-sm text-app-danger">
-                {selected.error.message || "Meeting is unavailable."}
+                {selected.error.message || t(m.unavailable)}
               </p>
               <Button
                 className="mt-3"
@@ -146,7 +153,7 @@ export function MeetingPage() {
                 size="compact"
                 tone="secondary"
               >
-                <Icon icon={RefreshIcon} size={14} /> Retry meeting
+                <Icon icon={RefreshIcon} size={14} /> {t(m.retryMeeting)}
               </Button>
             </div>
           ) : listed && selected.data?.meeting ? (

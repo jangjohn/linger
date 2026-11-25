@@ -265,7 +265,10 @@ func codexBindingFingerprint(home, configDigest string, spec RunSpec) string {
 	optional(spec.BaseInstructions)
 	optional(codexDeveloperInstructions(spec))
 	field(spec.Title)
-	field(fmt.Sprint(spec.CodexPermissionHook != nil))
+	reviewHook := spec.CodexPermissionHook != nil && spec.CodexPermissionHook.ReviewPermissions
+	stopHook := spec.CodexPermissionHook != nil && spec.CodexPermissionHook.StopHook
+	field(fmt.Sprintf("%t:%t", reviewHook, stopHook))
+	field(spec.ShellTextHook)
 	field(configDigest)
 	return hex.EncodeToString(hash.Sum(nil))
 }
@@ -275,8 +278,8 @@ func codexDeveloperInstructions(spec RunSpec) *string {
 	if spec.BaseInstructions != nil || spec.DeveloperInstructions != nil {
 		return spec.DeveloperInstructions
 	}
-	if spec.AppendPrompt != "" {
-		value := spec.AppendPrompt
+	if spec.SystemPrompt != "" {
+		value := spec.SystemPrompt
 		return &value
 	}
 	return nil

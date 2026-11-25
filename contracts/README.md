@@ -100,7 +100,28 @@ Progress and outcomes travel back only as snapshots:
    `TOOL_NOT_INSTALLED`. Each `LocalModel` may also carry optional model-card
    metadata (`family`, `publisher`, `architecture`, `parameters`,
    `active_parameters`, `capabilities`, `license`, `source_url`,
-   `prompt_tokens_per_second`).
+   `prompt_tokens_per_second`). Extended diagnostic reasons (`GPU_UNSUPPORTED`,
+   `DRIVER_UPDATE_REQUIRED`, `RUNTIME_DEPENDENCY_MISSING`, `UNAVAILABLE` and
+   their structured fields), extended error codes, and optional `debug`
+   metadata are sent only when `runner.welcome`'s `service_features` declares
+   `local_models_diagnostics` (`FIRST_LOCAL_MODELS_DIAGNOSTICS_COMPUTER_VERSION`,
+   `0.58.0`); otherwise the Daemon downgrades them for older Agent Services.
+   Per-model inference engine metadata (`engine`, `engine_label`, `concurrency`,
+   `host_ram_bytes`) is sent only when `runner.welcome`'s `service_features`
+   declares `local_models_engine` (`FIRST_LOCAL_MODELS_ENGINE_COMPUTER_VERSION`,
+   `0.61.0`); otherwise the Daemon strips those fields for older Agent Services.
+   Per-model `concurrency_probing` is sent only when `runner.welcome`'s
+   `service_features` declares `local_models_concurrency_probe`
+   (`FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION`, `0.64.0`);
+   otherwise the Daemon strips it for older Agent Services.
+   Pool `external_holders` is sent only when `service_features` declares
+   `local_models_external_holders` (to every Computer, which ignores unknown
+   features); otherwise the Daemon strips it. `[]` means localmodels found no
+   closeable app, while an absent field means not reported.
+   `service_features` also declares `local_model_unavailable` to every Computer
+   that receives the field: a Daemon ignores a feature it does not know, and one
+   that knows it reports a Pi Run whose local model it could not load with that
+   Run failure code instead of `model_unavailable`.
 2. Agent Service records it through TeamHub `recordAgentRuntimeLocalModels`
    (`POST /v0/agent-runtime/local-computers/local-models`). TeamHub keeps the
    latest snapshot per Computer, so an offline Computer shows what it last
@@ -154,3 +175,36 @@ with running work stays where it is unless the owner chose to end that work:
 work found before `apply` refuses the switch with `AGENT_HAS_ACTIVE_RUNS`, and
 work that started during it leaves only that Agent behind, answered with the
 same code after the others moved.
+
+## Stop hook flow
+
+A Feature may register a `stop` hook on an Agent Run so the Runtime asks the
+Agent Service before finishing a turn:
+
+1. Agent Service sets `stop_hook: true` on `provider.prepare`
+   (`run_context.stop_hook`), `operation.prepare` (`stop_hook`), and
+   `operation.start` (`request.run_context.stop_hook`) only when the Run's
+   composed Features have a `stop` hook and the Computer is version `0.57.0` or
+   later (`FIRST_STOP_HOOK_COMPUTER_VERSION`). Older Computers decode
+   `provider.prepare` and `operation.prepare` with `DisallowUnknownFields()` and
+   would close the connection on an unknown field; omitting `stop_hook` keeps
+   older Computers compatible and falls back to Agent Service's post-hoc
+   `reply_not_sent` check.
+2. When the Runtime is about to finish a turn, the Daemon emits an
+   `operation.event` carrying `human_interaction.requested` with
+   `kind: "runtime_hook"` and `hook: "stop"`, and waits for an
+   `operation.input` `runtime_response` (`{ action: "allow" | "block", reason? }`).
+   On `block`, the Runtime continues the turn with that reason (Claude Code and
+   Codex via their native `Stop` hooks; Pi via a follow-up `prompt` RPC on the
+   bound process). Timeout, disconnect, or an invalid decision fails open to
+   `allow`.
+
+## Model invocation outcomes
+
+`executed` `model_invoke` reports `context_too_long` (prompt exceeded the
+model's context window) and `unsupported` (the target Runtime does not support
+the requested mode, such as Pi workspace calls) only after `runner.welcome`'s
+`service_features` names `model_invoke_outcomes`
+(`FIRST_MODEL_INVOKE_OUTCOMES_COMPUTER_VERSION`, `0.60.0`); otherwise the
+Daemon downgrades them to `failed` and `runtime_unavailable` for older Agent
+Services.

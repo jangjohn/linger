@@ -77,8 +77,6 @@ type codexOperation struct {
 	liveUsage   *codexUsage
 	lastUsage   *codexUsage
 	compactions int64
-	// children are the sub-agent threads this turn spawned.
-	children map[string]codexChild
 	// steers holds each steer that waits for Codex to show its user message,
 	// by the client id the steer sent.
 	steers           map[string]chan struct{}
@@ -95,10 +93,10 @@ func newCodexOperation(proc *codexProcess, profile Profile, spec RunSpec, prompt
 	return &codexOperation{
 		proc: proc, spec: spec, prompt: prompt, logger: logger, taskID: profile.TaskID, configDigest: profile.CodexConfigDigest,
 		attempt: attempt, startedAt: time.Now(), fresh: fresh, reused: reused,
-		reviewed: spec.CodexPermissionHook != nil, bridge: spec.HumanInteraction,
+		reviewed: spec.CodexPermissionHook != nil && spec.CodexPermissionHook.ReviewPermissions, bridge: spec.HumanInteraction,
 		activity: make(chan string, codexActivityBuffer), terminal: make(chan struct{}),
 		events: make(chan Event, codexEventBuffer), itemsDone: map[string]bool{},
-		children: map[string]codexChild{}, steers: map[string]chan struct{}{}, requests: newModelRequestClock(GranularityItem),
+		steers: map[string]chan struct{}{}, requests: newModelRequestClock(GranularityItem),
 	}
 }
 
@@ -258,12 +256,34 @@ func codexIsHandshakeTimeout(err error) bool {
 // runTurn sends turn/start and waits for the turn to settle.
 func (op *codexOperation) runTurn(ctx context.Context) codexFailure {
 	thread := op.proc.boundThread()
-	if hook := op.spec.CodexPermissionHook; hook != nil && hook.Endpoint != nil && op.spec.PermissionReviewer != nil {
-		reviewer, spec := op.spec.PermissionReviewer, op.spec
-		unregister := hook.Endpoint.Register(thread, func(ctx context.Context, event permission.CodexHookEvent) permission.Verdict {
-			return permission.CodexReview(ctx, reviewer, event, spec.Dir, spec.RuntimeHome, spec.SharedTaskLink)
-		})
-		defer unregister()
+	if hook := op.spec.CodexPermissionHook; hook != nil && hook.Endpoint != nil {
+		if hook.ReviewPermissions && op.spec.PermissionReviewer != nil {
+			reviewer, spec := op.spec.PermissionReviewer, op.spec
+			unregister := hook.Endpoint.Register(thread, func(ctx context.Context, event permission.CodexHookEvent) permission.Verdict {
+				return permission.CodexReview(ctx, reviewer, event, spec.Dir, spec.RuntimeHome, spec.SharedTaskLink)
+			})
+			defer unregister()
+		}
+		if hook.StopHook && op.spec.StopHook != nil {
+			stopHook := op.spec.StopHook
+			unregisterStop := hook.Endpoint.RegisterStop(thread, func(hookCtx context.Context, event permission.CodexStopHookEvent) permission.CodexStopDecision {
+				op.mu.Lock()
+				failed := op.turnErr != "" || op.terminalAborted
+				op.mu.Unlock()
+				if failed || ctx.Err() != nil {
+					return permission.CodexStopDecision{}
+				}
+				decision := stopHook(hookCtx, StopHookRequest{
+					Runtime:        "codex",
+					StopHookActive: event.StopHookActive,
+				})
+				return permission.CodexStopDecision{
+					Block:  decision.Action == "block" && decision.Reason != "",
+					Reason: decision.Reason,
+				}
+			})
+			defer unregisterStop()
+		}
 	}
 	params := map[string]any{"threadId": thread, "input": []any{map[string]any{"type": "text", "text": op.prompt}}}
 	if op.spec.Effort != "" {
@@ -432,15 +452,12 @@ func (op *codexOperation) steer(ctx context.Context, request SteerRequest) (Stee
 		"threadId": op.proc.boundThread(), "expectedTurnId": request.ExpectedTurnID,
 		"input": []any{map[string]any{"type": "text", "text": request.Input, "text_elements": []any{}}},
 	}
-	evidence := codexSupportsSteerClientID(op.proc.version)
 	clientID := uuid.NewString()
 	consumed := make(chan struct{})
-	if evidence {
-		params["clientUserMessageId"] = clientID
-		op.mu.Lock()
-		op.steers[clientID] = consumed
-		op.mu.Unlock()
-	}
+	params["clientUserMessageId"] = clientID
+	op.mu.Lock()
+	op.steers[clientID] = consumed
+	op.mu.Unlock()
 	uncertain := func(reason, message string) error {
 		return &SteerError{Effect: "uncertain", Reason: reason, ExpectedTurnID: request.ExpectedTurnID, Message: message}
 	}
@@ -461,9 +478,6 @@ func (op *codexOperation) steer(ctx context.Context, request SteerRequest) (Stee
 	}
 	if json.Unmarshal(result, &ack) != nil || ack.TurnID != request.ExpectedTurnID {
 		return SteerAck{}, uncertain("ack_mismatch", "Codex acknowledged steer for an unexpected turn")
-	}
-	if !evidence {
-		return SteerAck{TurnID: ack.TurnID}, nil
 	}
 	select {
 	case <-consumed:

@@ -13,7 +13,10 @@ import {
   DropdownOptions,
 } from "@/components/ui/dropdown-options";
 import { Icon } from "@/components/ui/icon";
+import { useT } from "@/i18n/use-translation";
 import { cn } from "@/lib/cn";
+
+import { localModelsMessages as m } from "./local-models.messages";
 
 export interface ByokComboboxOption {
   /** A second line under the value. */
@@ -70,6 +73,7 @@ export function ByokCombobox({
   placeholder: string;
   value: string;
 }) {
+  const t = useT();
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -183,7 +187,7 @@ export function ByokCombobox({
         value={value}
       />
       <button
-        aria-label={`Show ${label} suggestions`}
+        aria-label={t(m.byokShowSuggestions, { label })}
         className="grid size-6 shrink-0 place-items-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
         disabled={disabled}
         onClick={() => {
@@ -202,7 +206,7 @@ export function ByokCombobox({
       </button>
       {open ? (
         <DropdownOptions
-          aria-label={`${label} suggestions`}
+          aria-label={t(m.byokSuggestions, { label })}
           className={cn(
             "absolute top-full z-30 mt-1 w-max min-w-[calc(100%+2px)] max-w-[min(22rem,86vw)]",
             menuClassName,
@@ -236,7 +240,7 @@ export function ByokCombobox({
               role="option"
               tabIndex={-1}
             >
-              <span className="block truncate font-mono text-[13px]">
+              <span className="block truncate font-mono text-xs">
                 {option.value || "-"}
               </span>
               {option.detail ? (

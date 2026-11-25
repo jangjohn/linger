@@ -26,8 +26,16 @@ import {
 } from "./computer-daemon.js";
 import { ConfigStore } from "./config.js";
 import { DesktopIpcModule } from "./desktop-ipc.js";
+import { dialogMessages } from "./dialogs.messages.js";
 import { DiagnosticsModule } from "./diagnostics.js";
+import { DriverUpdater } from "./driver-updater.js";
+import {
+  detectWindowsNvidiaGpuName,
+  runWindowsDriverInstaller,
+  verifyWindowsAuthenticode,
+} from "./windows-driver-platform.js";
 import { EnrollmentModule } from "./enrollment.js";
+import { LanguageModule } from "./language.js";
 import {
   LocalServerModule,
   signInWithPassword,
@@ -43,9 +51,11 @@ import { fileLogger, type Logger } from "./log.js";
 import { MacPermissions } from "./mac-permissions.js";
 import { EventBus, ModuleHost, type Module } from "./modules.js";
 import { parseServerUrl } from "./navigation.js";
+import { openWithXdg } from "./open-url.js";
 import { PowerGuardModule, type PowerApi } from "./power-guard.js";
 import { SetupWindowModule } from "./setup-window.js";
 import { loginShellEnvironment, withLoginShell } from "./shell-env.js";
+import { markStartMenuShortcut } from "./start-menu-shortcut.js";
 import { StatusModule } from "./status.js";
 import { SystemPermissions } from "./system-permissions.js";
 import { TrayModule } from "./tray.js";
@@ -114,7 +124,20 @@ async function main(): Promise<void> {
       user_data: userDataMove.userData,
       ...(userDataMove.setAside ? { set_aside: userDataMove.setAside } : {}),
     });
-  if (process.platform === "win32" && app.isPackaged) markStartMenuShortcut();
+  if (process.platform === "win32" && app.isPackaged)
+    markStartMenuShortcut({
+      appData: app.getPath("appData"),
+      execPath: process.execPath,
+      appUserModelId: APP_USER_MODEL_ID,
+      env: process.env,
+      readShortcutLink: (shortcut) => shell.readShortcutLink(shortcut),
+      writeShortcutLink: (shortcut, operation, options) =>
+        shell.writeShortcutLink(shortcut, operation, options),
+      onWriteError: (error) =>
+        log.warn("desktop.start_menu_shortcut_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+    });
   const background = process.argv.includes("--background");
   const envServer = parseServerUrl(process.env.LINGER_SERVER_URL ?? "");
   const config = new ConfigStore(
@@ -154,6 +177,7 @@ async function main(): Promise<void> {
   };
   const localServer = new LocalServerModule({
     home,
+    daemonDirectory,
     version: VERSION,
     macosVersion: () => process.getSystemVersion(),
     installerDirectory: path.join(here, "../installer"),
@@ -171,7 +195,11 @@ async function main(): Promise<void> {
         session.defaultSession.cookies.set({ url: server.origin, ...cookie }),
       ),
     sessionCookie: webSessionCookie,
-    openExternal: (url) => shell.openExternal(url),
+    // On Linux the sign-in needs to know when no browser opened.
+    openExternal: (url) =>
+      process.platform === "linux" ? openWithXdg(url) : shell.openExternal(url),
+    // The system proxy (fixed or PAC) the voice services reach Soniox with.
+    resolveProxy: (url) => session.defaultSession.resolveProxy(url),
   });
   // Until this computer is connected, the setup window comes first.
   const needsSetup = !config.get().computerId;
@@ -179,7 +207,38 @@ async function main(): Promise<void> {
     preload: path.join(here, "../preload/index.cjs"),
     shellPreload: path.join(here, "../preload/shell.cjs"),
     background: background || needsSetup,
-    localServerResumable: (url) => localServer.resumable(url),
+    localServerResumable: (url) => localServer.isStarting(url),
+  });
+  const openExternal = (url: string): Promise<void> =>
+    process.platform === "linux" ? openWithXdg(url) : shell.openExternal(url);
+  const bus = new EventBus();
+  const driverUpdater = new DriverUpdater({
+    platform: process.platform as "darwin" | "win32" | "linux",
+    arch: process.arch,
+    existsSync,
+    env: process.env,
+    launchExecutable: async (executablePath) => {
+      const error = await shell.openPath(executablePath);
+      if (error) throw new Error(error);
+    },
+    openExternal,
+    onStateChange: () => bus.emit("driver-update.changed"),
+    onBusyChange: (busy) => bus.emit("driver-update.busy", busy),
+    ...(process.platform === "win32" && process.arch === "x64"
+      ? {
+          directInstall: {
+            downloadDirectory: path.join(userData, "driver-updates"),
+            detectGpuName: detectWindowsNvidiaGpuName,
+            verifyAuthenticode: verifyWindowsAuthenticode,
+            runInstaller: runWindowsDriverInstaller,
+            readPendingUpdate: () => config.get().pendingDriverUpdate,
+            writePendingUpdate: (record) => {
+              config.update({ pendingDriverUpdate: record });
+            },
+            systemUptimeSeconds: () => os.uptime(),
+          },
+        }
+      : {}),
   });
   const setup = new SetupWindowModule({
     preload: path.join(here, "../preload/setup.cjs"),
@@ -191,6 +250,7 @@ async function main(): Promise<void> {
       set: (on) =>
         app.setLoginItemSettings({ openAtLogin: on, args: ["--background"] }),
     },
+    driverUpdater,
     ...(process.platform === "darwin"
       ? {
           permissions: new MacPermissions({
@@ -204,6 +264,9 @@ async function main(): Promise<void> {
           }),
         }
       : {}),
+  });
+  const language = new LanguageModule({
+    systemLanguages: () => app.getPreferredSystemLanguages(),
   });
   const status = new StatusModule();
   // Set once the bundle was swapped, so quitting relaunches the new version.
@@ -220,7 +283,7 @@ async function main(): Promise<void> {
     downloadDirectory: path.join(userData, "updates"),
     announce: (state) => {
       if (!Notification.isSupported()) return;
-      const notice = new Notification(updateNotice(state));
+      const notice = new Notification(updateNotice(state, language.t));
       notice.on("click", () => void updater.install());
       notice.show();
     },
@@ -266,6 +329,7 @@ async function main(): Promise<void> {
       start: async () => {},
       stop: async () => {},
     },
+    language,
     new EnrollmentModule({
       defaultDisplayName,
       credentials,
@@ -322,9 +386,10 @@ async function main(): Promise<void> {
     new DesktopIpcModule({
       defaultDisplayName,
       ...(desktopPermissions ? { permissions: desktopPermissions } : {}),
+      driverUpdater,
     }),
   ];
-  const host = new ModuleHost(modules, { config, log, bus: new EventBus() });
+  const host = new ModuleHost(modules, { config, log, bus });
 
   const showApp = (): void => setup.showApp();
   // The uninstaller, or setup replacing this release, asked to quit.
@@ -361,12 +426,14 @@ async function main(): Promise<void> {
     if (status.current().tone === "busy") {
       const { response } = await dialog.showMessageBox({
         type: "warning",
-        buttons: ["Quit and Stop Tasks", "Cancel"],
+        buttons: [
+          language.t(dialogMessages.quitAndStop),
+          language.t(dialogMessages.cancel),
+        ],
         defaultId: 1,
         cancelId: 1,
-        message: "Quit Linger and stop the running tasks?",
-        detail:
-          "Until you open Linger again, tasks from your phone or the web can't run on this computer.",
+        message: language.t(dialogMessages.quitConfirm),
+        detail: language.t(dialogMessages.quitConfirmDetail),
       });
       if (response !== 0) return;
     }
@@ -384,21 +451,12 @@ async function main(): Promise<void> {
     });
   } catch (error) {
     log.error("desktop.start_failed", { error: String(error) });
-    dialog.showErrorBox("Linger", `Linger failed to start: ${String(error)}`);
+    dialog.showErrorBox(
+      "Linger",
+      language.t(dialogMessages.startFailed, { error: String(error) }),
+    );
     app.exit(1);
   }
-}
-
-function markStartMenuShortcut(): void {
-  const shortcut = path.join(
-    app.getPath("appData"),
-    "Microsoft/Windows/Start Menu/Programs/Linger.lnk",
-  );
-  if (existsSync(shortcut))
-    shell.writeShortcutLink(shortcut, "update", {
-      target: process.execPath,
-      appUserModelId: APP_USER_MODEL_ID,
-    });
 }
 
 // LINGER_COMPUTER_DAEMON overrides the daemon for development. Packaged

@@ -9,10 +9,14 @@ import {
   type LocalAccountSignIn,
   type WorkspaceGrantView,
 } from "../shared/api.js";
+import { LANGUAGES } from "../i18n/language.js";
 import type { ComputerDaemonModule } from "./computer-daemon.js";
 import type { WorkspaceGrant } from "./config.js";
 import { ConnectorOAuth } from "./connector-oauth.js";
+import type { DiagnosticsModule } from "./diagnostics.js";
+import type { DriverUpdaterHost } from "./driver-updater.js";
 import type { EnrollmentModule } from "./enrollment.js";
+import type { LanguageModule } from "./language.js";
 import type { LocalServerModule } from "./local-server.js";
 import type { Module, ModuleContext } from "./modules.js";
 import { sameOrigin } from "./navigation.js";
@@ -26,10 +30,14 @@ import type { WindowManagerModule } from "./window-manager.js";
 import type { WorkspaceGrantsModule } from "./workspace-grants.js";
 
 const grantIdInput = z.string().min(1).max(128);
+const languageInput = z.enum(LANGUAGES);
 // The server address is not settable from the SPA: a page served by one
 // server must not be able to repoint the app. It changes on app://offline.
 const settingsPatchInput = z
-  .object({ displayName: z.string().min(1).max(120).optional() })
+  .object({
+    displayName: z.string().min(1).max(120).optional(),
+    preventSleep: z.boolean().optional(),
+  })
   .strict();
 
 const permissionId = z.enum(["screen_recording", "accessibility"]);
@@ -53,6 +61,22 @@ const permissionStepInput = z.discriminatedUnion("action", [
     .strict(),
 ]);
 
+const driverInstallRequestInput = z
+  .object({
+    gpuName: z.string().trim().min(1).max(200).optional(),
+    requiredCuda: z
+      .string()
+      .trim()
+      .regex(/^\d+(?:\.\d+){0,2}$/)
+      .optional(),
+    resumeModelId: z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/)
+      .optional(),
+  })
+  .strict();
+
 const view = (grant: WorkspaceGrant): WorkspaceGrantView => ({ ...grant });
 
 // The page learns what the tray shows; Install opens a release page itself,
@@ -71,21 +95,26 @@ export class DesktopIpcModule implements Module {
     "LocalServer",
     "PowerGuard",
     "ComputerDaemon",
+    "Diagnostics",
     "WindowManager",
     "WorkspaceGrants",
     "Updater",
+    "Language",
   ];
   readonly #defaultDisplayName: string;
   // Set on macOS only.
   readonly #permissions: DesktopPermissionHost | undefined;
+  readonly #driverUpdater: DriverUpdaterHost | undefined;
   readonly #unsubscribe: (() => void)[] = [];
 
   constructor(options: {
     defaultDisplayName: string;
     permissions?: DesktopPermissionHost;
+    driverUpdater?: DriverUpdaterHost;
   }) {
     this.#defaultDisplayName = options.defaultDisplayName;
     this.#permissions = options.permissions;
+    this.#driverUpdater = options.driverUpdater;
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -96,6 +125,8 @@ export class DesktopIpcModule implements Module {
     const power = ctx.get<PowerGuardModule>("PowerGuard");
     const localServer = ctx.get<LocalServerModule>("LocalServer");
     const updater = ctx.get<UpdaterModule>("Updater");
+    const language = ctx.get<LanguageModule>("Language");
+    const diagnostics = ctx.get<DiagnosticsModule>("Diagnostics");
 
     const oauth = new ConnectorOAuth();
     ipcMain.handle(IPC.connectorOAuthPrepare, (event: IpcMainInvokeEvent) => {
@@ -142,6 +173,7 @@ export class DesktopIpcModule implements Module {
       return {
         serverUrl: config.serverUrl ?? "",
         displayName: config.displayName ?? this.#defaultDisplayName,
+        preventSleep: power.alwaysOn(),
       };
     };
     const handle = (
@@ -173,16 +205,22 @@ export class DesktopIpcModule implements Module {
     });
     handle(IPC.settingsGet, () => settings());
     handle(IPC.settingsSet, (patch) => {
+      const parsed = settingsPatchInput.parse(patch);
       const before = settings().displayName;
-      ctx.config.update(settingsPatchInput.parse(patch));
-      // The daemon announces the name; a new name restarts it when idle.
-      if (settings().displayName !== before) ctx.bus.emit("computer.renamed");
+      if (parsed.displayName !== undefined) {
+        ctx.config.update({ displayName: parsed.displayName });
+        // The daemon announces the name; a new name restarts it when idle.
+        if (settings().displayName !== before) ctx.bus.emit("computer.renamed");
+      }
+      if (parsed.preventSleep !== undefined)
+        power.setAlwaysOn(parsed.preventSleep);
       return settings();
     });
 
     // The handler already checked that the caller is the window's server, so
     // only the window's server needs to be the installed one.
     handle(IPC.localAccountAvailable, () => localServer.servesWindow());
+    handle(IPC.localServerOwned, () => localServer.ownsWindow());
     handle(IPC.localAccountSignIn, async (): Promise<LocalAccountSignIn> => {
       try {
         await localServer.signInWithAccount();
@@ -195,7 +233,27 @@ export class DesktopIpcModule implements Module {
       }
     });
 
-    handle(IPC.voiceWindowShowMain, () => windows.show());
+    // The way back from the floating voice window, which stays up while the
+    // main window is minimized, hidden to the tray or behind another app.
+    // macOS brings a window forward only within the app, so the app comes
+    // forward too.
+    handle(IPC.voiceWindowShowMain, () => {
+      windows.show();
+      if (process.platform === "darwin") app.focus({ steal: true });
+    });
+    // The language picked in the page's Settings, for the shell's own text.
+    handle(IPC.languageSet, (tag) => {
+      language.choose(languageInput.parse(tag));
+    });
+    // The same save as the tray's; the page learns only whether it worked.
+    handle(IPC.diagnosticsSave, async () => {
+      try {
+        await diagnostics.save();
+      } catch (error) {
+        ctx.log.warn("ipc.diagnostics_failed", { error: String(error) });
+        throw error;
+      }
+    });
     handle(IPC.updateState, () => updateView(updater.state()));
     handle(IPC.updateInstall, () => updater.install());
     handle(IPC.updateCheck, () => updater.check());
@@ -206,20 +264,58 @@ export class DesktopIpcModule implements Module {
         runDesktopPermissionStep(permissions, permissionStepInput.parse(step)),
       );
 
+    const driverUpdater = this.#driverUpdater;
+    if (driverUpdater) {
+      handle(IPC.driverUpdateCapabilities, () => driverUpdater.capabilities());
+      handle(IPC.driverUpdateOpenNvidiaApp, () =>
+        driverUpdater.openNvidiaApp(),
+      );
+      handle(IPC.driverUpdateOpenDownload, () =>
+        driverUpdater.openOfficialDownload(),
+      );
+      handle(IPC.driverUpdateOpenGuide, () => driverUpdater.openGuide());
+      handle(IPC.driverUpdateInstallState, () => driverUpdater.installState());
+      handle(IPC.driverUpdateStartInstall, (request) =>
+        driverUpdater.startInstall(driverInstallRequestInput.parse(request)),
+      );
+      handle(IPC.driverUpdateClearState, () => {
+        driverUpdater.clearInstallState();
+      });
+    }
+
     const push = (): void => {
       windows.webContents()?.send(IPC.computerStatusEvent, status());
+    };
+    const pushSettings = (): void => {
+      windows.webContents()?.send(IPC.settingsEvent, settings());
     };
     this.#unsubscribe.push(
       ctx.bus.on("computer.connection", push),
       ctx.bus.on("runtime.state", push),
       ctx.bus.on("runtime.activity", push),
-      ctx.bus.on("power.changed", push),
+      ctx.bus.on("power.changed", () => {
+        push();
+        pushSettings();
+      }),
+      ctx.bus.on("computer.renamed", pushSettings),
       ctx.bus.on("computer.changed", push),
       ctx.bus.on("update.changed", () =>
         windows
           .webContents()
           ?.send(IPC.updateStateEvent, updateView(updater.state())),
       ),
+      ...(driverUpdater
+        ? [
+            ctx.bus.on("driver-update.changed", () =>
+              windows
+                .webContents()
+                ?.send(
+                  IPC.driverUpdateInstallStateEvent,
+                  driverUpdater.installState(),
+                ),
+            ),
+          ]
+        : []),
     );
   }
 

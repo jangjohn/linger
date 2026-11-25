@@ -133,7 +133,7 @@ export function useRoomChatNavigation(
           activityRoomId,
           anchorMessageId: sourceMessageId,
           actorId: agent.id,
-          title: `Activity · ${agent.display_name}`,
+          title: agent.display_name,
         });
         clearProfileParam();
       },
@@ -145,7 +145,7 @@ export function useRoomChatNavigation(
           kind: "agentActivity",
           actorId: agent.id,
           activityRoomId,
-          title: `Activity · ${agent.display_name}`,
+          title: agent.display_name,
         });
         clearProfileParam();
       },
@@ -153,7 +153,7 @@ export function useRoomChatNavigation(
         openPanelTab({
           kind: "agentInfo",
           actorId: actor.id,
-          title: `Agent · ${actor.display_name}`,
+          title: actor.display_name,
         });
         clearProfileParam();
       },

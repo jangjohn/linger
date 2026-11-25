@@ -1,6 +1,9 @@
 import { useEffect } from "react";
 
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { useT } from "@/i18n/use-translation";
+
+import { connectorMessages as m } from "./connectors.messages";
 
 export const OAUTH_COMPLETE_PATH = "/oauth/composio-complete";
 
@@ -9,6 +12,7 @@ const COMPLETE_WAIT_MS = 3000;
 
 export function OAuthCompletePage() {
   const { client } = useTeamHubRuntime();
+  const t = useT();
 
   useEffect(() => {
     // TeamHub checks the account with Composio; returning here is never
@@ -33,9 +37,9 @@ export function OAuthCompletePage() {
   return (
     <main className="flex min-h-dvh items-center justify-center bg-background px-6 text-center text-foreground">
       <div className="max-w-md">
-        <h1 className="text-lg">Authorization complete</h1>
+        <h1 className="text-lg">{t(m.authorizationComplete)}</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          You can close this window.
+          {t(m.canCloseWindow)}
         </p>
       </div>
     </main>

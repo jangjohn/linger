@@ -49,6 +49,7 @@ import {
 import type { ReplyRhythmSettings } from "../../../src/agent/agent-features/reply-rhythm/types.js";
 import { renderAcceptedNotification } from "../../../src/agent/prompt/accepted-notification.js";
 import { RunLoop } from "../../../src/agent/executor/run-loop.js";
+import { runPriorities } from "../../../src/model-tasks.js";
 import type {
   ToolRunContext,
   Message,
@@ -96,14 +97,10 @@ describe("RunLoop", () => {
       if (input.type === "text") {
         expect(input.text.includes("new native session")).toBe(expected);
         if (expected) {
-          expect(input.text).toContain("teamhub message read without a target");
-          expect(input.text).toContain("teamhub message read --thread <id>");
-          expect(input.text).toContain("task:, meta: and taskmeta:");
-          expect(input.text).toContain("--inbox <exact-inbox-id>");
+          expect(input.text).toContain("teamhub message read");
           expect(input.text).not.toContain("--room");
-          expect(input.text).toContain("latest relevant human decision");
           expect(input.text).toContain("room:room-1");
-          expect(input.text).toContain("Do not replay");
+          expect(input.text).toContain("do not replay");
         }
       }
       run.complete("done");
@@ -310,7 +307,7 @@ describe("RunLoop", () => {
   describe("Room reply delivery", () => {
     const messageWrite = (
       id: string,
-      outcome: "succeeded" | "failed",
+      outcome?: "succeeded" | "failed" | "canceled" | "declined",
     ): RunEvent[] => [
       {
         type: "activity.started",
@@ -318,7 +315,9 @@ describe("RunLoop", () => {
         kind: "message",
         title: "bash",
       },
-      { type: "activity.finished", activityId: id, outcome },
+      ...(outcome
+        ? [{ type: "activity.finished" as const, activityId: id, outcome }]
+        : []),
     ];
     const failedRead: RunEvent[] = [
       {
@@ -375,70 +374,6 @@ describe("RunLoop", () => {
       }
     };
 
-    it("fails a Room Run whose every message write failed as reply_undelivered", async () => {
-      const { log, run } = await finishRun([
-        ...messageWrite("send-1", "failed"),
-        ...failedRead,
-        ...messageWrite("send-2", "failed"),
-      ]);
-
-      expect(run).toMatchObject({
-        status: "failed",
-        terminal: {
-          type: "failed",
-          failure: { code: "reply_undelivered", runtime_type: "pi" },
-        },
-      });
-      expect(JSON.stringify(run?.terminal)).not.toContain("404");
-      expect(log).toHaveBeenCalledWith(
-        "warn",
-        "local_run.teamhub_messages_failed",
-        expect.objectContaining({
-          runId: run?.runId,
-          failedMessageWrites: 2,
-          deliveredMessageWrites: 0,
-          failedMessageReads: 1,
-          replyUndelivered: true,
-        }),
-      );
-    });
-
-    it("keeps a Room Run succeeded when a later message write was delivered", async () => {
-      const { log, run } = await finishRun([
-        ...messageWrite("send-1", "failed"),
-        ...messageWrite("send-2", "succeeded"),
-      ]);
-
-      expect(run).toMatchObject({
-        status: "succeeded",
-        terminal: { type: "succeeded" },
-      });
-      expect(log).toHaveBeenCalledWith(
-        "warn",
-        "local_run.teamhub_messages_failed",
-        expect.objectContaining({
-          failedMessageWrites: 1,
-          deliveredMessageWrites: 1,
-          replyUndelivered: false,
-        }),
-      );
-    });
-
-    it("keeps a Room Run succeeded when the Agent chose not to reply", async () => {
-      const { log, run } = await finishRun(failedRead);
-
-      expect(run?.terminal).toMatchObject({ type: "succeeded" });
-      expect(log).toHaveBeenCalledWith(
-        "warn",
-        "local_run.teamhub_messages_failed",
-        expect.objectContaining({
-          failedMessageWrites: 0,
-          failedMessageReads: 1,
-          replyUndelivered: false,
-        }),
-      );
-    });
-
     // TeamHub freezes each Inbox Message's sender, kind and whether it
     // mentioned this Agent into the queued input.
     const inboxInput = (
@@ -473,6 +408,130 @@ describe("RunLoop", () => {
         messageKind: "conversation",
         mentioned: true,
       });
+
+    it("fails a Room Run whose every message write failed while a Human waits as reply_undelivered", async () => {
+      const { log, run } = await finishRun(
+        [
+          ...messageWrite("send-1", "failed"),
+          ...failedRead,
+          ...messageWrite("send-2", "failed"),
+        ],
+        undefined,
+        humanMention("mention"),
+      );
+
+      expect(run).toMatchObject({
+        status: "failed",
+        terminal: {
+          type: "failed",
+          failure: { code: "reply_undelivered", runtime_type: "pi" },
+        },
+      });
+      expect(JSON.stringify(run?.terminal)).not.toContain("404");
+      expect(log).toHaveBeenCalledWith(
+        "warn",
+        "local_run.teamhub_messages_failed",
+        expect.objectContaining({
+          runId: run?.runId,
+          failedMessageWrites: 2,
+          deliveredMessageWrites: 0,
+          failedMessageReads: 1,
+          replyUndelivered: true,
+        }),
+      );
+    });
+
+    it("keeps a Room Run succeeded when a later message write was delivered", async () => {
+      const { log, run } = await finishRun(
+        [
+          ...messageWrite("send-1", "failed"),
+          ...messageWrite("send-2", "succeeded"),
+        ],
+        undefined,
+        humanMention("mention"),
+      );
+
+      expect(run).toMatchObject({
+        status: "succeeded",
+        terminal: { type: "succeeded" },
+      });
+      expect(log).toHaveBeenCalledWith(
+        "warn",
+        "local_run.teamhub_messages_failed",
+        expect.objectContaining({
+          failedMessageWrites: 1,
+          deliveredMessageWrites: 1,
+          replyUndelivered: false,
+        }),
+      );
+    });
+
+    it("keeps a Room Run succeeded when the Agent chose not to reply", async () => {
+      const { log, run } = await finishRun(failedRead);
+
+      expect(run?.terminal).toMatchObject({ type: "succeeded" });
+      expect(log).toHaveBeenCalledWith(
+        "warn",
+        "local_run.teamhub_messages_failed",
+        expect.objectContaining({
+          failedMessageWrites: 0,
+          failedMessageReads: 1,
+          replyUndelivered: false,
+        }),
+      );
+    });
+
+    it("keeps a Room Run succeeded when message writes failed without a waiting Human mention", async () => {
+      const { log, run } = await finishRun(
+        messageWrite("send-1", "failed"),
+        undefined,
+        inboxInput("room-talk", {
+          authorType: "user",
+          messageKind: "conversation",
+          mentioned: false,
+        }),
+      );
+
+      expect(run).toMatchObject({
+        status: "succeeded",
+        terminal: { type: "succeeded" },
+      });
+      expect(log).toHaveBeenCalledWith(
+        "warn",
+        "local_run.teamhub_messages_failed",
+        expect.objectContaining({
+          failedMessageWrites: 1,
+          deliveredMessageWrites: 0,
+          replyUndelivered: false,
+        }),
+      );
+    });
+
+    it("fails a Room Run as reply_not_sent when a Human waits and a started message write never completed or failed", async () => {
+      const { log, run } = await finishRun(
+        messageWrite("send-1", "canceled"),
+        undefined,
+        humanMention("mention"),
+        "Private scratch.",
+      );
+
+      expect(run).toMatchObject({
+        status: "failed",
+        terminal: {
+          type: "failed",
+          failure: { code: "reply_not_sent", runtime_type: "pi" },
+        },
+      });
+      expect(log).toHaveBeenCalledWith(
+        "warn",
+        "local_run.reply_not_sent",
+        expect.objectContaining({
+          runId: run?.runId,
+          failedMessageWrites: 0,
+          deliveredMessageWrites: 0,
+        }),
+      );
+    });
 
     it("fails a Room Run that posted nothing while the Human who mentioned the Agent waits", async () => {
       const { log, run } = await finishRun(
@@ -1267,6 +1326,287 @@ describe("RunLoop", () => {
     ).resolves.toBeUndefined();
     expect(harness.state.getLocalRun(secondId)?.status).toBe("succeeded");
     expect(harness.provider.starts).toHaveLength(2);
+    harness.state.close();
+  });
+
+  it("preempts a waiting Meta Run when a chat arrives, runs the chat first, and resumes without an interruption reminder", async () => {
+    const harness = createHarness();
+    const placeGate = deferred<void>();
+    harness.provider.placeGate = placeGate;
+    const chatRun = new FakeRun();
+    const followUpRun = new FakeRun();
+    harness.provider.runs.push(chatRun, followUpRun);
+    const followUpId = enqueue(
+      harness.state,
+      message("follow-up", "room:room-1"),
+    );
+
+    harness.execution.start();
+    await vi.waitFor(() => expect(harness.provider.starts).toHaveLength(1));
+    expect(harness.provider.starts[0]!.spec.priority?.value).toBe(
+      runPriorities.follow_up,
+    );
+
+    // Only the initial wait blocks; subsequent starts admit immediately.
+    harness.provider.placeGate = undefined;
+    // TeamHub queues the chat over the network; the Run must not be claimed
+    // again before it is queued, or the older Run would be claimed first.
+    const chatQueued = deferred<void>();
+    const enqueueSteer = harness.state.enqueueSteer.bind(harness.state);
+    const requeue = vi.spyOn(harness.state, "requeueLocalRun");
+    const statePort: ContextRuntimeStatePort = harness.state;
+    vi.spyOn(statePort, "enqueueSteer").mockImplementation(
+      async (groupId, messages) => {
+        await chatQueued.promise;
+        return enqueueSteer(groupId, messages);
+      },
+    );
+    const steer = selectSteer(
+      harness.state,
+      chatMessage("preempt-chat", "thread:thread-1"),
+    );
+    const steering = harness.execution.steer(
+      steer.groupId,
+      steer.messages,
+      new AbortController().signal,
+      "thread:thread-1",
+    );
+    await vi.waitFor(() => expect(requeue).toHaveBeenCalledWith(followUpId));
+    await settleAsyncWork();
+    expect(harness.provider.starts).toHaveLength(1);
+    chatQueued.resolve();
+    await steering;
+
+    await vi.waitFor(() => expect(chatRun.waitCalls).toBe(1));
+    expect(harness.provider.starts).toHaveLength(2);
+    expect(harness.provider.starts[1]!.spec.priority?.value).toBe(
+      runPriorities.chat,
+    );
+    expect(harness.provider.starts[1]!.input).toMatchObject({
+      type: "text",
+      text: "preempt-chat",
+    });
+    expect(harness.state.getLocalRun(followUpId)?.status).toBe("queued");
+    expect(
+      harness.log.mock.calls.some(
+        (call) =>
+          call[1] === "local_run.preempted" &&
+          call[2]?.runId === followUpId &&
+          call[2]?.yielded === false,
+      ),
+    ).toBe(true);
+
+    chatRun.complete("chat answered");
+    await vi.waitFor(() => expect(followUpRun.waitCalls).toBe(1));
+    expect(harness.provider.starts).toHaveLength(3);
+    expect(harness.provider.starts[2]!.input).toMatchObject({
+      type: "text",
+      text: expect.not.stringContaining("earlier attempt"),
+    });
+    followUpRun.complete("follow-up done");
+    await vi.waitFor(() =>
+      expect(harness.state.getLocalRun(followUpId)?.status).toBe("succeeded"),
+    );
+    await harness.execution.drain({ cancelActive: false });
+    harness.state.close();
+  });
+
+  it("preempts a yielded Meta Run waiting to resume and reminds it on re-claim", async () => {
+    const harness = createHarness();
+    const first = new FakeRun();
+    const chatRun = new FakeRun();
+    const resumed = new FakeRun();
+    harness.provider.runs.push(first);
+    const followUpId = enqueue(
+      harness.state,
+      message("routine-work", "room:room-1"),
+    );
+
+    harness.execution.start();
+    await vi.waitFor(() => expect(first.waitCalls).toBe(1));
+
+    const placeGate = deferred<void>();
+    harness.provider.placeGate = placeGate;
+    first.fail(new ProviderRunYieldedError({ threadId: "thread-1" }));
+    await vi.waitFor(() => expect(harness.provider.starts).toHaveLength(2));
+    expect(harness.provider.starts[1]!.spec.beforeYieldResume).toBeDefined();
+
+    harness.provider.placeGate = undefined;
+    harness.provider.runs.push(chatRun, resumed);
+    const steer = selectSteer(
+      harness.state,
+      chatMessage("chat-after-yield", "room:room-1"),
+    );
+    await harness.execution.steer(
+      steer.groupId,
+      steer.messages,
+      new AbortController().signal,
+      "room:room-1",
+    );
+
+    await vi.waitFor(() => expect(chatRun.waitCalls).toBe(1));
+    expect(harness.state.getLocalRun(followUpId)?.status).toBe("queued");
+    expect(
+      harness.log.mock.calls.some(
+        (call) =>
+          call[1] === "local_run.preempted" &&
+          call[2]?.runId === followUpId &&
+          call[2]?.yielded === true,
+      ),
+    ).toBe(true);
+
+    chatRun.complete("answered");
+    await vi.waitFor(() => expect(resumed.waitCalls).toBe(1));
+    expect(harness.provider.starts[3]!.input).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("a more urgent request went first"),
+    });
+    resumed.complete("finished");
+    await vi.waitFor(() =>
+      expect(harness.state.getLocalRun(followUpId)?.status).toBe("succeeded"),
+    );
+    await harness.execution.drain({ cancelActive: false });
+    harness.state.close();
+  });
+
+  it("steers a chat into a Meta Run whose start already reached the Runtime, raises its priority, and keeps a later yield unpreempted", async () => {
+    const harness = createHarness();
+    const providerStart = deferred<AgentRun>();
+    harness.provider.startGate = providerStart;
+    const runId = enqueue(harness.state, message("follow-up", "room:room-1"));
+
+    harness.execution.start();
+    await vi.waitFor(() => expect(harness.provider.starts).toHaveLength(1));
+    const priority = harness.provider.starts[0]!.spec.priority!;
+    const steer = selectSteer(
+      harness.state,
+      chatMessage("steered-chat", "thread:thread-1"),
+    );
+    const steering = harness.execution.steer(
+      steer.groupId,
+      steer.messages,
+      new AbortController().signal,
+      "thread:thread-1",
+    );
+    expect(harness.provider.starts[0]!.spec.preemptSignal?.aborted).toBe(true);
+
+    // The start had already been sent, so it activates instead of rejecting.
+    const run = new FakeRun();
+    harness.provider.startGate = undefined;
+    providerStart.resolve(run);
+    await steering;
+
+    expect(priority.value).toBe(runPriorities.chat);
+    expect(harness.provider.steers).toHaveLength(1);
+    expect(harness.state.getSteerOutcome("steered-chat")).toBe("applied");
+    expect(harness.execution.activeSourceInboxIds()).toEqual([
+      "room:room-1",
+      "thread:thread-1",
+    ]);
+
+    // A later yield must not inherit the earlier aborted preemption signal:
+    // the Run resumes in its Operation instead of going back to the queue.
+    const resumed = new FakeRun();
+    harness.provider.runs.push(resumed);
+    run.fail(new ProviderRunYieldedError({ threadId: "thread-1" }));
+    await vi.waitFor(() => expect(resumed.waitCalls).toBe(1));
+    expect(harness.provider.starts[1]).toMatchObject({
+      input: { text: "Continue on this task." },
+      spec: { runContext: { executionRunRef: runId } },
+    });
+    expect(harness.provider.starts[1]!.spec.preemptSignal?.aborted).toBe(false);
+    expect(
+      harness.log.mock.calls.some((call) => call[1] === "local_run.preempted"),
+    ).toBe(false);
+    resumed.complete("done");
+    await vi.waitFor(() =>
+      expect(harness.state.getLocalRun(runId)?.status).toBe("succeeded"),
+    );
+    await harness.execution.drain({ cancelActive: false });
+    harness.state.close();
+  });
+
+  it("steers a Meta chat from another Inbox into a running Run while non-chat from another Inbox still enqueues", async () => {
+    const harness = createHarness();
+    const first = new FakeRun();
+    const second = new FakeRun();
+    harness.provider.runs.push(first, second);
+    enqueue(harness.state, message("follow-up", "room:room-1"));
+
+    harness.execution.start();
+    await vi.waitFor(() => expect(first.waitCalls).toBe(1));
+    const priority = harness.provider.starts[0]!.spec.priority!;
+    expect(priority.value).toBe(runPriorities.follow_up);
+
+    const otherInboxFollowUp = selectSteer(
+      harness.state,
+      message("other-followup", "thread:thread-1"),
+    );
+    await harness.execution.steer(
+      otherInboxFollowUp.groupId,
+      otherInboxFollowUp.messages,
+      new AbortController().signal,
+      "thread:thread-1",
+    );
+    expect(harness.provider.steers).toHaveLength(0);
+    expect(harness.state.hasQueuedRuns()).toBe(true);
+    expect(priority.value).toBe(runPriorities.follow_up);
+
+    const otherInboxChat = selectSteer(
+      harness.state,
+      chatMessage("urgent-chat", "thread:thread-2"),
+    );
+    await harness.execution.steer(
+      otherInboxChat.groupId,
+      otherInboxChat.messages,
+      new AbortController().signal,
+      "thread:thread-2",
+    );
+    expect(priority.value).toBe(runPriorities.chat);
+    expect(harness.provider.steers).toHaveLength(1);
+    expect(harness.state.getSteerOutcome("urgent-chat")).toBe("applied");
+    expect(harness.execution.activeSourceInboxIds()).toEqual([
+      "room:room-1",
+      "thread:thread-2",
+    ]);
+
+    first.complete("answered chat and follow-up");
+    await vi.waitFor(() => expect(second.waitCalls).toBe(1));
+    second.complete("other follow-up done");
+    await harness.execution.drain({ cancelActive: false });
+    harness.state.close();
+  });
+
+  it("keeps a Task Run at Task priority whatever reaches it", async () => {
+    const harness = createHarness(undefined, undefined, undefined, undefined, {
+      kind: "alter_ego",
+      agentId: "agent-1",
+      taskId: "task-1",
+    });
+    const providerStart = deferred<AgentRun>();
+    harness.provider.startGate = providerStart;
+    const queuedMetaKind = vi.fn(async () => "chat" as const);
+    Object.assign(harness.state, { queuedMetaKind });
+    enqueue(harness.state, message("task-input", "task:task-1"));
+    harness.execution.start();
+    await vi.waitFor(() => expect(harness.provider.starts).toHaveLength(1));
+    const priority = harness.provider.starts[0]!.spec.priority!;
+    expect(priority.value).toBe(runPriorities.task);
+    enqueue(harness.state, chatMessage("queued-chat"));
+    harness.execution.notifyWorkAvailable({ workStateAlreadyFresh: true });
+    const steer = selectSteer(harness.state, chatMessage("steered-chat"));
+    const steering = harness.execution.steer(
+      steer.groupId,
+      steer.messages,
+      new AbortController().signal,
+    );
+    expect(priority.value).toBe(runPriorities.task);
+    expect(queuedMetaKind).not.toHaveBeenCalled();
+    const run = new FakeRun();
+    providerStart.resolve(run);
+    await steering;
+    run.complete("done");
+    await harness.execution.drain({ cancelActive: false });
     harness.state.close();
   });
 
@@ -4023,6 +4363,7 @@ class FakeProvider implements AgentProvider {
   }> = [];
   readonly steers: Array<{ run: AgentRun; options: ProviderSteerOptions }> = [];
   readonly startErrors: Error[] = [];
+  placeGate: Deferred<void> | undefined;
   startGate: Deferred<AgentRun> | undefined;
   steerGate: Deferred<void> | undefined;
   steerError: Error | undefined;
@@ -4058,6 +4399,33 @@ class FakeProvider implements AgentProvider {
     }
     const startError = this.startErrors.shift();
     if (startError) throw startError;
+    if (this.placeGate) {
+      const gate = this.placeGate;
+      const waitSignal = spec.preemptSignal
+        ? AbortSignal.any([
+            ...(spec.signal ? [spec.signal] : []),
+            spec.preemptSignal,
+          ])
+        : spec.signal;
+      await new Promise<void>((resolve, reject) => {
+        if (waitSignal?.aborted) {
+          reject(waitSignal.reason);
+          return;
+        }
+        const onAbort = () => reject(waitSignal!.reason);
+        waitSignal?.addEventListener("abort", onAbort, { once: true });
+        void gate.promise.then(
+          () => {
+            waitSignal?.removeEventListener("abort", onAbort);
+            resolve();
+          },
+          (error) => {
+            waitSignal?.removeEventListener("abort", onAbort);
+            reject(error);
+          },
+        );
+      });
+    }
     if (this.startGate) return await this.startGate.promise;
     const run = this.runs.shift();
     if (!run) throw new Error("Fake provider has no queued Run");
@@ -4210,6 +4578,26 @@ const enqueue = (state: ContextRuntimeState, value: Message): string =>
 
 const selectSteer = (state: ContextRuntimeState, value: Message) =>
   state.openSteerGroup([value]);
+
+/** A Human's Room Message as its Inbox notification. */
+const chatMessage = (messageId: string, inboxId = "room:room-1"): Message =>
+  ({
+    ...message(messageId, inboxId),
+    acceptedNotification: {
+      inboxId,
+      after: "0",
+      through: "1",
+      messages: [
+        {
+          id: `${messageId}-message`,
+          body: "are you there?",
+          author: "Leo",
+          authorType: "user",
+          messageKind: "conversation",
+        },
+      ],
+    },
+  }) as Message;
 
 const message = (
   messageId: string,

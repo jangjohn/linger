@@ -9,6 +9,7 @@ import {
   speakerIdFromOneBased,
 } from "./asr.js";
 import { ASREventQueue } from "./event-queue.js";
+import { providerAgent, type ProviderProxy } from "./provider-proxy.js";
 import { RecoveringASRStream, type ASRRecovery } from "./recovering-asr.js";
 import { VoiceFailure } from "./voice-failure.js";
 
@@ -23,6 +24,7 @@ export interface SonioxASRConfig {
   webSocketUrl?: string;
   diarization?: boolean;
   dictation?: boolean;
+  proxy?: ProviderProxy;
   onRecovery?: (recovery: ASRRecovery) => void;
 }
 
@@ -33,6 +35,17 @@ interface SonioxToken {
   end_ms?: number;
   speaker?: number | string;
 }
+
+// Soniox's error_code is the HTTP status of the error. These three ask the
+// person to act on their Soniox account, so each has its own failure code.
+// The key goes with the connection, so Soniox may refuse it on the handshake
+// with the same statuses. A proxy cannot answer inside the TLS tunnel; its
+// own refusal is ERR_PROXY_TUNNEL.
+const sonioxAccountFailures: Partial<Record<number, string>> = {
+  401: "asr_auth_rejected",
+  402: "asr_balance_exhausted",
+  403: "asr_permission_denied",
+};
 
 interface SonioxMessage {
   error_code?: number | string;
@@ -61,15 +74,15 @@ export class SonioxASRProvider implements ASRProvider {
   }
 }
 
+// The key is not in this start request: it goes with the connection, the
+// only way Soniox accepts from 2027-01-15.
 export function sonioxRealtimeSessionConfig(config: {
-  apiKey: string;
   model: string;
   languageHints?: string[];
   diarization?: boolean;
   dictation?: boolean;
 }) {
   return {
-    api_key: config.apiKey,
     model: config.model,
     audio_format: "pcm_s16le",
     sample_rate: 16000,
@@ -170,10 +183,14 @@ export class SonioxASRStream implements ASRStream {
     config: SonioxASRConfig,
     signal: AbortSignal,
   ): Promise<SonioxASRStream> {
-    const socket = new WebSocket(
-      config.webSocketUrl ?? sonioxRealtimeWebSocketUrl,
-      { signal, handshakeTimeout: 5_000, maxPayload: 1 << 20 },
-    );
+    const url = config.webSocketUrl ?? sonioxRealtimeWebSocketUrl;
+    const socket = new WebSocket(url, {
+      signal,
+      handshakeTimeout: 5_000,
+      maxPayload: 1 << 20,
+      headers: { Authorization: `Bearer ${config.apiKey}` },
+      agent: providerAgent(url, config.proxy),
+    });
     const stream = new SonioxASRStream(
       socket,
       config.dictation === true,
@@ -192,7 +209,7 @@ export class SonioxASRStream implements ASRStream {
             status >= 100 &&
             status <= 599
             ? new VoiceFailure(
-                `asr_http_${status}`,
+                sonioxAccountFailures[status] ?? `asr_http_${status}`,
                 `Soniox ASR handshake returned HTTP ${status}`,
               )
             : new Error("Soniox ASR handshake returned an invalid status"),
@@ -204,7 +221,6 @@ export class SonioxASRStream implements ASRStream {
     await stream.write(
       JSON.stringify(
         sonioxRealtimeSessionConfig({
-          apiKey: config.apiKey,
           model: config.model,
           languageHints: config.languageHints,
           diarization: config.diarization,
@@ -327,7 +343,11 @@ export class SonioxASRStream implements ASRStream {
     if (payload.error_code !== undefined && payload.error_code !== null) {
       const message = `Soniox ASR rejected the stream with code ${payload.error_code}`;
       throw /^[0-9]{1,10}$/.test(String(payload.error_code))
-        ? new VoiceFailure(`asr_provider_${payload.error_code}`, message)
+        ? new VoiceFailure(
+            sonioxAccountFailures[Number(payload.error_code)] ??
+              `asr_provider_${payload.error_code}`,
+            message,
+          )
         : new Error(message);
     }
     const processedMs = Math.max(

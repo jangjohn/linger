@@ -21,6 +21,10 @@ type piRuntime struct{ profile Profile }
 
 func newPiRuntime(profile Profile) Runtime { return &piRuntime{profile: profile} }
 
+// ErrPiUnsupportedEffort reports that a requested reasoning effort is outside
+// Pi's supported --thinking vocabulary.
+var ErrPiUnsupportedEffort = errors.New("Pi reasoning effort is unsupported")
+
 // piThinkingLevel maps a product effort to Pi's --thinking value. An empty
 // effort leaves Pi's own level in place.
 func piThinkingLevel(effort string) (string, error) {
@@ -32,7 +36,7 @@ func piThinkingLevel(effort string) (string, error) {
 	case "off", "minimal", "low", "medium", "high", "xhigh", "max":
 		return effort, nil
 	}
-	return "", fmt.Errorf("Pi reasoning effort %q is unsupported", effort)
+	return "", fmt.Errorf("%w: %q", ErrPiUnsupportedEffort, effort)
 }
 
 // piLaunchPlan is everything Start resolved before it takes or spawns a
@@ -47,11 +51,12 @@ type piLaunchPlan struct {
 	fence      releaseFence
 	shape      *piShape // nil when the process may not park
 	targets    map[string]string
+	canSyncMCP bool
 }
 
 func (p *piRuntime) Start(ctx context.Context, prompt string, spec RunSpec) (*Run, error) {
 	spec.MCPServers = mcpNamespace(spec.MCPServers)
-	if strings.TrimSpace(prompt) == "" {
+	if !spec.providerPrepare() && strings.TrimSpace(prompt) == "" {
 		return nil, errors.New("Pi requires a non-empty prompt")
 	}
 	if len(spec.ComputerArgs) > 0 || len(spec.AgentArgs) > 0 {
@@ -73,19 +78,23 @@ func (p *piRuntime) Start(ctx context.Context, prompt string, spec RunSpec) (*Ru
 	if plan.program, err = piResolveProgram(p.profile.Program); err != nil {
 		return nil, err
 	}
+	if spec.providerPrepare() {
+		return p.prestart(ctx, root, plan)
+	}
 	mcpShape, targets, eligible := residentMCPShape(spec.MCPServers)
 	if eligible && piResidents.enabled() {
 		plan.targets = targets
-		plan.shape, err = piShapeFor(plan.program, p.args(plan, piInstructionsName, len(targets) > 0), p.profile, spec, mcpShape)
+		plan.canSyncMCP = p.canSyncMCP()
+		plan.shape, err = piShapeFor(plan.program, p.args(plan, piInstructionsName, len(targets) > 0 || plan.canSyncMCP), p.profile, spec, mcpShape)
 		if err != nil {
 			return nil, err
 		}
-		proc, _, err := piResidents.take(plan.sessionDir, piMismatch(plan.shape, spec), p.profile.Logger, spec.Readiness)
+		proc, adopted, err := piResidents.take(plan.sessionDir, piMismatch(plan.shape, spec), p.profile.Logger, spec.Readiness)
 		if err != nil {
 			return nil, err
 		}
 		if proc != nil {
-			run, stale, err := p.reuse(ctx, proc, plan)
+			run, stale, err := p.reuse(ctx, proc, plan, adopted)
 			if err != nil || !stale {
 				return run, err
 			}
@@ -113,11 +122,14 @@ func (p *piRuntime) Start(ctx context.Context, prompt string, spec RunSpec) (*Ru
 }
 
 // reuse runs a turn on a process taken from the table. stale means the
-// probe refused the process and the caller spawns instead.
-func (p *piRuntime) reuse(ctx context.Context, proc *piProcess, plan piLaunchPlan) (run *Run, stale bool, err error) {
+// probe or MCP attachment refused the process and the caller spawns instead.
+func (p *piRuntime) reuse(ctx context.Context, proc *piProcess, plan piLaunchPlan, adopted bool) (run *Run, stale bool, err error) {
 	runCtx, cancel := budgetContext(ctx, plan.spec.Budget)
+	proc.mu.Lock()
+	validateTranscript := !(adopted && proc.prestartCreated)
+	proc.mu.Unlock()
 	probeCtx, probeCancel := context.WithTimeout(runCtx, piProbeBudget)
-	err = proc.probeIdle(probeCtx)
+	err = proc.probeIdleWithTranscript(probeCtx, validateTranscript)
 	probeCancel()
 	if err != nil {
 		cancel()
@@ -133,18 +145,46 @@ func (p *piRuntime) reuse(ctx context.Context, proc *piProcess, plan piLaunchPla
 		}
 		return nil, true, nil
 	}
+	if proc.shape == nil || proc.shape.mcp != plan.shape.mcp {
+		attachCtx, attachCancel := context.WithTimeout(runCtx, piAttachBudget)
+		err = p.attach(attachCtx, proc, plan)
+		attachCancel()
+		if err != nil {
+			cancel()
+			if ctx.Err() == nil {
+				if p.profile.Logger != nil {
+					p.profile.Logger.Warn("Pi process attachment failed", "pid", proc.pid, "adopted", adopted, "error", err)
+				}
+				piResidents.note(proc.res.loggerOr(p.profile.Logger), proc, "recycled", "attach_failed", nil, false)
+				plan.spec.Readiness.recycled("attach_failed", nil)
+			}
+			if !piResidents.retire(proc) {
+				return nil, false, errResidentRecycleUnconfirmed
+			}
+			if ctx.Err() != nil {
+				return nil, false, ctx.Err()
+			}
+			return nil, true, nil
+		}
+	} else if proc.front != nil {
+		if err := proc.front.Bind(plan.targets); err != nil {
+			cancel()
+			piResidents.retire(proc)
+			return nil, false, err
+		}
+	}
+	proc.mu.Lock()
+	proc.prestartCreated = false
+	proc.mu.Unlock()
 	fail := func(err error) (*Run, bool, error) {
 		cancel()
 		piResidents.retire(proc)
 		return nil, false, err
 	}
-	if proc.front != nil {
-		if err := proc.front.Bind(plan.targets); err != nil {
-			return fail(err)
-		}
-	}
 	turn := newPiTurn(runCtx, cancel, proc, true, plan.fence, p.profile.Logger)
 	turn.readiness = plan.spec.Readiness
+	turn.reviewer, turn.dir = plan.spec.PermissionReviewer, plan.spec.Dir
+	turn.stopHook = plan.spec.StopHook
 	if err := proc.bind(turn); err != nil {
 		return fail(err)
 	}
@@ -152,9 +192,9 @@ func (p *piRuntime) reuse(ctx context.Context, proc *piProcess, plan piLaunchPla
 	return turn.run(), false, nil
 }
 
-// spawn launches a fresh Pi process for the turn. lock is already held;
-// until the process runs, every failure releases what was acquired.
-func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File) (*Run, error) {
+// launchProcess starts one Pi RPC child for plan. lock is already held;
+// until the process launches, every failure releases what was acquired.
+func (p *piRuntime) launchProcess(plan piLaunchPlan, lock *os.File) (*piProcess, error) {
 	var (
 		front       *mcpFront
 		mcp         piMCPWiring
@@ -174,9 +214,9 @@ func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File)
 	}()
 	spec := plan.spec
 	instructions := ""
-	if spec.AppendPrompt != "" {
+	if spec.SystemPrompt != "" {
 		instructions = filepath.Join(plan.sessionDir, piInstructionsName)
-		if err := piWritePrivate(instructions, []byte(spec.AppendPrompt)); err != nil {
+		if err := piWritePrivate(instructions, []byte(spec.SystemPrompt)); err != nil {
 			return nil, fmt.Errorf("Pi instructions could not be written: %w", err)
 		}
 	}
@@ -197,6 +237,16 @@ func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File)
 	if mcp, err = piPrepareMCP(config, p.profile.ManagedMCPExtension, plan.sessionDir); err != nil {
 		return nil, err
 	}
+	if !mcp.wired() && plan.canSyncMCP {
+		if mcp, err = piPrepareEmptyMCP(p.profile.ManagedMCPExtension, plan.sessionDir); err != nil {
+			return nil, err
+		}
+	}
+	if spec.PermissionReviewer != nil {
+		if err := piCheckExtension(p.profile.ManagedMCPExtension); err != nil {
+			return nil, err
+		}
+	}
 	// The session flags sit right after "--mode rpc".
 	tail := p.args(plan, instructions, mcp.wired())
 	args := append([]string{tail[0], tail[1], "--session-dir", plan.sessionDir, "--session-id", plan.sessionID}, tail[2:]...)
@@ -206,7 +256,12 @@ func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File)
 	}
 	if mcp.wired() {
 		env[piMCPConfigEnvKey] = mcp.configPath
-		piExtensionNodePath(env, mcp.extension)
+	}
+	if mcp.wired() || spec.PermissionReviewer != nil || p.guardsShellText(spec) {
+		piExtensionNodePath(env, p.profile.ManagedMCPExtension)
+	}
+	if p.guardsShellText(spec) {
+		env[piShellTextHookEnvKey] = spec.ShellTextHook
 	}
 	if p.profile.RetainProcessTemp != nil {
 		if releaseTemp, err = p.profile.RetainProcessTemp(); err != nil {
@@ -226,11 +281,25 @@ func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File)
 	proc.cancel = procCancel
 	proc.sessionID, proc.sessionDir, proc.contextDir = plan.sessionID, plan.sessionDir, spec.Dir
 	proc.shape, proc.lock, proc.mcp, proc.front, proc.releaseTemp = plan.shape, lock, mcp, front, releaseTemp
+	proc.canSyncMCP = plan.canSyncMCP
 	proc.res.bind(plan.sessionDir, p.profile)
+	return proc, nil
+}
 
+// spawn launches a fresh Pi process for the turn. lock is already held;
+// until the process runs, every failure releases what was acquired.
+func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File) (*Run, error) {
+	proc, err := p.launchProcess(plan, lock)
+	if err != nil {
+		return nil, err
+	}
+	spec := plan.spec
 	runCtx, cancel := budgetContext(ctx, spec.Budget)
 	turn := newPiTurn(runCtx, cancel, proc, false, plan.fence, p.profile.Logger)
+	turn.requestedThinking = plan.thinking
 	turn.readiness = plan.spec.Readiness
+	turn.reviewer, turn.dir = spec.PermissionReviewer, spec.Dir
+	turn.stopHook = plan.spec.StopHook
 	spec.Readiness.spawned()
 	spec.Readiness.session(spec.ResumeID != "")
 	_ = proc.bind(turn)
@@ -245,7 +314,11 @@ func (p *piRuntime) spawn(ctx context.Context, plan piLaunchPlan, lock *os.File)
 // instruction path, or empty when there are none.
 func (p *piRuntime) args(plan piLaunchPlan, instructions string, wired bool) []string {
 	spec := plan.spec
-	args := append([]string{"--mode", "rpc"}, PiRPCResourceArgs()...)
+	prompt := ""
+	if spec.SystemPrompt != "" {
+		prompt = instructions
+	}
+	args := append([]string{"--mode", "rpc"}, PiRPCResourceArgs(prompt)...)
 	if spec.Model != "" && spec.Model != piDefaultModel {
 		args = append(args, "--model", spec.Model)
 	}
@@ -255,20 +328,33 @@ func (p *piRuntime) args(plan piLaunchPlan, instructions string, wired bool) []s
 	if spec.Title != "" {
 		args = append(args, "--name", spec.Title)
 	}
-	if spec.AppendPrompt != "" {
-		args = append(args, "--append-system-prompt", instructions)
-	}
 	if skills := filepath.Join(spec.Dir, ".agents", "skills"); spec.Dir != "" {
 		if info, err := os.Stat(skills); err == nil && info.IsDir() {
 			args = append(args, "--skill", skills)
 		}
 	}
+	// The managed extension also carries permission review: its tool_call
+	// hook asks the Daemon over RPC (piProcess.answerDialog).
 	tools := piBaseTools
-	if wired {
+	if wired || spec.PermissionReviewer != nil || p.guardsShellText(spec) {
 		args = append(args, "--extension", p.profile.ManagedMCPExtension)
+	}
+	if wired {
 		tools += ",mcp__*"
 	}
 	return append(args, "--tools", tools)
+}
+
+// canSyncMCP reports whether a resident Pi process can load the managed
+// extension up front so Runs can attach or update MCP servers in place.
+func (p *piRuntime) canSyncMCP() bool {
+	return p.profile.ManagedMCPExtension != "" && piResidents.enabled()
+}
+
+// guardsShellText reports whether the managed extension runs the
+// shell-text-hook before the Run's bash calls.
+func (p *piRuntime) guardsShellText(spec RunSpec) bool {
+	return spec.ShellTextHook != "" && p.profile.ManagedMCPExtension != ""
 }
 
 // piResolveProgram finds the Pi executable on the Daemon's own search path.

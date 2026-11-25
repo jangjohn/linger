@@ -1573,7 +1573,7 @@ export interface paths {
     get?: never;
     /**
      * Save the deployment's API key for one voice provider.
-     * @description For deployments without the provider's environment key. TeamHub checks the key with the provider, then stores it encrypted with TEAMHUB_SECRET_ENCRYPTION_KEY. Any signed-in Human may save it; the key is never returned. 400 carries INVALID_REQUEST or VOICE_KEY_REJECTED, 409 VOICE_KEY_FROM_ENVIRONMENT, and 503 VOICE_KEY_STORAGE_UNAVAILABLE, VOICE_PROVIDER_UNAVAILABLE or VOICE_MEDIA_OFF.
+     * @description For deployments without the provider's environment key. TeamHub checks the key with the provider, then stores it encrypted with TEAMHUB_SECRET_ENCRYPTION_KEY. A Soniox key is also probed on the realtime stream (start request, no audio, a few seconds at most), which refuses a key without balance or realtime permission. Any signed-in Human may save it; the key is never returned. error.code is one of VoiceProviderKeyErrorCode.
      */
     put: operations["saveVoiceProviderKey"];
     post?: never;
@@ -2504,6 +2504,93 @@ export interface paths {
     /** Create a Human-owned file Document in personal root Placement and bind it to an authorized Room. */
     post: operations["uploadRoomDocument"];
     delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v0/url-preview/framing": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * Report whether a site lets the link preview panel frame it.
+     * @description A browser cannot read a cross-origin frame's response headers, so the Web link preview panel asks TeamHub before it frames a page. TeamHub sends HEAD without cookies (GET only when the server refuses HEAD, which may spend a one-time link), follows up to five redirects and reads the framing rules of the final response. It requests only public addresses, checked at connection time, on ports 80 and 443, runs a few probes at once and gives up after five seconds. The desktop app shows pages natively and does not use this. 400 INVALID_REQUEST for a URL that is not http or https, or that carries credentials.
+     */
+    get: operations["getUrlPreviewFraming"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v0/web-search/backends": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * List the web search backends with their display text, state and live quota.
+     * @description Every backend in TeamHub's default order, with what a client needs to render one row each: name, commands, filters, free tier text, where to get a key, the key state and live quota. Quota is read from each provider's official usage endpoint for this request, in parallel and briefly; with include_quota=false TeamHub calls no provider and leaves quota out of every backend.
+     */
+    get: operations["listWebSearchBackends"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v0/web-search/backends/{backend}/key": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        backend: components["schemas"]["WebSearchKeyBackend"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    /**
+     * Save the deployment's API key for one web search backend.
+     * @description From a search_key card (decision_id, its decision owner only), TeamHub first runs the search or page open the card was posted for against this backend with the new key. A provider refusing the key leaves it unsaved and the card open (400 WEB_SEARCH_KEY_REJECTED). Any other outcome saves the key, verified once the provider proved it, and answers the card configured with this backend and that call's results or error code, so the Agent need not run it again. Otherwise TeamHub checks the key with the provider's official endpoint when it has one (Tavily usage, You.com account balance, Firecrawl credit usage); a Brave key is saved unverified and its first call proves it. Keys are stored encrypted with TEAMHUB_SECRET_ENCRYPTION_KEY and never returned; any signed-in Human may save one. Saving answers every other open search_key card configured with this backend and wakes the waiting Agents. 400 carries INVALID_REQUEST or WEB_SEARCH_KEY_REJECTED, 403 FORBIDDEN, 404 NOT_FOUND for a card the caller cannot see, 503 WEB_SEARCH_KEY_STORAGE_UNAVAILABLE or WEB_SEARCH_PROVIDER_UNAVAILABLE.
+     */
+    put: operations["saveWebSearchKey"];
+    post?: never;
+    /**
+     * Remove the saved API key of one web search backend.
+     * @description The backend also stops being the chosen default, so searches without a backend fall back to TeamHub's order. Removing a key that is not saved succeeds.
+     */
+    delete: operations["deleteWebSearchKey"];
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v0/web-search/default": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    /**
+     * Choose the backend a search without one uses.
+     * @description The backend must be ready (409 WEB_SEARCH_KEY_REQUIRED otherwise). Any signed-in Human may choose it; it applies to the whole deployment.
+     */
+    put: operations["setWebSearchDefault"];
+    post?: never;
+    /** Return searches without a backend to TeamHub's order. */
+    delete: operations["clearWebSearchDefault"];
     options?: never;
     head?: never;
     patch?: never;
@@ -3930,6 +4017,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v0/external-apps/feishu-mail/setup": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Check whether the signed-in account can start Feishu Mail authorization. */
+    get: operations["checkFeishuMailSetup"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v0/external-apps/provider-key": {
     parameters: {
       query?: never;
@@ -4356,6 +4460,19 @@ export interface components {
      * @enum {string}
      */
     TenantAgentAvailabilityStatus: "online" | "error" | "offline" | "unknown";
+    /**
+     * @description Why the Agent has its status, as a stable code clients word in their own language. `label` and `current_activity.summary` carry the same state in English for clients that do not know the code. With `runtime_error` the summary is the Runtime's own diagnostic text.
+     * @enum {string}
+     */
+    TenantAgentAvailabilityReason:
+      | "online"
+      | "status_unavailable"
+      | "reconnecting"
+      | "authentication_required"
+      | "waiting_for_computer"
+      | "runtime_not_installed"
+      | "runtime_incompatible"
+      | "runtime_error";
     TenantAgentCurrentActivity: {
       summary: string;
       run_id?: components["schemas"]["Id"];
@@ -4363,7 +4480,9 @@ export interface components {
     };
     TenantAgentAvailability: {
       status: components["schemas"]["TenantAgentAvailabilityStatus"];
+      /** @description English wording of the status, the fallback for clients that do not know `reason`. */
       label: string;
+      reason?: components["schemas"]["TenantAgentAvailabilityReason"];
       /**
        * Format: int64
        * @description Number of non-terminal managed Tasks assigned to this Agent.
@@ -4389,7 +4508,8 @@ export interface components {
       | "RUNTIME_AUTHENTICATION_REQUIRED"
       | "RUNTIME_INCOMPATIBLE"
       | "RUNTIME_DIAGNOSTIC_FAILED"
-      | "LOCAL_COMPUTER_OFFLINE";
+      | "LOCAL_COMPUTER_OFFLINE"
+      | "LOCAL_COMPUTER_UPGRADE_REQUIRED";
     LocalAgentRuntimeStatus: {
       computer_id: components["schemas"]["Id"];
       display_name: string;
@@ -4420,10 +4540,25 @@ export interface components {
       items: components["schemas"]["TenantAgentAvailabilitySnapshot"][];
       page: components["schemas"]["PageMeta"];
     };
+    /**
+     * @description Why the latest background model call failed: the Runtime is incompatible or its model is not available to the account, the Runtime needs sign-in, the Runtime is unavailable, or a cause the Human cannot act on. Clients show an unknown value as unknown.
+     * @enum {string}
+     */
+    AnotherMeBackgroundFailureReason:
+      | "runtime_incompatible"
+      | "runtime_auth_required"
+      | "runtime_unavailable"
+      | "unknown";
+    /** @description Present while the Another Me's background model calls (Wiki, Memory, daily reports) have failed at least three times in a row; absent again after the next one completes. */
+    AnotherMeBackgroundFailure: {
+      consecutive_failures: number;
+      reason: components["schemas"]["AnotherMeBackgroundFailureReason"];
+    };
     /** @description The Human's Another Me and its live direct Chat. Empty until the Another Me exists; room_id is also absent while the Chat is being deleted. */
     AnotherMe: {
       agent_actor_id?: components["schemas"]["Id"];
       room_id?: components["schemas"]["Id"];
+      background_failure?: components["schemas"]["AnotherMeBackgroundFailure"];
     };
     TenantAgentAvatarUpdateRequest: {
       avatar_key: string;
@@ -4605,6 +4740,12 @@ export interface components {
       /** Format: int64 */
       bytes: number;
     };
+    /** @description A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close. */
+    LocalModelPoolExternalHolder: {
+      name: string;
+      /** Format: int64 */
+      bytes: number;
+    };
     /** @description One place models load into. The system and unified budgets are 80% of RAM, as localmodels computes them. */
     LocalModelPool: {
       id: components["schemas"]["LocalModelPoolId"];
@@ -4617,6 +4758,8 @@ export interface components {
       /** Format: int64 */
       used_bytes: number;
       holders: components["schemas"]["LocalModelPoolHolder"][];
+      /** @description Closeable desktop applications holding this pool's memory, as localmodels reports them. An empty list means localmodels looked and found no closeable app; absent means not reported, and the rest of used_bytes is then not known to be other apps. */
+      external_holders?: components["schemas"]["LocalModelPoolExternalHolder"][];
     };
     /** @description Stable localmodels library id: catalog id and variant, such as qwen3-4b:Q4_K_M. */
     LocalModelId: string;
@@ -4630,11 +4773,37 @@ export interface components {
       code:
         | "MEMORY_INSUFFICIENT"
         | "DISK_INSUFFICIENT"
-        | "PLATFORM_UNSUPPORTED";
+        | "PLATFORM_UNSUPPORTED"
+        | "GPU_UNSUPPORTED"
+        | "DRIVER_UPDATE_REQUIRED"
+        | "RUNTIME_DEPENDENCY_MISSING"
+        | "UNAVAILABLE";
       /** Format: int64 */
       need_bytes?: number;
       /** Format: int64 */
       have_bytes?: number;
+      /**
+       * @description With MEMORY_INSUFFICIENT: which memory space was short.
+       * @enum {string}
+       */
+      memory_kind?: "vram" | "ram" | "unified";
+      /**
+       * @description With GPU_UNSUPPORTED: detected GPU vendor class on this Computer.
+       * @enum {string}
+       */
+      gpu_vendor?: "amd" | "intel" | "none" | "unknown";
+      /** @description With DRIVER_UPDATE_REQUIRED: minimum CUDA version required by the pinned engine. */
+      required_cuda?: string;
+      /** @description With DRIVER_UPDATE_REQUIRED: CUDA version reported by the installed driver. */
+      detected_cuda?: string;
+      /** @description With DRIVER_UPDATE_REQUIRED: installed NVIDIA driver version. */
+      driver_version?: string;
+      /** @description With RUNTIME_DEPENDENCY_MISSING: missing shared libraries such as libgomp.so.1. */
+      missing_libraries?: string[];
+      /** @description With RUNTIME_DEPENDENCY_MISSING: minimum glibc version required by the engine. */
+      required_glibc?: string;
+      /** @description With RUNTIME_DEPENDENCY_MISSING: glibc version detected on this Computer. */
+      detected_glibc?: string;
     };
     LocalModelAvailability: {
       downloadable: boolean;
@@ -4666,7 +4835,7 @@ export interface components {
       base_url: string;
     };
     /**
-     * @description Closed localmodels library error set. It is extended only together with the localmodels library contract.
+     * @description Closed localmodels library error set. It is extended only together with the localmodels library contract; UNKNOWN_ERROR preserves forward compatibility with newer localmodels releases.
      * @enum {string}
      */
     LocalModelErrorCode:
@@ -4676,6 +4845,9 @@ export interface components {
       | "MEMORY_INSUFFICIENT"
       | "DISK_INSUFFICIENT"
       | "PLATFORM_UNSUPPORTED"
+      | "GPU_UNSUPPORTED"
+      | "DRIVER_UPDATE_REQUIRED"
+      | "RUNTIME_DEPENDENCY_MISSING"
       | "LOAD_NO_ROOM"
       | "DOWNLOAD_FAILED"
       | "CHECKSUM_MISMATCH"
@@ -4685,7 +4857,8 @@ export interface components {
       | "OUT_OF_MEMORY"
       | "MODEL_FILES_MISSING"
       | "GATEWAY_REGISTRATION_FAILED"
-      | "CANCELLED";
+      | "CANCELLED"
+      | "UNKNOWN_ERROR";
     LocalModelError: {
       code: components["schemas"]["LocalModelErrorCode"];
       /** @description Diagnostic text for display; never matched on. */
@@ -4734,6 +4907,11 @@ export interface components {
       | "reasoning"
       | "coding"
       | "multilingual";
+    /**
+     * @description Inference engine family that runs this model entry. Never inferred from name or description.
+     * @enum {string}
+     */
+    LocalModelEngine: "llama.cpp" | "polystrata" | "strata";
     /** @description One validated chat model of the catalog on this platform and its state on this Computer. Sizes are bytes; readers format them. */
     LocalModel: {
       id: components["schemas"]["LocalModelId"];
@@ -4785,6 +4963,18 @@ export interface components {
       source_url?: string;
       /** @description Warm prompt-processing speed in tokens/s measured at the last load; absent when unknown. */
       prompt_tokens_per_second?: number;
+      engine?: components["schemas"]["LocalModelEngine"];
+      /** @description Display-only engine version and backend for this model, such as PolyStrata 0.2.19-poly.1 · CUDA. */
+      engine_label?: string;
+      /** @description Maximum concurrent request slots configured or probed for this model when loaded. */
+      concurrency?: number;
+      /** @description True while a loaded or loading local model is running its post-load max-concurrency probe before reporting loaded. */
+      concurrency_probing?: boolean;
+      /**
+       * Format: int64
+       * @description Additional host system RAM used alongside GPU VRAM for hybrid offload engines (such as PolyStrata); absent when all weights stay in the model's primary pool.
+       */
+      host_ram_bytes?: number;
     };
     /** @description An Agent whose runtime model is this model on this Computer. */
     LocalModelUser: {
@@ -4795,6 +4985,15 @@ export interface components {
       model: components["schemas"]["LocalModel"];
       /** @description Active Agents placed on this Computer with runtime pi whose runtime model is this model's gateway model. */
       used_by: components["schemas"]["LocalModelUser"][];
+    };
+    /** @description Present only when localmodels debug mode (tiny or simulate) is active on the Computer. config_path is shown only to the Computer owner. */
+    LocalModelsDebugInfo: {
+      /** @enum {string} */
+      mode: "tiny" | "simulate";
+      /** @enum {string} */
+      source: "env" | "state_config" | "user_config";
+      /** @description Local debug.json path when source is state_config or user_config; owner-only in the public view. */
+      config_path?: string;
     };
     /** @description One Computer's model library as last reported. Only the Computer owner can act (viewer_is_owner); other Tenant members who can see the Computer read it. */
     LocalModelsView: {
@@ -4808,6 +5007,8 @@ export interface components {
       tool_version?: string;
       pools: components["schemas"]["LocalModelPool"][];
       models: components["schemas"]["LocalModelView"][];
+      /** @description Present only when localmodels debug mode is active on the Computer; config_path is omitted for non-owners. */
+      debug?: components["schemas"]["LocalModelsDebugInfo"];
     };
     LocalModelsRefreshAccepted: {
       computer_id: components["schemas"]["Id"];
@@ -4829,6 +5030,9 @@ export interface components {
       | "LOCAL_MODEL_MEMORY_INSUFFICIENT"
       | "LOCAL_MODEL_DISK_INSUFFICIENT"
       | "LOCAL_MODEL_PLATFORM_UNSUPPORTED"
+      | "LOCAL_MODEL_GPU_UNSUPPORTED"
+      | "LOCAL_MODEL_DRIVER_UPDATE_REQUIRED"
+      | "LOCAL_MODEL_RUNTIME_DEPENDENCY_MISSING"
       | "LOCAL_MODEL_ACTION_FAILED"
       | "LOCAL_MODEL_ACTION_UNCONFIRMED"
       | "LOCAL_MODELS_SERVICE_UNAVAILABLE";
@@ -4906,7 +5110,7 @@ export interface components {
       terminated_run_count?: number;
     };
     /**
-     * @description error.code of a refused model-source request (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. MODEL_SOURCE_FORBIDDEN: the viewer is not the Computer owner. MODEL_SOURCE_UNAVAILABLE: the Computer has no localmodels tool or cannot switch model sources. AGENT_HAS_ACTIVE_RUNS: Agents on the Computer have running work and force_terminate was false; details carries one entry per such Agent, with field "agent" and the Agent's display name as reason. RUNTIME_NOT_ENABLED, LOCAL_MODEL_NO_ROOM, LOCAL_MODEL_UNKNOWN, and the BYOK_ codes are the Computer's refusals (409); for BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE and BYOK_UPSTREAM_REJECTED, message is the Computer's own and names the address it sent to and the endpoint's HTTP status. MODEL_SOURCE_FAILED: the Computer failed with an error that has no code of its own here (502). MODEL_SOURCE_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). MODEL_SOURCE_UNCONFIRMED: the Computer had not answered by the deadline; it may still switch (504).
+     * @description error.code of a refused model-source request (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. MODEL_SOURCE_FORBIDDEN: the viewer is not the Computer owner. MODEL_SOURCE_UNAVAILABLE: the Computer has no localmodels tool or cannot switch model sources. AGENT_HAS_ACTIVE_RUNS: Agents on the Computer have running work and force_terminate was false; details carries one entry per such Agent, with field "agent" and the Agent's display name as reason. RUNTIME_NOT_ENABLED, LOCAL_MODEL_NO_ROOM, LOCAL_MODEL_UNKNOWN, and the BYOK endpoint refusals (BYOK_INVALID_CONFIG, BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE, BYOK_UPSTREAM_REJECTED) are the Computer's refusals (409); for BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE and BYOK_UPSTREAM_REJECTED, message is the Computer's own and names the address it sent to and the endpoint's HTTP status. BYOK_GATEWAY_FAILED: the Computer could not start, stop, or configure its local BYOK gateway (502); when the Computer reported a diagnostic message, message carries it and details carries one entry with field "gateway" and that diagnostic as reason. MODEL_SOURCE_FAILED: the Computer failed with an error that has no code of its own here (502). MODEL_SOURCE_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). MODEL_SOURCE_UNCONFIRMED: the Computer had not answered by the deadline; it may still switch (504).
      * @enum {string}
      */
     ModelSourceErrorCode:
@@ -4922,6 +5126,7 @@ export interface components {
       | "BYOK_NOT_FOUND"
       | "BYOK_UNREACHABLE"
       | "BYOK_UPSTREAM_REJECTED"
+      | "BYOK_GATEWAY_FAILED"
       | "MODEL_SOURCE_FAILED"
       | "MODEL_SOURCE_SERVICE_UNAVAILABLE"
       | "MODEL_SOURCE_UNCONFIRMED";
@@ -5487,9 +5692,10 @@ export interface components {
       | "provider_key"
       | "browser_connection"
       | "room_creation"
-      | "computer_permission";
+      | "computer_permission"
+      | "search_key";
     /**
-     * @description For connector_write and agent_change, approved and executing mean TeamHub is running the approved request, and unknown means a run stopped midway and may have taken effect; TeamHub does not run it again. A question or AnotherMe setup card ends answered. An approved runtime_permission lets the Agent retry that one call until expires_at, and ends consumed once it does. An approved connection_auth is authorizing until the OAuth it started completes (succeeded), fails, or expires. A provider_key ends answered when someone saves a Composio key, denied when its Human declines. A browser_connection ends answered when its owner connects, denied when they decline. A room_creation ends succeeded with its Room created, or denied. A computer_permission ends answered once every permission it asks for is granted, denied when its owner declines.
+     * @description For connector_write and agent_change, approved and executing mean TeamHub is running the approved request, and unknown means a run stopped midway and may have taken effect; TeamHub does not run it again. A question or AnotherMe setup card ends answered. An approved runtime_permission lets the Agent retry that one call until expires_at, and ends consumed once it does. An approved connection_auth is authorizing until the OAuth it started completes (succeeded), fails, or expires. A provider_key ends answered when someone saves a Composio key, denied when its Human declines. A browser_connection ends answered when its owner connects, denied when they decline. A room_creation ends succeeded with its Room created, or denied. A computer_permission ends answered once every permission it asks for is granted, denied when its owner declines. A search_key ends answered when someone saves any web search key, denied when its Human declines.
      * @enum {string}
      */
     DecisionStatus:
@@ -5504,13 +5710,18 @@ export interface components {
       | "answered"
       | "consumed"
       | "authorizing";
+    /**
+     * @description A backend that takes an API key saved in the product.
+     * @enum {string}
+     */
+    WebSearchKeyBackend: "tavily" | "brave" | "firecrawl" | "exa" | "you";
     /** @description A radio or checkbox answer names option ids. Any other value is the Human's own written answer, which every option question accepts, so a checkbox answer holds up to 20 options and one written answer. */
     DecisionAnswerValue: string | string[];
     /** @description Service-signed upload credential. It names the uploading Human, the Room, and the stored file, and it expires at the upload's expires_at; clients must not construct or parse it. */
     AttachmentUploadToken: string;
     DecisionAnswer: {
       /**
-       * @description approve or deny for connector_write, agent_change, runtime_permission, connection_auth and room_creation; deny or connected (recorded by TeamHub once the owner connects Chrome) for browser_connection; deny or configured (recorded by TeamHub once a Composio key is saved) for provider_key; deny or granted (recorded by TeamHub once the Computer reports every permission granted) for computer_permission; submit for question; connected or skipped for profile_setup_apps; done or skipped for profile_setup_sources.
+       * @description approve or deny for connector_write, agent_change, runtime_permission, connection_auth and room_creation; deny or connected (recorded by TeamHub once the owner connects Chrome) for browser_connection; deny or configured (recorded by TeamHub once a Composio key is saved) for provider_key and search_key (with the backend whose key was saved); deny or granted (recorded by TeamHub once the Computer reports every permission granted) for computer_permission; submit for question; connected or skipped for profile_setup_apps; done or skipped for profile_setup_sources.
        * @enum {string}
        */
       decision:
@@ -5526,6 +5737,8 @@ export interface components {
       comment?: string;
       /** @description The Connection a connection_auth approval chose. */
       connection_id?: components["schemas"]["Id"];
+      /** @description The web search backend whose key was saved, on a configured search_key answer; it may differ from the backend the card showed. */
+      backend?: components["schemas"]["WebSearchKeyBackend"];
       /** @description Map of question id to the Human's answer; only with submit. */
       answers?: {
         [key: string]: components["schemas"]["DecisionAnswerValue"];
@@ -5683,6 +5896,14 @@ export interface components {
       permissions: components["schemas"]["ComputerPermissionId"][];
       reason?: string;
     };
+    /** @description The view of a search_key decision: the web search backend the card shows. origin is requested when the Agent's command named it, and suggested when the command named none and nothing was usable, so TeamHub picked the first backend in its order that still needs a key. reason says why: no key is saved (missing), the provider refused the saved one (rejected), or the keyless You.com searches are used up (free_limit). The Human may add a key for any other backend instead; saving any web search key answers the card configured with that backend. */
+    SearchKeyDecisionView: {
+      backend: components["schemas"]["WebSearchKeyBackend"];
+      /** @enum {string} */
+      origin: "requested" | "suggested";
+      /** @enum {string} */
+      reason: "missing" | "rejected" | "free_limit";
+    };
     /** @description A request waiting on one Human's decision. TeamHub runs what the decision approves and reports the result to the requesting Agent. Exactly the view property named by kind is present; both AnotherMe setup kinds use profile_setup. */
     DecisionRequestedMessageCard: {
       /** @constant */
@@ -5718,6 +5939,7 @@ export interface components {
       browser_connection?: components["schemas"]["BrowserConnectionDecisionView"];
       room_creation?: components["schemas"]["RoomCreationDecisionView"];
       computer_permission?: components["schemas"]["ComputerPermissionDecisionView"];
+      search_key?: components["schemas"]["SearchKeyDecisionView"];
     };
     /** @description The Message author, an Agent, created this General Agent. Without approved_by it was created here and joined this Room; with approved_by it was created after that Human approved the confirmation card and joined no Room. */
     AgentCreatedNotice: {
@@ -5883,7 +6105,13 @@ export interface components {
        * @description Connected app whose new events the Routine hands to proactive judgement.
        * @enum {string}
        */
-      app: "gmail" | "outlook" | "google_calendar" | "slack";
+      app:
+        | "gmail"
+        | "outlook"
+        | "google_calendar"
+        | "outlook_calendar"
+        | "slack"
+        | "feishu_mail";
     };
     /** @description A Routine has exactly one of cadence and listener. A listener Routine is AnotherMe's app listener; it can only be paused and resumed, and goes away when the Human revokes AnotherMe's access to the app. */
     Routine: {
@@ -6427,7 +6655,7 @@ export interface components {
       /** @description Optional public queue label for queued, or the full provider-visible reasoning summary title for thinking. Omit for working; raw reasoning is never allowed. */
       title?: string;
     };
-    /** @description Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished, but every message the Agent tried to post failed, so the Room received no reply from it. reply_not_sent means a Room Run finished without trying to post anything while a Human who mentioned the Agent waited for its reply; the Runtime ended the turn in text nobody sees, which is not posted for it. interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one. */
+    /** @description Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished while a Human who mentioned the Agent waited for its reply, every message write the Agent tried to post failed, and no reply reached the Room. reply_not_sent means a Room Run finished while a Human who mentioned the Agent waited for its reply and no reply reached the Room without any failed message write attempt (for instance, the Runtime ended the turn in text nobody sees, which is not posted for it). interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one. */
     AgentRuntimeExecutionFailure: {
       /** @enum {string} */
       code:
@@ -6438,6 +6666,7 @@ export interface components {
         | "rate_limited"
         | "model_unavailable"
         | "model_not_offered"
+        | "local_model_unavailable"
         | "context_too_long"
         | "model_service_error"
         | "timeout"
@@ -6640,6 +6869,32 @@ export interface components {
     SaveVoiceProviderKeyRequest: {
       api_key: string;
     };
+    /**
+     * @description error.code of a refused voice provider key save. 400: INVALID_REQUEST (malformed request or key); VOICE_KEY_REJECTED (the provider refused the key); VOICE_KEY_NO_BALANCE (the provider account's balance or monthly budget is used up); VOICE_KEY_NO_REALTIME_PERMISSION (the Soniox key may not use realtime transcription). 409: VOICE_KEY_FROM_ENVIRONMENT. 503: VOICE_KEY_STORAGE_UNAVAILABLE, VOICE_MEDIA_OFF, or VOICE_PROVIDER_UNAVAILABLE (the provider could not be reached or did not answer in time).
+     * @enum {string}
+     */
+    VoiceProviderKeyErrorCode:
+      | "INVALID_REQUEST"
+      | "VOICE_KEY_REJECTED"
+      | "VOICE_KEY_NO_BALANCE"
+      | "VOICE_KEY_NO_REALTIME_PERMISSION"
+      | "VOICE_KEY_FROM_ENVIRONMENT"
+      | "VOICE_KEY_STORAGE_UNAVAILABLE"
+      | "VOICE_MEDIA_OFF"
+      | "VOICE_PROVIDER_UNAVAILABLE";
+    /** @description The common error body with error.code narrowed to VoiceProviderKeyErrorCode. */
+    VoiceProviderKeyError: {
+      code: components["schemas"]["VoiceProviderKeyErrorCode"];
+      /** @description Human-readable summary safe to display; clients branch on code, not message. */
+      message: string;
+      request_id: string;
+      details?: components["schemas"]["ErrorDetail"][];
+      /** @default false */
+      retryable: boolean;
+    };
+    VoiceProviderKeyErrorResponse: {
+      error: components["schemas"]["VoiceProviderKeyError"];
+    };
     VoiceConnectionCredential: {
       /** Format: uri */
       endpoint: string;
@@ -6721,6 +6976,16 @@ export interface components {
       transcript_recovery_progress_ms?: number;
       /** Format: int64 */
       transcript_recovery_total_ms?: number;
+      /**
+       * Format: int64
+       * @description The recovery attempt that is running or due next; once recovery failed, the attempts already made. Present with transcript_recovery_status.
+       */
+      transcript_recovery_attempt?: number;
+      /**
+       * Format: int64
+       * @description Attempts a recovery makes before it fails and waits for the account's retry.
+       */
+      transcript_recovery_max_attempts?: number;
       audio_document_version_id?: components["schemas"]["Id"];
       transcript_document_version_id?: components["schemas"]["Id"];
       id: components["schemas"]["Id"];
@@ -7319,6 +7584,123 @@ export interface components {
       /** Format: binary */
       content: string;
     };
+    UrlPreviewFraming: {
+      /**
+       * @description refused: the final response forbids framing by another site (X-Frame-Options DENY or SAMEORIGIN, or a CSP frame-ancestors that allows no page of the Linger page's scheme), so the panel offers a new tab instead of a frame. allowed: it does not. unknown: TeamHub did not read the page, because it was unreachable, slow or redirected too often, TeamHub was busy with other probes, or it is on a non-public address or a port other than 80 and 443, which TeamHub never requests; the panel frames it and lets the browser decide.
+       * @enum {string}
+       */
+      framing: "allowed" | "refused" | "unknown";
+    };
+    /**
+     * @description A backend that runs searches.
+     * @enum {string}
+     */
+    WebSearchSearchBackend:
+      | "tavily"
+      | "brave"
+      | "firecrawl"
+      | "exa"
+      | "you"
+      | "duckduckgo";
+    /**
+     * @description A web search backend. duckduckgo searches without a key. direct opens pages only and is fetched by the Agent CLI on the Agent's computer; TeamHub never fetches a page itself.
+     * @enum {string}
+     */
+    WebSearchBackendId:
+      | "tavily"
+      | "brave"
+      | "firecrawl"
+      | "exa"
+      | "you"
+      | "duckduckgo"
+      | "direct";
+    /** @enum {string} */
+    WebSearchCommand: "search" | "open";
+    /** @enum {string} */
+    WebSearchFilter: "recency" | "site";
+    /** @description What is left on the backend's account. from says where the numbers came from: provider is the provider's official usage endpoint read for this response; last_response is the rate-limit headers of the last call (Brave), as of observed_at; unavailable carries no numbers and reason says why. */
+    WebSearchQuota: {
+      /** @enum {string} */
+      from: "provider" | "last_response" | "unavailable";
+      remaining?: number;
+      /** @description Absent when the provider reports no cap. */
+      limit?: number;
+      /** @enum {string} */
+      unit?: "credits" | "usd" | "requests";
+      plan?: string;
+      resets_at?: components["schemas"]["Timestamp"];
+      observed_at?: components["schemas"]["Timestamp"];
+      /**
+       * @description no_key: no key is saved; not_reported: there is no usage endpoint to read (keyless You.com, DuckDuckGo, Exa, direct); not_observed: Brave has answered no call yet; key_rejected: the provider refused the saved key; provider_unavailable: the usage endpoint did not answer in time.
+       * @enum {string}
+       */
+      reason?:
+        | "no_key"
+        | "not_reported"
+        | "not_observed"
+        | "key_rejected"
+        | "provider_unavailable";
+    };
+    /** @description One backend with the static text a client shows for it and its live state. status is ready when a call would run now: DuckDuckGo and direct always, You.com also without a key, the others with a key that is not rejected. */
+    WebSearchBackend: {
+      id: components["schemas"]["WebSearchBackendId"];
+      name: string;
+      /** @description The provider's own one-line description of its product. */
+      description: string;
+      /**
+       * @description How a call to the backend runs now. key: with an API key saved in the product (or one it still needs); free: without a key, on a free service with limits that TeamHub does not count (DuckDuckGo, and You.com without a key); none: direct, which needs no account.
+       * @enum {string}
+       */
+      tier: "key" | "free" | "none";
+      /** @description A short display line for the tier, set for free. */
+      tier_text?: string;
+      commands: components["schemas"]["WebSearchCommand"][];
+      /** @description The search filters the backend honors; any other is refused before a call. */
+      filters: components["schemas"]["WebSearchFilter"][];
+      /** @description The most results one search returns; 0 for a backend without search. */
+      max_limit: number;
+      /** @description How many sites one search may name; 0 when it takes no site filter. */
+      max_sites: number;
+      /** @description Whether the backend works without a saved key. */
+      keyless: boolean;
+      /** @description Whether the provider has an official endpoint TeamHub checks a key with before saving it. Without one the key is saved unverified and proven by its first call. */
+      official_key_check: boolean;
+      /** @description The provider's free allowance, for display. */
+      free_tier?: string;
+      /**
+       * Format: uri
+       * @description Where the Human gets a key.
+       */
+      key_url?: string;
+      /** @enum {string} */
+      status: "ready" | "key_required" | "key_rejected";
+      /** @enum {string} */
+      key_state: "none" | "verified" | "unverified" | "rejected";
+      /** @description Left out when the caller asked for the list without quota. */
+      quota?: components["schemas"]["WebSearchQuota"];
+    };
+    /** @description Every backend in TeamHub's default order. default_search is the backend a search without one uses now: the default a Human saved (chosen_default_search) even when its key stopped working, else the first backend with a usable key in that order, else duckduckgo. */
+    WebSearchBackendList: {
+      default_search: components["schemas"]["WebSearchSearchBackend"];
+      chosen_default_search?: components["schemas"]["WebSearchSearchBackend"];
+      /** @constant */
+      default_open: "direct";
+      /** @description False when the deployment has no TEAMHUB_SECRET_ENCRYPTION_KEY to seal keys with. */
+      can_save_keys: boolean;
+      backends: components["schemas"]["WebSearchBackend"][];
+    };
+    SaveWebSearchKeyRequest: {
+      api_key: string;
+      /** @description The search_key card the key is added from. TeamHub then runs the search or page open that card was posted for against this backend with the new key before saving it, and answers the card with what that call returned. Without it, or for a card posted by a connect request, the key gets the official check. */
+      decision_id?: string;
+    };
+    SetWebSearchDefaultRequest: {
+      backend: components["schemas"]["WebSearchSearchBackend"];
+    };
+    WebSearchDefault: {
+      default_search: components["schemas"]["WebSearchSearchBackend"];
+      chosen_default_search?: components["schemas"]["WebSearchSearchBackend"];
+    };
     DocumentMetadataUpdateRequest: {
       title: string;
     };
@@ -7582,6 +7964,8 @@ export interface components {
         | "failed"
         | "unknown"
         | "declined";
+      /** @description The canvas's mail app, gmail, outlook or feishu_mail; Send must use a connection of this app. */
+      target?: string;
       subject: string;
       to: string;
       error?: string;
@@ -8364,6 +8748,15 @@ export interface components {
       };
       content: {
         "application/json": components["schemas"]["ErrorResponse"];
+      };
+    };
+    /** @description TeamHub or the voice provider refused the key; error.code is one of VoiceProviderKeyErrorCode. */
+    VoiceProviderKeyRefused: {
+      headers: {
+        [name: string]: unknown;
+      };
+      content: {
+        "application/json": components["schemas"]["VoiceProviderKeyErrorResponse"];
       };
     };
     /** @description Rejected or retryable file operation. Native latest changed throughout bounded rendering retries returns 202 with latest_not_ready, private/no-store and no document bytes. Retry after one second. Other conflicts include current and base version IDs. Service failures and exhausted serialization retries remain unavailable. */
@@ -11065,10 +11458,10 @@ export interface operations {
           "application/json": components["schemas"]["VoiceProviderKeyStatus"];
         };
       };
-      400: components["responses"]["BadRequest"];
+      400: components["responses"]["VoiceProviderKeyRefused"];
       401: components["responses"]["Unauthenticated"];
-      409: components["responses"]["Conflict"];
-      503: components["responses"]["ServiceUnavailable"];
+      409: components["responses"]["VoiceProviderKeyRefused"];
+      503: components["responses"]["VoiceProviderKeyRefused"];
     };
   };
   getVoiceSession: {
@@ -12509,6 +12902,158 @@ export interface operations {
       409: components["responses"]["Conflict"];
       413: components["responses"]["PayloadTooLarge"];
       503: components["responses"]["ServiceUnavailable"];
+    };
+  };
+  getUrlPreviewFraming: {
+    parameters: {
+      query: {
+        /** @description The http or https page to preview. */
+        url: string;
+        /** @description The scheme of the Linger page that frames the site; frame-ancestors scheme sources are matched against it. Without it, http and https sources both allow the frame. */
+        page_scheme?: "http" | "https";
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Whether the page may be framed. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UrlPreviewFraming"];
+        };
+      };
+      400: components["responses"]["BadRequest"];
+      401: components["responses"]["Unauthenticated"];
+    };
+  };
+  listWebSearchBackends: {
+    parameters: {
+      query?: {
+        /** @description Read each backend's live quota from its provider. */
+        include_quota?: boolean;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The backends. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WebSearchBackendList"];
+        };
+      };
+      401: components["responses"]["Unauthenticated"];
+    };
+  };
+  saveWebSearchKey: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        backend: components["schemas"]["WebSearchKeyBackend"];
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SaveWebSearchKeyRequest"];
+      };
+    };
+    responses: {
+      /** @description The backend after saving. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WebSearchBackend"];
+        };
+      };
+      400: components["responses"]["BadRequest"];
+      401: components["responses"]["Unauthenticated"];
+      403: components["responses"]["Forbidden"];
+      404: components["responses"]["NotFound"];
+      503: components["responses"]["ServiceUnavailable"];
+    };
+  };
+  deleteWebSearchKey: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        backend: components["schemas"]["WebSearchKeyBackend"];
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The key is gone. */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      400: components["responses"]["BadRequest"];
+      401: components["responses"]["Unauthenticated"];
+    };
+  };
+  setWebSearchDefault: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SetWebSearchDefaultRequest"];
+      };
+    };
+    responses: {
+      /** @description The default now in effect. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WebSearchDefault"];
+        };
+      };
+      400: components["responses"]["BadRequest"];
+      401: components["responses"]["Unauthenticated"];
+      409: components["responses"]["Conflict"];
+    };
+  };
+  clearWebSearchDefault: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The default now in effect. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WebSearchDefault"];
+        };
+      };
+      401: components["responses"]["Unauthenticated"];
     };
   };
   uploadWorkItemDocument: {
@@ -15193,6 +15738,27 @@ export interface operations {
         };
       };
       401: components["responses"]["Unauthenticated"];
+    };
+  };
+  checkFeishuMailSetup: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The Computer can start authorization. */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      401: components["responses"]["Unauthenticated"];
+      409: components["responses"]["Conflict"];
+      503: components["responses"]["ServiceUnavailable"];
     };
   };
   saveExternalProviderKey: {

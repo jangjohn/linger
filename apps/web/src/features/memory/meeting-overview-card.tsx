@@ -2,7 +2,12 @@ import { cn } from "@/lib/cn";
 import { BubbleChatIcon } from "@hugeicons/core-free-icons";
 import { Fragment } from "react";
 import { Icon } from "@/components/ui/icon";
+import type { Message } from "@/i18n/messages";
+import { useT } from "@/i18n/use-translation";
+
 import type { MeetingOutcome, MeetingTopic } from "./meeting-overview";
+import { meetingsExtrasMessages } from "./meetings-extras.messages";
+import { meetingsMessages as m } from "./meetings.messages";
 
 /**
  * Topic cards cycle through categorical Nature tints (500 shell at 10%,
@@ -16,6 +21,9 @@ const topicTints = [
   "bg-bubblegum-500/10 text-bubblegum-700",
 ] as const;
 
+// Section headings and the None observed line stay as the stored page words
+// them: they are its fixed format, and the table of contents and section
+// links are keyed on them.
 /** Shares the knowledge document's column and H2 around these sections. */
 const sectionFrame = "mb-3 w-full";
 const sectionHeading =
@@ -29,6 +37,7 @@ const LONG_TOPIC_TEXT = 120;
  * topic. The heading matches the knowledge document's H2 around it.
  */
 export function MeetingOverviewCard({ topics }: { topics: MeetingTopic[] }) {
+  const t = useT();
   const longTopics = topics.some(
     (topic) =>
       (topic.intro ?? "").length +
@@ -37,12 +46,14 @@ export function MeetingOverviewCard({ topics }: { topics: MeetingTopic[] }) {
   );
   return (
     <section
-      aria-label="Meeting overview"
+      aria-label={t(m.overview)}
       className={cn("@container", sectionFrame)}
     >
-      <h2 className={sectionHeading}>Meeting Summary</h2>
+      <h2 className={sectionHeading}>
+        {t(meetingsExtrasMessages.meetingSummary)}
+      </h2>
       <ol
-        aria-label="Topics"
+        aria-label={t(m.topics)}
         className={cn(
           "grid grid-cols-1 gap-3 rounded-xl border border-app-border bg-app-surface p-4 md:p-5 @lg:grid-cols-2",
           !longTopics && "@3xl:grid-cols-3",
@@ -113,10 +124,11 @@ export function MeetingKeywords({
   keywords: string[];
   title: string;
 }) {
+  const t = useT();
   return (
     <section aria-label={title} className={sectionFrame}>
       <h2 className={sectionHeading}>{title}</h2>
-      <ul className="flex flex-wrap gap-1.5" aria-label="Keywords">
+      <ul className="flex flex-wrap gap-1.5" aria-label={t(m.keywords)}>
         {keywords.map((keyword) => (
           <li
             className="rounded-full border border-app-border bg-app-surface px-2.5 py-0.5 text-[14px] leading-5 text-app-body"
@@ -138,6 +150,17 @@ const outcomeTints: Record<NonNullable<MeetingOutcome["label"]>, string> = {
     "border-(--app-status-warning-border) bg-(--app-status-warning-surface) text-(--app-status-warning-text)",
 };
 
+// The stored page marks each entry in English; the tag names its kind in
+// the language on screen.
+const outcomeNames: Record<
+  NonNullable<MeetingOutcome["label"]>,
+  Message<string>
+> = {
+  Decision: m.outcomeDecision,
+  Completed: m.outcomeCompleted,
+  Action: m.outcomeAction,
+};
+
 /**
  * Decisions And Outcomes or Action Items, each entry led by its kind as a
  * tag instead of the `Decision:` / `Completed:` / `Action:` prefix.
@@ -149,12 +172,13 @@ export function MeetingOutcomes({
   outcomes: MeetingOutcome[];
   title: string;
 }) {
+  const t = useT();
   return (
     <section aria-label={title} className={sectionFrame}>
       <h2 className={sectionHeading}>{title}</h2>
       {outcomes.length === 0 ? (
         <p className="text-[15px] leading-relaxed text-app-body">
-          None observed.
+          {t(meetingsExtrasMessages.noneObserved)}
         </p>
       ) : null}
       <ul className="space-y-2.5 text-[15px] leading-relaxed text-app-body">
@@ -167,7 +191,7 @@ export function MeetingOutcomes({
                   outcomeTints[item.label],
                 )}
               >
-                {item.label}
+                {t(outcomeNames[item.label])}
               </span>
             ) : null}
             <div className="min-w-0">

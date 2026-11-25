@@ -141,6 +141,7 @@ func TestClaudeToolPolicyOnBothControlPaths(t *testing.T) {
 		{"Agent", `{"prompt":"x"}`, "agent-1", false},
 		{"Agent", `{"background":true}`, "", false},
 		{"Bash", `{"command":"ls","run_in_background":true}`, "", false},
+		{"Bash", `{"command":"teamhub message send --content \"Quote: $180/store\""}`, "", false},
 	}
 	for _, c := range cases {
 		canUse := `{"subtype":"can_use_tool","tool_name":"` + c.tool + `","input":` + c.input + `,"agent_id":"` + c.agentID + `","tool_use_id":"tool-1"}`
@@ -193,14 +194,14 @@ func TestClaudeToolPolicyOnBothControlPaths(t *testing.T) {
 }
 
 func TestClaudeInitializeFrameForEmptyPolicy(t *testing.T) {
-	frame := claudeInitializeFrame(RunSpec{ClaudePolicy: &ClaudeToolPolicy{}, AppendPrompt: "extra"})
+	frame := claudeInitializeFrame(RunSpec{ClaudePolicy: &ClaudeToolPolicy{}, SystemPrompt: "extra", Dir: "/work/context"})
 	var decoded struct {
 		Type      string `json:"type"`
 		RequestID string `json:"request_id"`
 		Request   struct {
 			Subtype              string          `json:"subtype"`
 			Skills               json.RawMessage `json:"skills"`
-			AppendSystemPrompt   string          `json:"appendSystemPrompt"`
+			SystemPrompt         string          `json:"systemPrompt"`
 			SystemPromptSnapshot *bool           `json:"systemPromptSnapshot"`
 			Hooks                map[string][]struct {
 				HookCallbackIDs []string `json:"hookCallbackIds"`
@@ -211,7 +212,7 @@ func TestClaudeInitializeFrameForEmptyPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := decoded.Request
-	if decoded.RequestID != claudeInitializeRequestID || request.Subtype != "initialize" || string(request.Skills) != "[]" || request.AppendSystemPrompt != "extra" ||
+	if decoded.RequestID != claudeInitializeRequestID || request.Subtype != "initialize" || string(request.Skills) != "[]" || request.SystemPrompt != "extra\n\nCurrent working directory: /work/context" ||
 		request.SystemPromptSnapshot == nil || *request.SystemPromptSnapshot || len(request.Hooks["PreToolUse"]) != 1 || request.Hooks["PreToolUse"][0].HookCallbackIDs[0] != "hook_0" ||
 		len(request.Hooks["PostToolUse"]) != 1 || request.Hooks["PostToolUse"][0].HookCallbackIDs[0] != claudeSteerHookID ||
 		len(request.Hooks["PostToolUseFailure"]) != 1 || request.Hooks["PostToolUseFailure"][0].HookCallbackIDs[0] != claudeSteerHookID {

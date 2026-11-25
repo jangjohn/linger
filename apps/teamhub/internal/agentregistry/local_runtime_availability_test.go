@@ -87,6 +87,14 @@ func TestPersistedLocalRuntimeObservationSeparatesConnectionFromDiagnostics(t *t
 			if result.Status != tc.runtime || result.ConnectionStatus != tc.connection || result.ComputerStatus != tc.computer || !result.ObservedAt.Equal(observation.LastSeenAt.Time) {
 				t.Fatalf("observation=%+v", result)
 			}
+			if tc.stored == "upgrade_required" {
+				if result.ErrorCode != string(httpapi.LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTERUPGRADEREQUIRED) {
+					t.Fatalf("error code = %q, want %q", result.ErrorCode, httpapi.LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTERUPGRADEREQUIRED)
+				}
+				if !httpapi.LocalRuntimeDiagnosticErrorCode(result.ErrorCode).Valid() {
+					t.Fatalf("error code %q is not in the contract enum", result.ErrorCode)
+				}
+			}
 			available := availabilityWithLocalRuntimeStatus(httpapi.TenantAgentAvailability{Status: httpapi.TenantAgentAvailabilityStatusOnline, ActiveTaskCount: 2}, result)
 			if tc.connection != "connected" && available.Status == httpapi.TenantAgentAvailabilityStatusOnline {
 				t.Fatal("stale observation presented as live")
@@ -109,4 +117,33 @@ func TestPersistedLocalRuntimeObservationSeparatesConnectionFromDiagnostics(t *t
 			t.Fatalf("observation=%+v", result)
 		}
 	})
+}
+
+func TestAvailabilityCarriesReasonBesideEnglishLabel(t *testing.T) {
+	online := listedTenantAgentAvailability(store.ListTenantAgentsForAccountRow{ActiveTaskCount: 1})
+	for _, tc := range []struct {
+		name   string
+		status roomagent.LocalAgentRuntimeStatus
+		want   httpapi.TenantAgentAvailabilityReason
+		label  string
+	}{
+		{"ready", roomagent.LocalAgentRuntimeStatus{ComputerStatus: "online", Status: "ready", ConnectionStatus: "connected"}, httpapi.TenantAgentAvailabilityReasonOnline, "Online"},
+		{"unknown", roomagent.LocalAgentRuntimeStatus{Status: "unknown", ConnectionStatus: "unknown"}, httpapi.TenantAgentAvailabilityReasonStatusUnavailable, "Status unavailable"},
+		{"reconnecting", roomagent.LocalAgentRuntimeStatus{Status: "ready", ConnectionStatus: "reconnecting"}, httpapi.TenantAgentAvailabilityReasonReconnecting, "Reconnecting"},
+		{"sign-in", roomagent.LocalAgentRuntimeStatus{ComputerStatus: "online", Status: "authentication_required", ConnectionStatus: "connected"}, httpapi.TenantAgentAvailabilityReasonAuthenticationRequired, "Offline"},
+		{"computer offline", roomagent.LocalAgentRuntimeStatus{ComputerStatus: "offline", Status: "error", ConnectionStatus: "connected", ErrorCode: "LOCAL_COMPUTER_OFFLINE"}, httpapi.TenantAgentAvailabilityReasonWaitingForComputer, "Offline"},
+		{"not installed", roomagent.LocalAgentRuntimeStatus{ComputerStatus: "online", Status: "not_installed", ConnectionStatus: "connected"}, httpapi.TenantAgentAvailabilityReasonRuntimeNotInstalled, "Needs attention"},
+		{"incompatible", roomagent.LocalAgentRuntimeStatus{ComputerStatus: "online", Status: "incompatible", ConnectionStatus: "connected"}, httpapi.TenantAgentAvailabilityReasonRuntimeIncompatible, "Needs attention"},
+		{"error", roomagent.LocalAgentRuntimeStatus{ComputerStatus: "online", Status: "error", ConnectionStatus: "connected", Message: "Probe failed"}, httpapi.TenantAgentAvailabilityReasonRuntimeError, "Needs attention"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			projected := availabilityWithLocalRuntimeStatus(online, tc.status)
+			if projected.Reason == nil || *projected.Reason != tc.want || projected.Label != tc.label {
+				t.Fatalf("availability = %+v, reason = %v", projected, projected.Reason)
+			}
+			if !projected.Reason.Valid() {
+				t.Fatalf("reason %q is not in the contract enum", *projected.Reason)
+			}
+		})
+	}
 }

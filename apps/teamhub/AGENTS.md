@@ -24,6 +24,71 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
 - Connector authorization defaults to the public Web callback. For a desktop
   request, pass only a validated one-time loopback address to Composio.
   TeamHub verifies connection status independently under the signed-in Account.
+- Feishu Mail is the one connected app TeamHub runs itself
+  (`internal/feishu`, `externalsource/feishu.go`): Composio has no Feishu
+  toolkit. Every call runs through the owner's own lark-cli on the online
+  Computer that runs their active Another Me
+  (`store.GetFeishuMailComputerTarget`): TeamHub sends a `feishu_mail` Computer
+  tool call through Node Services (`roomagent.CallLocalComputerToolResult`),
+  and the Daemon runs lark-cli against the owner's mailbox API paths only.
+  TeamHub keeps no Feishu credentials and needs no Feishu app of its own; the
+  Feishu app behind lark-cli must enable the mail scopes the Daemon's
+  `localtools.FeishuMailScopes` names. The Apps page never shows Feishu Mail,
+  not even under Connected: a person shares it by asking their Another Me, whose
+  `teamhub apps connect feishu_mail` posts the chat's `connection_auth` card,
+  and the account then shows among Another Me's connectors. Connect checks the
+  owner's lark-cli: one already logged in with every mail scope needs no page,
+  and otherwise the Computer starts a device login named after the upstream and
+  keeps its device code, whose Feishu page is the connect URL. The connection's
+  pending checks wait on that login, then read the mailbox address as its
+  identity. Without an online Computer, lark-cli, or a scope the app enables,
+  connecting answers `FEISHU_COMPUTER_OFFLINE`, `LARK_CLI_NOT_INSTALLED`,
+  `LARK_CLI_NOT_CONFIGURED` (installed but never set up with a Feishu app) or
+  `FEISHU_SCOPES_NOT_ENABLED`, which the Web shows as steps the Human can
+  follow. The install and setup commands live only in `internal/feishu`
+  (`InstallCommand`, `SetupCommand`) and reach the Web as `command` error
+  details. The connection card and the Feishu Mail management dialog check
+  and recheck setup through the same account-scoped endpoint. The check neither
+  starts a login nor creates a connection. Connect rechecks readiness before
+  creating one. A lark-cli that is only logged out is ready to start OAuth. Any other Computer
+  failure is logged with the status and detail the Computer sent. Disconnecting leaves the owner's lark-cli login
+  alone. While the Computer is offline, polls, syncs and tool calls fail
+  without changing the connection, and a listener catches up from its
+  watermark later. An Agent tool call does not check the login first: the
+  six-hourly reconcile does, and a call that finds it broken fails as not
+  active. lark-cli acts as whoever is logged in to it now, so an identified
+  connection is bound to its mailbox address: its first mail call of an
+  operation reads the logged-in address, and another mailbox refuses every
+  call (`feishu.ErrMailboxChanged`) before anything is read or sent and
+  expires the connection at its next check. Its Agent tools (`FEISHU_MAIL_*`) run in
+  `externalsource/feishu_mail_tools.go` behind
+  `agentconnectedapps.WithNativeToolkit`, so admission, confirmation cards and
+  operation IDs match Composio's tools; a confirmed send runs on the Computer
+  when the card is approved. A Feishu Mail connection imports no mail from
+  before it: its snapshot completes empty and the nightly sync reads the inbox
+  and sent folders from the connection time on. Its listener polls the inbox
+  against a received-time watermark; a backlog larger than one poll reads is
+  read on from its page over the next polls, and the watermark moves past it
+  only once all of it is read. Email canvases target `gmail`, `outlook` or
+  `feishu_mail`. Gmail and Feishu take one RFC 5322 message; Outlook uses
+  Graph JSON drafts with CID inline images and attachment upload sessions.
+  Outlook updates replace all attachments and invalidate the old source binding
+  before the first write, so partial uploads cannot use an old confirmation.
+  Graph's empty 202 acknowledges sending without supplying a sent message ID;
+  an uncertain send is never replayed automatically. All three share draft
+  bindings and delivery receipts.
+- `internal/urlpreview`: `GET /v0/url-preview/framing` reads a page's
+  framing rules (`X-Frame-Options`, CSP `frame-ancestors`) for the Web link
+  preview panel, which cannot read a cross-origin frame's headers. It sends
+  a cookieless HEAD (GET only when the server refuses HEAD, which may spend
+  a one-time link), follows up to five redirects itself and answers
+  `allowed`, `refused` or `unknown` within five seconds. It requests only
+  public addresses, checked at connection time, on ports 80 and 443, reads
+  at most 64 KiB of headers and runs at most eight probes at once; others
+  answer `unknown` at once. Through the environment's HTTP(S) proxy it checks
+  every address the name resolves to before asking; the proxy resolves the
+  name again, so only certificates guard https against a name that changes
+  its answer in between.
 - `internal/<feature>`: business behavior, transactions and data access with
   package tests: `collaboration` (Human Rooms and Messages),
   `agentregistry` (Agents, templates, Skill bindings, Another Me),
@@ -38,6 +103,13 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
 
 ## Important Conventions
 
+- `another_me_background_failures` counts an Another Me's background model
+  calls that failed in a row, as the Agent Service reports them; a completed
+  call deletes the row. `GET /v0/tenants/{tenantId}/another-me` carries
+  `background_failure` from the third failure on. The `another-me` hint goes
+  out when it appears, when its reason changes and when it clears; a higher
+  count alone shows on the next fetch. Reason codes TeamHub does not know are
+  stored as `unknown`.
 - The Human's default Another Me Agent is named `Linger`. Changing the Human's
   name updates the delegate description, never the Agent's display name.
   A forward migration renames generated names; custom Agent names stay.
@@ -75,8 +147,35 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   card cannot send it again. `GET` reports `sent` whenever the header says so, and
   `can_edit`; only editors may send or decline. While the latest content is
   still rendering these routes answer 503 with `Retry-After`.
+- The live voice's About the User holds the Human's whole memory.md and the
+  email addresses they use: their own (login, active Gmail connection,
+  addresses in the current Profile) and up to ten recipients of Gmail canvases
+  they sent, read from `document_texts`; all of it goes to the voice provider
+  with the instructions. Live writes a recipient as heard and leaves matching
+  it to TeamHub: before a canvas write, TeamHub compares each `to`/`cc`
+  address not on that list with it, name before `@` and domain apart (edit
+  distance, or a shared start with Jaro-Winkler): a close one holds the write
+  as `needs_confirmation` with reason `check_recipient` and the suggested
+  address (the known one, or the heard name at the known domain). The write
+  goes ahead when the model writes the suggestion, or keeps its own with
+  `confirmed` once the user stood by it (no recorded question is needed: the
+  model may have suggested the known address itself, and sending asks again).
+  It never replaces an address itself.
+- Live whole-document rewrites preserve top-level image, file, audio and video
+  blocks. The model keeps their exported `document-asset:` lines in order;
+  missing, repeated or reordered markers are rejected before any write.
+  Nested media requires targeted text edits. Text runs are edited from last
+  to first with revision checks; a conflict stops the rewrite and reports
+  whether earlier runs changed. Gmail canvases keep their separate header,
+  body and attachment rules; an inline image still blocks a body rewrite.
 - Live voice write tools that finish a send return a `next` asking the model
   to say it was sent; a result without one can leave the voice silent.
+- The live voice's persona is warm and lightly playful and says what it does
+  in the first person; Voice Runtime's tone rules have each reply open with a
+  brief reaction and keep it to two or three short sentences. Humor softens
+  when the user is rushed or upset. Started work is not done; its
+  acknowledgement must not repeat an already-spoken preamble. Change the
+  persona here and the tone rules in Voice Runtime together.
 - Live voice writes need the user's yes from a turn after the question
   (`voiceLiveConfirmed`), except `voicelive.DirectYesTools`: sending a Gmail
   canvas, which is open beside the chat, runs when the user's own turn told
@@ -106,7 +205,10 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   `teamhub room handoff`): TeamHub posts a hidden `agent_runtime` message,
   authored by the Human and mentioning the AnotherMe, in another live Room
   where both are members, and it wakes the AnotherMe's Context there, which
-  then speaks for itself. Only a Run whose inputs carry a message the Human
+  then speaks for itself. `teamhub message read --list-inboxes` returns each
+  authorized Room's display `name` alongside `inbox_id` so AnotherMe can
+  resolve a natural-language Room name to `room:<room-id>` before handing off.
+  Only a Run whose inputs carry a message the Human
   wrote, or a card they decided, in the direct chat may hand off
   (`X-TeamHub-Run-Id`); proactive wakes, Routines and Task callbacks may not,
   because they often carry outside content. A refusal names its reason in an
@@ -120,6 +222,11 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   extra, or wrongly bound route. Handlers are `App` methods that read bound
   query and header parameters with `contractParams[T]` and path parameters
   with `c.Param`.
+- Text TeamHub writes for a person to read stays English and ships with the
+  meaning the client words it from: a status or error with a stable code, a
+  card with its kind and fields, catalog text with its id. Add the code (an
+  enum in `contracts/openapi`) beside the English rather than wording it per
+  language here; the client keeps the English for a code it does not know.
 - `internal/app` opens no transaction and calls no store queries: handlers
   call a domain service and map its errors. `TestAppLayerHoldsNoTransactionsOrQueries`
   (`tests/integration/layout`) fails on a transaction, SQL, a `store.Queries` or
@@ -227,6 +334,23 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   A missing start stays unconfirmed. Keep audio duration and transcript offsets
   on the confirmed timeline, and enqueue an already-requested Stop when the
   initial recorder becomes known, including after restart reconciliation.
+  Every voice job retries a failing step, so give each wait that a person sees
+  a terminal that outlasts a dependency outage. After Stop, a failed
+  reconciliation of an epoch whose recorder sent its terminal receipt spends
+  the epoch's `stop_reconcile_failures` budget with the shared `voiceRetryDelay`
+  backoff; an exhausted budget fails the Capture with that epoch so its voice
+  session can close. Never fail an epoch whose recorder may still write its
+  staging: it keeps its owed stop. A shutdown or not-yet-due deferral spends
+  nothing.
+- A stopped Capture whose recorder saved no audio is not failed outright: its
+  epoch fails with `audio_unavailable` and materialization finalizes the
+  Capture from its live transcript, without an audio Document, once that
+  transcript has speech, kept its integrity and is covered up to its frozen
+  end (Stop, or the earlier end of the input track). Completion then writes the
+  transcript Document, the completion Message (transcript card only) and Quick
+  Notes, and the Meeting Wiki picks it up as any finalized recording. The
+  Meetings browser still lists only recordings with audio. Without speech,
+  integrity or coverage within the transcript wait, the Capture fails.
 - Voice: `TEAMHUB_VOICE_MEDIA` (`on` by default) builds the voice media plane
   over LiveKit; `off`, a missing `LINGER_SECRET_SEED`, or missing ffmpeg keep
   voice off (the last two log `voice.media_unavailable`) without stopping
@@ -235,6 +359,28 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   environment key over one saved in the product (`voice_provider_keys`, sealed
   with `TEAMHUB_SECRET_ENCRYPTION_KEY`), so a save applies without a restart
   on every replica. A save wakes the Node Services voice workers best effort.
+  Only a save checks a key with its provider, never a use. A Soniox key is
+  also probed on the realtime stream (the start request, no audio, five
+  seconds at most), and Soniox's HTTP status gives a refusal its code
+  (`VOICE_KEY_REJECTED`, `VOICE_KEY_NO_BALANCE`,
+  `VOICE_KEY_NO_REALTIME_PERMISSION`, else `VOICE_PROVIDER_UNAVAILABLE`).
+- Web search: `internal/websearch` runs Agent searches and page reads through
+  Tavily, Brave, Firecrawl and You.com with deployment-wide keys in
+  `web_search_keys` (sealed with `TEAMHUB_SECRET_ENCRYPTION_KEY`, read at each
+  call) and the chosen default in `web_search_settings`. TeamHub calls only the
+  providers' fixed API hosts; the CLI reads `direct` pages itself. A search
+  without a backend runs the chosen default as if it were named, even when its
+  key stopped working; without one it uses the first backend with a usable key,
+  else You.com's keyless MCP trial, which TeamHub does not count. A failed call
+  never falls back to another backend. `include_quota=false` lists the
+  backends without calling any provider. A missing or refused key,
+  or the end of the trial, posts a `search_key` card that stores the request.
+  A key added from that card replays the request first: a provider 401/403
+  leaves the key unsaved and the card open; any other outcome saves it and
+  answers the card `configured` with the backend and the call's results or
+  error code. Any save answers every other pending card `configured` with the
+  saved backend, which the Agent reruns with; saves outside a card use the
+  official check (Brave has none and stays unverified until its first call).
 - Local models: `local_computer_model_snapshots` keeps each Computer's latest
   model library snapshot and the last host any snapshot carried; removing the
   Computer deletes the row in the same transaction. Recording a snapshot
@@ -248,19 +394,30 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   (`refreshLocalComputerModels`) forwards an empty-model `refresh` command through
   the same owner/online gate, while `POST .../local-models/{modelId}/actions` acts on
   one model (`refresh` stays invalid there). A connected Computer that has not
-  decided within the action's 10 seconds answers 504
+  decided within the action's 30 seconds answers 504
   `LOCAL_MODEL_ACTION_UNCONFIRMED`: it may still act, and the snapshots show
   the outcome. The Computer's refusal codes map to `LocalModelsErrorCode` in
   `internal/app/handlers_local_models.go` (and `LOAD_NO_ROOM` / `MEMORY_INSUFFICIENT`
-  on model-source switches map to `LOCAL_MODEL_NO_ROOM` in
-  `internal/app/handlers_model_source.go`).
+  map to `LOCAL_MODEL_NO_ROOM` and `BYOK_GATEWAY_FAILED` maps to HTTP 502
+  `BYOK_GATEWAY_FAILED` with the Computer's diagnostic message and a `gateway`
+  detail entry in `internal/app/handlers_model_source.go`).
 - A Computer's model source lives on the Computer
   (`internal/app/handlers_model_source.go`); TeamHub never stores a BYOK key.
   A switch checks for running work, runs `apply` on the Computer, then moves
   the owner's Agents on it in one transaction
-  (`agentregistry.SwitchComputerRuntime`). Work found before `apply` refuses
-  the switch with `AGENT_HAS_ACTIVE_RUNS` unless the owner sent
-  `force_terminate`; work that starts during `apply` keeps only its Agent
-  behind, answered with the same code after the others moved.
+  (`agentregistry.SwitchComputerRuntime`). Both `apply` and the Agent switch run
+  under a context detached from the HTTP client's cancellation (bounded by
+  `modelSourceApplyLifetime`, 190 s) so navigating away mid-switch cannot leave
+  the Computer switched while TeamHub Agents remain on the old Runtime model.
+  TeamHub rejects invalid `apply` statuses (empty `runtime_model` or mismatched
+  `mode`) before updating Agents. Work found before `apply` refuses the switch
+  with `AGENT_HAS_ACTIVE_RUNS` unless the owner sent `force_terminate`; work
+  that starts during `apply` keeps only its Agent behind, answered with the same
+  code after the others moved. Allowlisted BYOK endpoint refusals and
+  `BYOK_GATEWAY_FAILED` forward Computer messages scrubbed of credentials, URL
+  query strings/userinfo, and user-home paths (`safeComputerMessage`), unmapped
+  refusals return generic `MODEL_SOURCE_FAILED` (HTTP 502), and timeouts,
+  `MODEL_SOURCE_EXPIRED`, or client disconnects return `MODEL_SOURCE_UNCONFIRMED`
+  (HTTP 504).
 - Do not add write-only audit, event, or provenance tables. A new audit table
   needs a named product or compliance reader in the same pull request.

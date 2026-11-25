@@ -152,7 +152,7 @@ const mail = {
   },
 };
 describe("reviewed Connector command boundaries", () => {
-  it("provides all 52 reviewed leaves as offline help and schemas, excluding removed apps", async () => {
+  it("provides all 68 reviewed leaves as offline help and schemas, excluding removed apps", async () => {
     const f = await fixture("gmail", () => {
       throw new Error("offline must not call provider");
     });
@@ -160,7 +160,7 @@ describe("reviewed Connector command boundaries", () => {
       x.toolName.startsWith("connector_"),
     );
     // Includes the two provider-independent generation commands.
-    expect(commands.length).toBe(52);
+    expect(commands.length).toBe(68);
     for (const command of commands) {
       expect(
         await runCli([...command.command, "--help"], { ...f.deps, env: {} }),
@@ -663,14 +663,15 @@ describe("mail attachment downloads", () => {
       "--output",
       ".",
     ]);
-    expect(result.error.error.code).toBe("invalid_path");
+    expect(result.error.error.code).toBe("invalid_input");
     expect(
       f.calls.filter((x) => x.body.tool_slug === "GMAIL_GET_ATTACHMENT"),
     ).toHaveLength(0);
   });
   it.each([
     [[], "OUTLOOK_QUERY_EMAILS"],
-    [["--folder", "all"], "OUTLOOK_QUERY_EMAILS"],
+    [["--folder", "all"], "OUTLOOK_LIST_MESSAGES"],
+    [["--folder", "all", "--unread"], "OUTLOOK_LIST_MESSAGES"],
     [["--folder", "sent", "--unread"], "OUTLOOK_QUERY_EMAILS"],
     [["--unread"], "OUTLOOK_QUERY_EMAILS"],
     [["--query", "invoice"], "OUTLOOK_LIST_MESSAGES"],
@@ -690,11 +691,64 @@ describe("mail attachment downloads", () => {
       expect(await validateSchema(schema, seen[0]!.args)).toBe(true);
     },
   );
+  it("lists the whole Outlook mailbox newest first and pages it without a query", async () => {
+    const seen: Json[] = [];
+    const f = await fixture("outlook", (slug, args) => {
+      expect(slug).toBe("OUTLOOK_LIST_MESSAGES");
+      seen.push(args);
+      return args.page_token
+        ? { value: [{ id: "message_two", isRead: false }] }
+        : {
+            value: [{ id: "message_one", isRead: false }],
+            next_page_token: "page_2",
+          };
+    });
+    const flags = ["outlook", "list", "--folder", "all", "--unread"];
+    const first = await f.run([...flags, "--limit", "1", "--json"]);
+    expect(first.code, JSON.stringify(first.error)).toBe(0);
+    expect(first.result).toMatchObject({
+      messages: [{ messageId: "message_one", unread: true }],
+      hasMore: true,
+    });
+    const next = await f.run([
+      ...flags,
+      "--limit",
+      "1",
+      "--cursor",
+      first.result.nextCursor,
+      "--json",
+    ]);
+    expect(next.result).toMatchObject({
+      messages: [{ messageId: "message_two", unread: true }],
+      hasMore: false,
+    });
+    expect(next.result).not.toHaveProperty("nextCursor");
+    expect(seen).toEqual([
+      {
+        top: 1,
+        folder: "allfolders",
+        filter: "receivedDateTime ge 0001-01-01T00:00:00Z and isRead eq false",
+        orderby: ["receivedDateTime desc"],
+      },
+      expect.objectContaining({ folder: "allfolders", page_token: "page_2" }),
+    ]);
+    const inbox = await f.run([
+      "outlook",
+      "list",
+      "--unread",
+      "--limit",
+      "1",
+      "--cursor",
+      first.result.nextCursor,
+    ]);
+    expect(inbox.error.error.code).toBe("cursor_mismatch");
+  });
   it("requires an attachment ID for duplicate Outlook names", async () => {
+    const ids = ["AAMkAGI2THVSAAABEgAQAC/+x1=", "AAMkAGI2THVSAAABEgAQAD+y2="];
     const f = await fixture("outlook", (slug) => {
       if (slug === "OUTLOOK_LIST_OUTLOOK_ATTACHMENTS")
         return {
-          value: ["a", "b"].map((id) => ({
+          value: ids.map((id) => ({
             id,
             name: "Propuesta ñ.pdf",
             "@odata.type": "#microsoft.graph.fileAttachment",
@@ -714,7 +768,7 @@ describe("mail attachment downloads", () => {
       "file.pdf",
     ]);
     expect(result.error.error.code).toBe("target_ambiguous");
-    expect(result.error.error.details.issues).toHaveLength(2);
+    expect(result.error.error.details.candidates).toEqual(ids);
   });
   it("reports saved paths on a partial batch failure without publishing corrupt bytes", async () => {
     const f = await fixture(
@@ -2082,8 +2136,11 @@ describe("generative media connectors", () => {
         ...flags,
         path.join("locked", "a", "clip.mp4"),
       ]);
-      expect(failed.code).toBe(1);
-      expect(failed.error.error.code).toBe("local_failure");
+      expect(failed.code).toBe(2);
+      expect(failed.error.error).toMatchObject({
+        code: "invalid_input",
+        details: { issues: [{ path: "--output", code: "unwritable" }] },
+      });
     },
   );
 });
@@ -2267,5 +2324,401 @@ describe("GitHub commands", () => {
     expect(rejected.error.error.code).toBe("usage");
     expect(rejected.error.error.message).toContain(hint);
     expect(f.calls).toEqual([]);
+  });
+});
+
+describe("outlook-calendar connector", () => {
+  it("lists calendars, queries by mailbox Windows timezone, and searches with OData filter", async () => {
+    const f = await fixture("outlook", (slug, args) => {
+      if (slug === "OUTLOOK_LIST_CALENDARS") {
+        expect(args).toEqual({ top: 10 });
+        return {
+          value: [
+            {
+              id: "cal_primary",
+              name: "Calendar",
+              canEdit: true,
+              isDefaultCalendar: true,
+            },
+            {
+              id: "cal_team",
+              name: "Team",
+              canEdit: false,
+              isDefaultCalendar: false,
+            },
+          ],
+          next_page_token: "tok_2",
+        };
+      }
+      if (slug === "OUTLOOK_GET_MAILBOX_SETTINGS") {
+        expect(args).toEqual({ select: ["timeZone"] });
+        return { timeZone: "China Standard Time" };
+      }
+      if (slug === "OUTLOOK_GET_CALENDAR_VIEW") {
+        expect(args).toEqual({
+          start_datetime: "2026-11-20T16:00:00.000Z",
+          end_datetime: "2026-11-21T16:00:00.000Z",
+          top: 20,
+          orderby: "start/dateTime asc",
+          timezone: "Asia/Shanghai",
+        });
+        return {
+          value: [
+            {
+              id: "evt_day",
+              subject: "Morning standup",
+              showAs: "busy",
+              isCancelled: false,
+              start: {
+                dateTime: "2026-11-21T09:30:00.0000000",
+                timeZone: "China Standard Time",
+              },
+              end: {
+                dateTime: "2026-11-21T10:00:00.0000000",
+                timeZone: "China Standard Time",
+              },
+              organizer: { emailAddress: { address: "owner@example.test" } },
+            },
+          ],
+        };
+      }
+      if (slug === "OUTLOOK_LIST_EVENTS") {
+        expect(args).toEqual({
+          calendar_id: "cal_team",
+          top: 20,
+          expand_recurring_events: true,
+          filter:
+            "start/dateTime lt '2026-11-22T00:00:00Z' and end/dateTime gt '2026-11-21T00:00:00Z' and contains(subject,'O''Reilly') and isCancelled eq false",
+          orderby: ["start/dateTime asc"],
+          timezone: "UTC",
+        });
+        return {
+          value: [
+            {
+              id: "evt_query",
+              subject: "O'Reilly review",
+              type: "occurrence",
+              seriesMasterId: "master_1",
+              start: { dateTime: "2026-11-21T10:00:00", timeZone: "UTC" },
+              end: { dateTime: "2026-11-21T11:00:00", timeZone: "UTC" },
+            },
+          ],
+        };
+      }
+      throw new Error(`Unexpected tool ${slug}`);
+    });
+
+    const cals = await f.run([
+      "outlook-calendar",
+      "calendars",
+      "--limit",
+      "10",
+    ]);
+    expect(cals.code).toBe(0);
+    expect(cals.result.calendars).toEqual([
+      {
+        calendarId: "cal_primary",
+        name: "Calendar",
+        accessRole: "writer",
+        primary: true,
+      },
+      {
+        calendarId: "cal_team",
+        name: "Team",
+        accessRole: "reader",
+        primary: false,
+      },
+    ]);
+    expect(cals.result.hasMore).toBe(true);
+    expect(cals.result.nextCursor).toBeTruthy();
+
+    const byDate = await f.run([
+      "outlook-calendar",
+      "list",
+      "--date",
+      "2026-11-21",
+    ]);
+    expect(byDate.code).toBe(0);
+    expect(byDate.result.events).toEqual([
+      {
+        eventId: "evt_day",
+        calendarId: "primary",
+        title: "Morning standup",
+        status: "busy",
+        start: {
+          dateTime: "2026-11-21T09:30:00+08:00",
+          timeZone: "Asia/Shanghai",
+        },
+        end: {
+          dateTime: "2026-11-21T10:00:00+08:00",
+          timeZone: "Asia/Shanghai",
+        },
+        organizerEmail: "owner@example.test",
+      },
+    ]);
+
+    const byQuery = await f.run([
+      "outlook-calendar",
+      "list",
+      "--calendar",
+      "cal_team",
+      "--from",
+      "2026-11-21T00:00:00Z",
+      "--to",
+      "2026-11-22T00:00:00Z",
+      "--query",
+      "O'Reilly",
+    ]);
+    expect(byQuery.code).toBe(0);
+    expect(byQuery.result.events).toHaveLength(1);
+    expect(byQuery.result.events[0]).toMatchObject({
+      eventId: "evt_query",
+      calendarId: "cal_team",
+      title: "O'Reilly review",
+    });
+  });
+
+  it("finds shared free time across own calendar view and --with schedule, failing closed on incomplete data", async () => {
+    let scheduleResponse: Json = {
+      value: [
+        {
+          scheduleId: "alice@example.test",
+          scheduleItems: [
+            {
+              status: "busy",
+              start: { dateTime: "2026-11-21T10:00:00", timeZone: "UTC" },
+              end: { dateTime: "2026-11-21T11:30:00", timeZone: "UTC" },
+            },
+            {
+              status: "free",
+              start: { dateTime: "2026-11-21T12:00:00", timeZone: "UTC" },
+              end: { dateTime: "2026-11-21T13:00:00", timeZone: "UTC" },
+            },
+          ],
+        },
+      ],
+    };
+    const f = await fixture("outlook", (slug, args) => {
+      if (slug === "OUTLOOK_GET_CALENDAR_VIEW") {
+        return {
+          value: [
+            {
+              id: "evt_own",
+              isCancelled: false,
+              showAs: "busy",
+              start: { dateTime: "2026-11-21T09:00:00", timeZone: "UTC" },
+              end: { dateTime: "2026-11-21T10:30:00", timeZone: "UTC" },
+            },
+          ],
+        };
+      }
+      if (slug === "OUTLOOK_GET_CALENDAR_SCHEDULE") {
+        expect(args).toEqual({
+          schedules: ["alice@example.test"],
+          start_time: { dateTime: "2026-11-21T09:00:00", timeZone: "UTC" },
+          end_time: { dateTime: "2026-11-21T14:00:00", timeZone: "UTC" },
+          availability_view_interval: 30,
+        });
+        return scheduleResponse;
+      }
+      throw new Error(`Unexpected tool ${slug}`);
+    });
+
+    const args = [
+      "outlook-calendar",
+      "free",
+      "--from",
+      "2026-11-21T09:00:00Z",
+      "--to",
+      "2026-11-21T14:00:00Z",
+      "--with",
+      "alice@example.test",
+      "--duration",
+      "45",
+    ];
+    const ok = await f.run(args);
+    expect(ok.code).toBe(0);
+    expect(ok.result.calendarIds).toEqual(["primary", "alice@example.test"]);
+    expect(ok.result.slots).toEqual([
+      {
+        start: "2026-11-21T11:30:00Z",
+        end: "2026-11-21T14:00:00Z",
+        durationMinutes: 150,
+      },
+    ]);
+
+    for (const broken of [
+      { value: [] },
+      {
+        value: [
+          {
+            scheduleId: "alice@example.test",
+            error: { message: "No access" },
+            scheduleItems: [],
+          },
+        ],
+      },
+      {
+        value: [
+          {
+            scheduleId: "alice@example.test",
+            scheduleItems: [
+              { status: "busy", start: { dateTime: "bad" }, end: {} },
+            ],
+          },
+        ],
+      },
+    ]) {
+      scheduleResponse = broken;
+      expect((await f.run(args)).error.error.code).toBe("incomplete_response");
+    }
+  });
+
+  it("creates with --teams, updates attendees, rejects recurring/non-organizer writes, and cancels or deletes appropriately", async () => {
+    let currentEvent: Json = {
+      id: "evt_1",
+      subject: "Project sync",
+      isOrganizer: true,
+      type: "singleInstance",
+      organizer: { emailAddress: { address: "owner@example.test" } },
+      attendees: [
+        {
+          type: "required",
+          status: { response: "accepted" },
+          emailAddress: { name: "Alice", address: "alice@example.test" },
+        },
+        {
+          type: "optional",
+          status: { response: "tentative" },
+          emailAddress: { address: "bob@example.test" },
+        },
+      ],
+    };
+    const executed: string[] = [];
+    const f = await fixture("outlook", (slug, args) => {
+      executed.push(slug);
+      if (slug === "OUTLOOK_CALENDAR_CREATE_EVENT") {
+        expect(args).toEqual({
+          subject: "Project sync",
+          start_datetime: "2026-11-21T02:00:00",
+          end_datetime: "2026-11-21T02:30:00",
+          time_zone: "UTC",
+          attendees_info: [{ email: "alice@example.test", type: "required" }],
+          is_online_meeting: true,
+          online_meeting_provider: "teamsForBusiness",
+        });
+        return {
+          id: "evt_1",
+          subject: "Project sync",
+          onlineMeeting: {
+            joinUrl: "https://teams.microsoft.com/l/meetup-join/demo",
+          },
+          start: { dateTime: "2026-11-21T02:00:00", timeZone: "UTC" },
+          end: { dateTime: "2026-11-21T02:30:00", timeZone: "UTC" },
+        };
+      }
+      if (slug === "OUTLOOK_GET_EVENT" || slug === "OUTLOOK_GET_CALENDAR_EVENT")
+        return currentEvent;
+      if (slug === "OUTLOOK_UPDATE_CALENDAR_EVENT") {
+        expect(args).toEqual({
+          event_id: "evt_1",
+          attendees: [
+            {
+              type: "required",
+              emailAddress: { address: "alice@example.test", name: "Alice" },
+            },
+            {
+              type: "required",
+              emailAddress: { address: "charlie@example.test" },
+            },
+          ],
+        });
+        return { id: "evt_1", subject: "Project sync" };
+      }
+      if (slug === "OUTLOOK_CANCEL_EVENT") {
+        expect(args).toEqual({ user_id: "me", event_id: "evt_1" });
+        return {};
+      }
+      if (slug === "OUTLOOK_DELETE_CALENDAR_EVENT_FROM_SPECIFIC_CALENDAR") {
+        expect(args).toEqual({ calendar_id: "cal_work", event_id: "evt_solo" });
+        return {};
+      }
+      throw new Error(`Unexpected tool ${slug}`);
+    });
+
+    const created = await f.run([
+      "outlook-calendar",
+      "create",
+      "Project sync",
+      "--start",
+      "2026-11-21T10:00:00+08:00",
+      "--duration",
+      "30",
+      "--attendee",
+      "alice@example.test",
+      "--teams",
+    ]);
+    expect(created.code).toBe(0);
+    expect(created.result.result.event.meetingUrl).toBe(
+      "https://teams.microsoft.com/l/meetup-join/demo",
+    );
+
+    const updated = await f.run([
+      "outlook-calendar",
+      "update",
+      "evt_1",
+      "--add-attendee",
+      "charlie@example.test",
+      "--remove-attendee",
+      "bob@example.test",
+    ]);
+    expect(updated.code).toBe(0);
+
+    const canceledMeeting = await f.run([
+      "outlook-calendar",
+      "cancel",
+      "evt_1",
+    ]);
+    expect(canceledMeeting.code).toBe(0);
+    expect(executed).toContain("OUTLOOK_CANCEL_EVENT");
+
+    currentEvent = {
+      id: "evt_solo",
+      isOrganizer: true,
+      type: "singleInstance",
+      attendees: [],
+    };
+    const canceledSolo = await f.run([
+      "outlook-calendar",
+      "cancel",
+      "evt_solo",
+      "--calendar",
+      "cal_work",
+    ]);
+    expect(canceledSolo.code).toBe(0);
+    expect(executed).toContain(
+      "OUTLOOK_DELETE_CALENDAR_EVENT_FROM_SPECIFIC_CALENDAR",
+    );
+
+    currentEvent = {
+      id: "evt_rec",
+      isOrganizer: true,
+      seriesMasterId: "master_1",
+      type: "occurrence",
+    };
+    expect(
+      (await f.run(["outlook-calendar", "update", "evt_rec", "--title", "New"]))
+        .error.error.code,
+    ).toBe("unsupported_combination");
+
+    currentEvent = {
+      id: "evt_other",
+      isOrganizer: false,
+      type: "singleInstance",
+    };
+    expect(
+      (await f.run(["outlook-calendar", "cancel", "evt_other"])).error.error
+        .code,
+    ).toBe("forbidden");
   });
 });

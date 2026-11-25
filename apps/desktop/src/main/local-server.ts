@@ -33,10 +33,17 @@ import {
   readLocalIdentity,
   readLocalLogin,
 } from "@linger/local-installation/account";
+import { extractArchiveFallback } from "@linger/local-installation/archive";
 import { downloadInRegion } from "@linger/local-installation/region";
 import { latestLegacyBackup } from "@linger/local-installation/legacy-database";
 import { legacyMigrationPending } from "@linger/local-installation/home";
-import { validateSourceRepository } from "@linger/local-installation/source-checkout";
+import { loadInstance } from "@linger/local-installation/instance";
+import { foldersInUse } from "@linger/local-installation/native-process";
+import { normalizeFailurePunctuation } from "@linger/local-installation/localmodels-failure";
+import {
+  localRunnerGatewayUrl,
+  validateSourceRepository,
+} from "@linger/local-installation/source-checkout";
 import type { LegacyInstanceSkipped } from "@linger/local-installation/legacy-migration";
 import {
   type SetupChoice,
@@ -53,11 +60,18 @@ import {
   NATIVE_RUNTIME_DIRECTORY,
   readNativeRuntime,
 } from "@linger/local-installation/native-runtime";
+import { linuxNodeFdHygieneArgs } from "@linger/local-installation/native-process-fds";
 import {
   installTeamhubBinaries,
   TEAMHUB_BINARY_DIRECTORY,
 } from "@linger/local-installation/teamhub-binaries";
 import { redact } from "@linger/local-installation/redaction";
+import { isInkling2MiniModelId } from "@linger/service-kit/featured-models";
+import {
+  windowsPrivateLocation,
+  windowsPrivateRefusal,
+  type WindowsPrivateRefusal,
+} from "@linger/local-installation/windows-private";
 import { adoptUserEnvironment } from "@linger/local-installation/user-environment";
 
 import {
@@ -74,6 +88,7 @@ import {
 } from "./navigation.js";
 import { humanTenant, type EnrollmentModule } from "./enrollment.js";
 import { compareVersions } from "./update-manifest.js";
+import { systemProxy } from "./system-proxy.js";
 import type { WindowManagerModule } from "./window-manager.js";
 import {
   installerKeyChanges,
@@ -128,10 +143,10 @@ export type LocalModelsCheck =
       readonly state: "checked";
       // Whether this computer can serve a local model now.
       readonly eligible: boolean;
-      // The model fits this computer's hardware, but other programs hold
-      // memory it needs now: the tool's state "blocked-now". The install
-      // would plan again against the memory free then, so it is not offered
-      // until a new check finds that memory.
+      // A temporary blocker prevents installing right now (the tool's state
+      // "blocked-now", such as memory held by other programs, gateway port in
+      // use, or harness unavailable); shown on hold until a new check clears
+      // it.
       readonly blockedNow?: true;
       // While blocked now: the memory free now and what the plan needs, as
       // the tool counts them (VRAM only for a discrete GPU).
@@ -139,7 +154,7 @@ export type LocalModelsCheck =
       readonly memoryBytes: number;
       readonly diskFreeBytes: number | null;
       readonly gpu?: string;
-      // Present when eligible or when it needs free memory.
+      // Present when eligible or when a blocked-now report included a plan.
       readonly model?: LocalModel;
       // The localmodels tool's code for why not, or, when eligible, for
       // what could still stop the install, with the counts it carries.
@@ -223,6 +238,8 @@ export const LOCAL_STEPS = [
 ] as const;
 export type LocalServerStep = (typeof LOCAL_STEPS)[number];
 
+export type LocalServerPreparing = "updating" | "starting";
+
 export type LocalServerPhase =
   | "idle"
   | "preparing"
@@ -262,8 +279,33 @@ export interface RuntimeSignIn {
   readonly deviceCode?: string;
   // The vendor's page shows a code to paste back (Claude Code).
   readonly acceptsCode?: boolean;
+  // Why a failed sign-in ended, which the page words itself; message is the
+  // installer's own English for anything else.
+  readonly reason?: RuntimeLoginReason;
   readonly message?: string;
+  // The browser could not be opened on url; the page offers to copy it.
+  readonly browserFailed?: boolean;
 }
+
+// unavailable: no native sign-in for this runtime; timed_out: nobody
+// finished it in time; ended: the login stopped without a sign-in.
+export type RuntimeLoginReason = "unavailable" | "timed_out" | "ended";
+
+// Why an installation stopped, for failures the setup page words itself:
+// the runtime lookup outlasted RUNTIME_LOOKUP_LIMIT_MS, or the installer
+// stopped answering while it ran.
+export type LocalServerFailure =
+  | "runtime_lookup_timed_out"
+  | "runtime_lookup_unreachable";
+
+// What a running step still waits on once it has taken a while; the page
+// says so, since the bar does not move meanwhile.
+export type LocalServerWaiting = "runtime";
+
+// Codex's two logins: browser calls back to this computer, so the browser
+// must run here; device shows a code to enter in any browser, which needs
+// device-code sign-in turned on in the person's ChatGPT settings.
+export type RuntimeLoginMethod = "browser" | "device";
 
 export interface LocalServerStatus {
   // Source installs ship for macOS arm64, Linux x64 and Windows x64 only, and need the
@@ -271,6 +313,9 @@ export interface LocalServerStatus {
   readonly available: boolean;
   readonly phase: LocalServerPhase;
   readonly message: string;
+  // While preparing: whether the services restart on a new version or
+  // only start, for pages that word it themselves.
+  readonly preparing?: LocalServerPreparing;
   // While installing: the steps shown, the current one and the overall share
   // done (0-1).
   readonly steps: readonly LocalServerStep[];
@@ -278,6 +323,8 @@ export interface LocalServerStatus {
   readonly progress: number;
   // While the current step downloads: what and how far.
   readonly transfer?: Transfer & { readonly label: string };
+  // While installing: what a step that has run a while still waits on.
+  readonly waiting?: LocalServerWaiting;
   // Which installation this is; each Install or Try Again starts a new one.
   readonly attempt: number;
   readonly localModels: LocalModelsCheck;
@@ -295,6 +342,19 @@ export interface LocalServerStatus {
   // Where this installation moved the data of the earlier Simplex app,
   // which it could not upgrade.
   readonly legacyBackup?: string;
+  // While failed because the installer refused a folder as not private
+  // (Windows): its code and reason.
+  readonly refusal?: WindowsPrivateRefusal;
+  // While failed for a reason the page words itself.
+  readonly failure?: LocalServerFailure;
+  // While ready after a degraded resume where local models could not be restored.
+  readonly localModelsDegraded?: LocalModelsDegradedStatus;
+}
+
+export interface LocalModelsDegradedStatus {
+  readonly code: string;
+  readonly message: string;
+  readonly reasons?: readonly string[];
 }
 
 export interface LocalServerOptions {
@@ -336,6 +396,13 @@ export interface LocalServerOptions {
   readonly pollMs?: number;
   // The free space a picked folder needs; LOCATION_FREE_BYTES by default.
   readonly freeBytes?: number;
+  // Where the Desktop Computer daemon stores its config and state
+  // (<userData>/computer); validated on Windows during setup preflight so
+  // ancestor ACL refusals fail immediately instead of after installation.
+  readonly daemonDirectory?: string;
+  // Checks Windows private-path safety for a candidate directory without
+  // creating it or mutating ACLs; windowsPrivateLocation by default on Windows.
+  readonly checkPrivateLocation?: (directory: string) => Promise<void>;
   // How long setup waits for the Another Me; AGENTS_TIMEOUT_MS by default.
   readonly agentsTimeoutMs?: number;
   // Opens the runtime's sign-in page in the browser.
@@ -347,6 +414,14 @@ export interface LocalServerOptions {
   readonly rename?: (from: string, to: string) => Promise<void>;
   // The glibc of this Linux computer; the running one's by default.
   readonly glibcVersion?: string;
+  // Chromium's proxy for a URL (session.resolveProxy); without it the
+  // services get no system proxy.
+  readonly resolveProxy?: (url: string) => Promise<string>;
+  // How often the running server the window shows is checked, and how long
+  // one that does not answer gets to come back by itself before a resume;
+  // WATCH_MS and UNREACHABLE_GRACE_MS by default.
+  readonly watchMs?: number;
+  readonly unreachableGraceMs?: number;
 }
 
 // The starter Room the server makes for a new owner, with their Agents.
@@ -357,6 +432,19 @@ const SIGN_IN_POLL_MS = 3_000;
 // How long one check that the installed server still answers as itself
 // serves the pages that ask whether to offer the owner account.
 const SERVER_CHECK_TTL_MS = 2_000;
+const WATCH_MS = 30_000;
+// Longer than a service supervisor's restart delays (1, 2 and 5 seconds)
+// plus a web start, so a restart it has under way is not doubled.
+const UNREACHABLE_GRACE_MS = 20_000;
+// A ready server counts as stopped only after this many unanswered checks in
+// a row, spread over the grace, each waiting longer than a launch's fast
+// check: one under heavy load (such as local model inference) can answer
+// slowly for a while, and resuming it would send the window to Starting.
+const UNREACHABLE_PROBES = 3;
+const UNREACHABLE_PROBE_TIMEOUT_MS = 5_000;
+// A server that keeps going away is resumed at most this often on its own;
+// Retry is never held back.
+const RECOVERY_INTERVAL_MS = 60_000;
 
 // The instance the desktop installs.
 export const LOCAL_INSTANCE = "desktop";
@@ -422,6 +510,7 @@ export class LocalServerModule implements Module {
   #ctx: ModuleContext | undefined;
   #phase: LocalServerPhase = "idle";
   #message = "";
+  #preparing: LocalServerPreparing = "starting";
   #step: LocalServerStep = "prepare";
   #progress = 0;
   #transfer: LocalServerStatus["transfer"];
@@ -429,6 +518,8 @@ export class LocalServerModule implements Module {
   #attempt = 0;
   #origin: string | undefined;
   #resuming = false;
+  #busyCount = 0;
+  #started = false;
   #running: Promise<void> | undefined;
   #check: LocalModelsCheck = { state: "unchecked" };
   #checkedAt: number | undefined;
@@ -439,9 +530,17 @@ export class LocalServerModule implements Module {
   #home: string;
   #location: string | undefined;
   #locationError: string | undefined;
+  #refusal: WindowsPrivateRefusal | undefined;
+  #failure: LocalServerFailure | undefined;
+  #waiting: LocalServerWaiting | undefined;
+  #localModelsDegraded: LocalModelsDegradedStatus | undefined;
   #node: Promise<string> | undefined;
   #abort = new AbortController();
   #offRetry: (() => void) | undefined;
+  #offUnreachable: (() => void) | undefined;
+  #watch: ReturnType<typeof setInterval> | undefined;
+  #recovering = false;
+  #recoveredAt: number | undefined;
   #offReset: (() => void) | undefined;
   #offDaemon: (() => void) | undefined;
   #offDaemonConnection: (() => void) | undefined;
@@ -459,6 +558,9 @@ export class LocalServerModule implements Module {
   #switchTo: LocalRuntime | undefined;
   #switchByok: SetupByokConfig | undefined;
   #opened: string | undefined;
+  // The Codex login this app asked for; undefined leaves the choice, and
+  // opening the browser, to the installer.
+  #signInMethod: RuntimeLoginMethod | undefined;
   #serverCheck:
     | { readonly at: number; readonly ok: Promise<boolean> }
     | undefined;
@@ -489,7 +591,11 @@ export class LocalServerModule implements Module {
     if (record) this.#home = record.home;
     const config = ctx.config.get();
     const resumes =
-      !!record && config.serverUrl === record.origin && !!config.computerId;
+      !!record &&
+      config.serverUrl !== undefined &&
+      sameOrigin(config.serverUrl, record.origin) &&
+      !!config.computerId;
+    this.#started = true;
     if (migrationFailure) {
       // Resume would fail on the legacy record with a less useful error;
       // Retry resumes, and the installer migrates again first.
@@ -509,18 +615,38 @@ export class LocalServerModule implements Module {
       this.#daemonConnection = undefined;
     });
     this.#offRetry = ctx.bus.on("local-server.retry", () => {
-      if (this.#phase === "failed" && record) {
-        void this.#resume(record, this.#abort.signal);
+      if (this.#phase === "ready") {
+        void this.#recoverUnreachable("retry", 0, false);
+        return;
       }
+      if (this.#phase !== "failed") return;
+      void this.#readRecord().then((latest) => {
+        const target = latest ?? record;
+        if (target && this.#phase === "failed") {
+          record = target;
+          void this.#resume(target, this.#abort.signal);
+        }
+      });
     });
     this.#offReset = ctx.bus.on("local-server.reset", () => {
       record = undefined;
       void this.#reset();
     });
+    const grace = this.#options.unreachableGraceMs ?? UNREACHABLE_GRACE_MS;
+    this.#offUnreachable = ctx.bus.on("local-server.unreachable", () => {
+      void this.#recoverUnreachable("load_failed", grace, true);
+    });
+    this.#watch = setInterval(
+      () => void this.#recoverUnreachable("watch", grace, true),
+      this.#options.watchMs ?? WATCH_MS,
+    );
+    this.#watch.unref?.();
   }
 
   async stop(reason: StopReason): Promise<void> {
     this.#offRetry?.();
+    this.#offUnreachable?.();
+    clearInterval(this.#watch);
     this.#offReset?.();
     this.#offDaemon?.();
     this.#offDaemonConnection?.();
@@ -528,7 +654,22 @@ export class LocalServerModule implements Module {
     // The installer manager keeps running a started installation; it exits
     // by itself once idle.
     this.#abort.abort();
+    if (this.#busyCount > 0) {
+      this.#busyCount = 0;
+      this.#ctx?.bus.emit("local-server.busy", false);
+    }
     if (reason === "quit") await this.#stopLocalModels();
+  }
+
+  #acquireBusy(): void {
+    this.#busyCount += 1;
+    if (this.#busyCount === 1) this.#ctx?.bus.emit("local-server.busy", true);
+  }
+
+  #releaseBusy(): void {
+    if (this.#busyCount === 0) return;
+    this.#busyCount -= 1;
+    if (this.#busyCount === 0) this.#ctx?.bus.emit("local-server.busy", false);
   }
 
   // The Computer exits with the app, so after a quit nothing uses the local
@@ -562,6 +703,7 @@ export class LocalServerModule implements Module {
       const child = spawn(
         process.execPath,
         [
+          ...linuxNodeFdHygieneArgs(this.#options.platform),
           this.#installerScript(),
           "--home",
           this.#options.home,
@@ -596,6 +738,18 @@ export class LocalServerModule implements Module {
     return record !== undefined && sameOrigin(record.origin, serverUrl);
   }
 
+  // Whether the window should show "Starting Linger" instead of the retrying
+  // offline page when `serverUrl` fails to load. True while a resume is active
+  // for this origin, or during initial boot before LocalServer.start() begins
+  // the resume; false once resume has settled so a later transient failure
+  // never traps the window on the non-retrying Starting page.
+  async isStarting(serverUrl: string): Promise<boolean> {
+    if (this.#resuming)
+      return this.#origin !== undefined && sameOrigin(this.#origin, serverUrl);
+    if (!this.#started) return this.resumable(serverUrl);
+    return false;
+  }
+
   status(): LocalServerStatus {
     // The services run natively, so the build must carry PostgreSQL for
     // this computer.
@@ -616,10 +770,14 @@ export class LocalServerModule implements Module {
       available,
       phase: this.#phase,
       message: this.#message,
+      ...(this.#phase === "preparing" ? { preparing: this.#preparing } : {}),
       steps: this.#steps(),
       step: this.#step,
       progress: this.#progress,
       ...(this.#transfer ? { transfer: this.#transfer } : {}),
+      ...(this.#waiting && this.#phase === "installing"
+        ? { waiting: this.#waiting }
+        : {}),
       attempt: this.#attempt,
       localModels: this.#check,
       location: {
@@ -635,6 +793,11 @@ export class LocalServerModule implements Module {
       ...(this.#byokCheck ? { byokCheck: this.#byokCheck } : {}),
       ...(this.#byokModels ? { byokModels: this.#byokModels } : {}),
       ...(this.#legacyBackup ? { legacyBackup: this.#legacyBackup } : {}),
+      ...(this.#refusal ? { refusal: this.#refusal } : {}),
+      ...(this.#failure ? { failure: this.#failure } : {}),
+      ...(this.#localModelsDegraded
+        ? { localModelsDegraded: this.#localModelsDegraded }
+        : {}),
     };
   }
 
@@ -696,7 +859,12 @@ export class LocalServerModule implements Module {
             ms: Date.now() - started,
             eligible: check.state === "checked" && check.eligible,
             ...(check.state === "checked" && check.blockedNow
-              ? { blocked_now: true, free_memory: check.freeMemory }
+              ? {
+                  blocked_now: true,
+                  ...(check.freeMemory
+                    ? { free_memory: check.freeMemory }
+                    : {}),
+                }
               : {}),
             ...(check.state === "checked" && check.recommendation
               ? { recommendation: check.recommendation }
@@ -812,7 +980,13 @@ export class LocalServerModule implements Module {
       const output = await new Promise<string>((resolve, reject) => {
         const child = spawn(
           process.execPath,
-          [this.#installerScript(), "--home", home, flag],
+          [
+            ...linuxNodeFdHygieneArgs(this.#options.platform),
+            this.#installerScript(),
+            "--home",
+            home,
+            flag,
+          ],
           {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
@@ -859,6 +1033,7 @@ export class LocalServerModule implements Module {
       const child = spawn(
         process.execPath,
         [
+          ...linuxNodeFdHygieneArgs(this.#options.platform),
           this.#installerScript(),
           "--home",
           this.#options.home,
@@ -944,9 +1119,9 @@ export class LocalServerModule implements Module {
       typeof estimate?.model === "string" && estimate.model
         ? estimate.model
         : undefined;
-    // Offered only with a model to show; the plan names it. A plan blocked
-    // now cannot install until other programs free memory.
-    const blockedNow = !!name && report.localModels.state === "blocked-now";
+    // A blocked-now report holds local models even when no plan could be built
+    // yet (for example gateway-port-in-use or harness-unavailable).
+    const blockedNow = report.localModels.state === "blocked-now";
     const eligible = report.localModels.eligible && !!name && !blockedNow;
     const memory = report.localModels.memory;
     const freeMemory: SetupMemory | undefined =
@@ -971,14 +1146,27 @@ export class LocalServerModule implements Module {
         )
       : [];
     // The page words each reason by its code and counts, never the tool's.
+    const version = (value: unknown) =>
+      typeof value === "string" && /^\d+(?:\.\d+){0,2}$/.test(value)
+        ? value
+        : null;
     const reasons = listed.map((reason): SetupReason => {
       const counted = (key: "gpuIndex" | "freeBytes" | "requiredBytes") =>
         bytes(reason[key]) !== null ? { [key]: reason[key] as number } : {};
+      const versioned = (
+        key: "detectedCudaVersion" | "requiredCudaVersion" | "driverVersion",
+      ) => {
+        const value = version(reason[key]);
+        return value !== null ? { [key]: value } : {};
+      };
       return {
         code: reason.code as string,
         ...counted("gpuIndex"),
         ...counted("freeBytes"),
         ...counted("requiredBytes"),
+        ...versioned("detectedCudaVersion"),
+        ...versioned("requiredCudaVersion"),
+        ...versioned("driverVersion"),
       };
     });
     const reasonLog = listed.map(({ code, message }) =>
@@ -1012,6 +1200,9 @@ export class LocalServerModule implements Module {
               downloadBytes: bytes(estimate?.downloadBytes),
               diskBytes: bytes(estimate?.diskBytes),
               memoryBytes: bytes(estimate?.memoryBytes),
+              ...(isInkling2MiniModelId(name)
+                ? { featuredInkling: true as const }
+                : {}),
             },
           }
         : {}),
@@ -1041,6 +1232,7 @@ export class LocalServerModule implements Module {
     const signal = this.#abort.signal;
     const home = this.#location ?? this.#home;
     this.#attempt += 1;
+    this.#acquireBusy();
     try {
       // A retry starts over from the first step.
       this.#step = "prepare";
@@ -1066,6 +1258,34 @@ export class LocalServerModule implements Module {
             (plan.runtime === "local" ? (model?.diskBytes ?? 0) : 0),
         );
         if (error) throw new Error(error);
+      }
+      // On Windows, pre-check both the install home and the Computer daemon
+      // directory (<userData>/computer) before unpacking so ancestor ACL
+      // refusals fail immediately instead of after installation and enrollment.
+      if ((this.#options.platform ?? process.platform) === "win32") {
+        const checkPrivate =
+          this.#options.checkPrivateLocation ?? windowsPrivateLocation;
+        await this.#timed("private_paths", async () => {
+          await checkPrivate(home);
+          const daemonDirectory = this.#options.daemonDirectory;
+          if (
+            daemonDirectory &&
+            path.resolve(daemonDirectory) !== path.resolve(home)
+          ) {
+            try {
+              await checkPrivate(daemonDirectory);
+            } catch (error) {
+              // Do not tag a daemon-directory refusal as an install-location
+              // refusal; moving the install folder does not move <userData>.
+              const detail =
+                error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `Desktop Computer directory validation failed: ${detail}`,
+                { cause: error },
+              );
+            }
+          }
+        });
       }
       const node = await this.#timed("node", () => this.#ensureNode(signal));
       const keysChanged = Object.keys(plan.keys ?? {}).length > 0;
@@ -1127,7 +1347,7 @@ export class LocalServerModule implements Module {
       for (;;) {
         const nextChoice = job.signInRequired
           ? await this.#timed("await_signin", () =>
-              this.#awaitSignIn(installer, signal),
+              this.#awaitSignIn(installer, signal, job.setupChoice),
             )
           : undefined;
         if (!nextChoice) break;
@@ -1158,8 +1378,10 @@ export class LocalServerModule implements Module {
         .prewarmAssets(job.origin);
       // The desktop's Computer runs the runtime this installer set up, with
       // its profile, rather than whatever its PATH finds.
-      const runtime = await this.#timed("installer_runtime", () =>
-        installer.runtime(signal),
+      const runtime = await this.#timed("installer_runtime", async () =>
+        job.runtime && !job.signInRequired
+          ? job.runtime
+          : this.#runtimeOf(installer, signal),
       );
       const preferredRuntime = setupRuntime(runtime.setupChoice);
       this.#ctx?.config.update({
@@ -1228,8 +1450,17 @@ export class LocalServerModule implements Module {
         step: this.#step,
         error: message,
       });
-      this.#set("failed", message);
+      this.#set(
+        "failed",
+        message,
+        windowsPrivateRefusal(
+          (error as { refusal?: unknown } | null)?.refusal ?? error,
+        ),
+        localServerFailure((error as { code?: unknown } | null)?.code),
+      );
       throw error;
+    } finally {
+      this.#releaseBusy();
     }
   }
 
@@ -1263,9 +1494,12 @@ export class LocalServerModule implements Module {
   async #awaitSignIn(
     installer: InstallerApi,
     signal: AbortSignal,
+    setupChoice?: string,
   ): Promise<LocalRuntime | { readonly byok: SetupByokConfig } | undefined> {
     const runtime =
-      setupRuntime((await installer.runtime(signal)).setupChoice) ?? "pi";
+      setupRuntime(setupChoice) ??
+      setupRuntime((await this.#runtimeOf(installer, signal)).setupChoice) ??
+      "pi";
     this.#signInInstaller = installer;
     this.#switchTo = undefined;
     this.#switchByok = undefined;
@@ -1314,29 +1548,38 @@ export class LocalServerModule implements Module {
           ? "failed"
           : "required"
         : login.state;
+    const url = state === "waiting_user" ? login.url : undefined;
+    const reason =
+      state === "failed"
+        ? login.state === "failed"
+          ? login.reason
+          : previous?.reason
+        : undefined;
     this.#signIn = {
       runtime,
       state,
-      ...(state === "waiting_user" && login.url ? { url: login.url } : {}),
-      ...(state === "waiting_user" && login.deviceCode
-        ? { deviceCode: login.deviceCode }
-        : {}),
-      ...(state === "waiting_user" && login.acceptsCode
-        ? { acceptsCode: true }
-        : {}),
+      ...(url ? { url } : {}),
+      ...(url && login.deviceCode ? { deviceCode: login.deviceCode } : {}),
+      ...(url && login.acceptsCode ? { acceptsCode: true } : {}),
+      ...(reason ? { reason } : {}),
       ...(state === "failed"
         ? { message: login.message ?? previous?.message ?? "" }
         : {}),
+      ...(url && url === previous?.url && previous.browserFailed
+        ? { browserFailed: true }
+        : {}),
     };
-    // Claude Code and Codex open the browser themselves, on the page that
-    // calls back to them; the link they print is the fallback that needs a
-    // pasted code. A device login opens nothing, so its page opens here.
+    // On macOS and Windows, Claude Code and Codex open the browser
+    // themselves, on the page that calls back to them; the link they print
+    // is the fallback. A device login opens nothing, and on Linux this app
+    // asks Codex to leave the browser to it, so those pages open here,
+    // where a failure to open shows.
     if (
-      this.#signIn.deviceCode &&
-      this.#signIn.url &&
-      this.#signIn.url !== this.#opened
+      url &&
+      url !== this.#opened &&
+      (this.#signIn.deviceCode || this.#signInMethod === "browser")
     ) {
-      this.#opened = this.#signIn.url;
+      this.#opened = url;
       void this.openSignInPage();
     }
     this.#advance("signin", 0, `Sign in to ${RUNTIME_NAMES[runtime]}`);
@@ -1347,6 +1590,19 @@ export class LocalServerModule implements Module {
     this.#signInInstaller = undefined;
     this.#signInWake = undefined;
     this.#opened = undefined;
+    this.#signInMethod = undefined;
+  }
+
+  // Whether the window is pointed at this app's own local installation
+  // regardless of startup phase (installing, preparing/resuming, or ready),
+  // unlike servesWindow(), which also requires readiness and TeamHub proof
+  // before posting the owner password.
+  async ownsWindow(): Promise<boolean> {
+    const serverUrl = this.#ctx?.config.get().serverUrl;
+    if (!serverUrl) return false;
+    if (this.#origin && sameOrigin(this.#origin, serverUrl)) return true;
+    const record = await this.#readRecord();
+    return Boolean(record && sameOrigin(record.origin, serverUrl));
   }
 
   // Whether the window shows the Linger this app installed here and its
@@ -1467,15 +1723,30 @@ export class LocalServerModule implements Module {
   }
 
   // Starts the runtime's own login (the installer runs it), or hands it the
-  // code the vendor's page showed.
-  async startSignIn(code?: string): Promise<void> {
+  // code the vendor's page showed. device starts Codex's device-code login,
+  // for a browser on another device. On Linux, Codex's browser login opens
+  // its page from here rather than from the CLI, so a failure to open shows.
+  async startSignIn(code?: string, device = false): Promise<void> {
     const installer = this.#signInInstaller;
     const runtime = this.#signIn?.runtime;
     if (!installer || !runtime) return;
+    if (code === undefined)
+      this.#signInMethod =
+        runtime !== "codex"
+          ? undefined
+          : device
+            ? "device"
+            : (this.#options.platform ?? process.platform) === "linux"
+              ? "browser"
+              : undefined;
     this.#signIn = { runtime, state: "starting" };
     this.#ctx?.bus.emit("local-server.changed");
     const login = await installer
-      .runtimeLogin(true, code)
+      .runtimeLogin(
+        true,
+        code,
+        code === undefined ? this.#signInMethod : undefined,
+      )
       .catch((error: unknown) => ({
         state: "failed" as const,
         message: error instanceof Error ? error.message : String(error),
@@ -1494,6 +1765,7 @@ export class LocalServerModule implements Module {
     if (this.#signInInstaller !== installer) return;
     this.#signIn = { runtime, state: "required" };
     this.#opened = undefined;
+    this.#signInMethod = undefined;
     this.#ctx?.bus.emit("local-server.changed");
   }
 
@@ -1511,10 +1783,27 @@ export class LocalServerModule implements Module {
     this.#signInWake?.();
   }
 
+  // Opens the sign-in page in the default browser. When none opens, the
+  // step says so and the page offers the link to copy; the link itself is
+  // never logged, since it carries the login's state.
   async openSignInPage(): Promise<void> {
     const url = this.#signIn?.url;
-    if (url && new URL(url).protocol === "https:")
-      await this.#options.openExternal?.(url);
+    const open = this.#options.openExternal;
+    if (!url || !open || new URL(url).protocol !== "https:") return;
+    let failed = false;
+    try {
+      await open(url);
+    } catch (error) {
+      failed = true;
+      this.#ctx?.log.warn("local_server.sign_in_browser_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const signIn = this.#signIn;
+    if (signIn?.url !== url || !!signIn.browserFailed === failed) return;
+    const { browserFailed: _, ...rest } = signIn;
+    this.#signIn = failed ? { ...rest, browserFailed: true } : rest;
+    this.#ctx?.bus.emit("local-server.changed");
   }
 
   // Whether the source package comes over the network; a bundled one and a
@@ -1534,7 +1823,32 @@ export class LocalServerModule implements Module {
     );
   }
 
-  #set(phase: LocalServerPhase, message: string): void {
+  // The runtime the installation set up. On Windows the installer's lookup
+  // can run for minutes with nothing to report, so after a while the page
+  // says what it waits on.
+  async #runtimeOf(
+    installer: InstallerApi,
+    signal: AbortSignal,
+  ): Promise<InstanceRuntime> {
+    const slow = setTimeout(() => {
+      this.#waiting = "runtime";
+      this.#ctx?.bus.emit("local-server.changed");
+    }, RUNTIME_LOOKUP_HINT_MS);
+    try {
+      return await installer.runtime(signal);
+    } finally {
+      clearTimeout(slow);
+      this.#waiting = undefined;
+    }
+  }
+
+  // A refusal or a failure reason stays only with the failure it caused.
+  #set(
+    phase: LocalServerPhase,
+    message: string,
+    refusal?: WindowsPrivateRefusal,
+    failure?: LocalServerFailure,
+  ): void {
     // A failure stays on the step it happened in.
     if (phase !== "installing" && phase !== "ready" && phase !== "failed") {
       this.#progress = 0;
@@ -1544,6 +1858,9 @@ export class LocalServerModule implements Module {
     if (phase !== "installing") this.#transfer = undefined;
     this.#phase = phase;
     this.#message = message;
+    this.#refusal = phase === "failed" ? refusal : undefined;
+    this.#failure = phase === "failed" ? failure : undefined;
+    if (phase !== "ready") this.#localModelsDegraded = undefined;
     this.#ctx?.bus.emit("local-server.changed");
   }
 
@@ -1578,7 +1895,13 @@ export class LocalServerModule implements Module {
     const outcome = await new Promise<LegacyMigrationRun>((resolve) => {
       const child = spawn(
         process.execPath,
-        [this.#installerScript(), "--home", home, "--migrate"],
+        [
+          ...linuxNodeFdHygieneArgs(this.#options.platform),
+          this.#installerScript(),
+          "--home",
+          home,
+          "--migrate",
+        ],
         {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
@@ -2016,12 +2339,24 @@ export class LocalServerModule implements Module {
     if (this.#options.checkout) return;
     const parent = path.join(home, "desktop", "source");
     const kept = keep.flatMap((item) => (item ? [path.basename(item)] : []));
-    for (const entry of await readdir(parent).catch(() => [] as string[]))
-      if (!kept.includes(entry))
-        await rm(path.join(parent, entry), {
-          recursive: true,
-          force: true,
-        }).catch(() => undefined);
+    const prunable = (
+      await readdir(parent).catch(() => [] as string[])
+    ).flatMap((entry) =>
+      kept.includes(entry) ? [] : [path.join(parent, entry)],
+    );
+    if (!prunable.length) return;
+    // A service still running from a folder (its restart onto the kept one
+    // has not happened, or failed) would lose its files under it.
+    const inUse = await foldersInUse(prunable);
+    for (const folder of prunable) {
+      if (inUse.has(folder)) {
+        this.#ctx?.log.info("local_server.source_in_use", {
+          source: path.basename(folder),
+        });
+        continue;
+      }
+      await rm(folder, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   // Downloads a verified archive and unpacks its single top-level folder
@@ -2113,25 +2448,13 @@ export class LocalServerModule implements Module {
     unpacked: string,
     signal: AbortSignal,
   ): Promise<void> {
-    await removeRetrying(unpacked);
-    await mkdir(unpacked, { recursive: true, mode: 0o700 });
-    // Windows' tar may not read zstd; Node's zlib does, and tar reads stdin.
-    if (file.endsWith(".zst")) {
-      await run(
-        tarCommand(),
-        ["-xf", "-", "--strip-components=1"],
-        unpacked,
-        signal,
-        createReadStream(file, { signal }).pipe(createZstdDecompress()),
-      );
-      return;
-    }
-    await run(
-      tarCommand(),
-      ["-xf", path.relative(unpacked, file), "--strip-components=1"],
-      unpacked,
-      signal,
-    );
+    await unpackArchive(file, unpacked, signal, {
+      onFallback: (command) =>
+        this.#ctx?.log.warn("local_server.tar_fallback", {
+          command,
+          archive: path.basename(file),
+        }),
+    });
   }
 
   // Moves a finished `unpacked` folder to `directory`. One that is already
@@ -2160,6 +2483,18 @@ export class LocalServerModule implements Module {
     });
   }
 
+  // The system proxy for the installer runs that start the services, which
+  // pass it to TeamHub and node-services only. Logged without its address.
+  async #systemProxyEnv(): Promise<Record<string, string>> {
+    const startedAt = Date.now();
+    const proxy = await systemProxy(process.env, this.#options.resolveProxy);
+    this.#ctx?.log.info("local_server.system_proxy", {
+      source: proxy.source,
+      ms: Date.now() - startedAt,
+    });
+    return proxy.env;
+  }
+
   // Saves the provider keys with the installer, before it installs; the keys go
   // over stdin, never in arguments or logs.
   async #saveKeys(
@@ -2172,6 +2507,7 @@ export class LocalServerModule implements Module {
       const child = spawn(
         node,
         [
+          ...linuxNodeFdHygieneArgs(this.#options.platform),
           this.#installerScript(),
           "--home",
           home,
@@ -2194,17 +2530,20 @@ export class LocalServerModule implements Module {
       child.once("close", () => resolve(text));
       child.stdin.end(JSON.stringify(installerKeyChanges(changes)));
     });
-    let outcome: { saved?: unknown; error?: unknown } = {};
+    let outcome: { saved?: unknown; error?: unknown; refusal?: unknown } = {};
     try {
       outcome = JSON.parse(output.trim().split("\n").at(-1) ?? "") as never;
     } catch {
       // Reported below.
     }
     if (!Array.isArray(outcome.saved))
-      throw new Error(
-        typeof outcome.error === "string"
-          ? `Keys could not be saved: ${outcome.error}`
-          : "Keys could not be saved",
+      throw Object.assign(
+        new Error(
+          typeof outcome.error === "string"
+            ? `Keys could not be saved: ${outcome.error}`
+            : "Keys could not be saved",
+        ),
+        { refusal: windowsPrivateRefusal(outcome.refusal) },
       );
     this.#ctx?.log.info("local_server.keys_saved", { saved: outcome.saved });
     this.#ctx?.bus.emit("local-server.changed");
@@ -2218,9 +2557,11 @@ export class LocalServerModule implements Module {
     repo: string,
     signal: AbortSignal,
   ): Promise<InstallerApi> {
+    const proxyEnv = await this.#systemProxyEnv();
     const child = spawn(
       node,
       [
+        ...linuxNodeFdHygieneArgs(this.#options.platform),
         this.#installerScript(),
         "--home",
         home,
@@ -2236,7 +2577,7 @@ export class LocalServerModule implements Module {
         // A detached Windows process otherwise opens its own console window.
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, LINGER_HOME: home },
+        env: { ...process.env, ...proxyEnv, LINGER_HOME: home },
       },
     );
     const log = this.#ctx?.log;
@@ -2246,13 +2587,27 @@ export class LocalServerModule implements Module {
     child.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       reason = text.trim().slice(0, 1500) || reason;
-      log?.warn("local_server.installer_stderr", { line: text.slice(0, 1500) });
+    });
+    // By line, so a timing event split across chunks still parses.
+    createInterface({ input: child.stderr }).on("line", (line) => {
+      if (!line.trim()) return;
+      const event = installerTimingEvent(line);
+      if (event)
+        log?.info("local_server.installer_runtime_timings", { ...event });
+      else
+        log?.warn("local_server.installer_stderr", {
+          line: line.slice(0, 1500),
+        });
     });
     const origin = await new Promise<string>((resolve, reject) => {
       let output = "";
       const fail = (message: string) => {
         child.stdout.removeAllListeners("data");
-        reject(new Error(message));
+        reject(
+          Object.assign(new Error(message), {
+            refusal: startRefusal(output),
+          }),
+        );
       };
       child.stdout.on("data", (chunk: Buffer) => {
         output += chunk.toString("utf8");
@@ -2423,23 +2778,50 @@ export class LocalServerModule implements Module {
   // services move to it first: the window and the Computer already are this
   // version, and the older services would serve the older interface.
   async #resume(record: LocalRecord, signal: AbortSignal): Promise<void> {
+    let currentRecord = record;
     this.#origin = record.origin;
     this.#resuming = true;
     const startedAt = Date.now();
     let stage = "fast_ready_check";
     this.#ctx?.log.info("local_server.resume_started");
     const windows = this.#ctx?.get<WindowManagerModule>("WindowManager");
+    this.#acquireBusy();
     try {
-      const update = this.#sourceUpdate(record);
+      const update = this.#sourceUpdate(currentRecord);
       if (update) {
         // The services restart even if they still answer.
+        this.#preparing = "updating";
         this.#set("preparing", "Updating Linger on this computer…");
         windows?.showUpdating();
       } else {
+        this.#preparing = "starting";
         this.#set("preparing", "Starting Linger on this computer…");
         // The window would show the server as unreachable until it is back.
         const checkStartedAt = Date.now();
-        const reachable = await this.#reachable(record.origin);
+        let reachable = await this.#reachable(currentRecord.origin);
+        if (!reachable) {
+          // If an earlier restart moved the instance onto a new port before
+          // desktop state caught up, follow the live origin right away instead
+          // of showing Starting with the stale port.
+          const moved = await this.#readInstanceOrigin(currentRecord.home);
+          if (
+            moved &&
+            !sameOrigin(moved, currentRecord.origin) &&
+            (await this.#reachable(moved)) &&
+            (await this.#checkServer({ ...currentRecord, origin: moved }))
+          ) {
+            const previous = currentRecord.origin;
+            currentRecord = { ...currentRecord, origin: moved };
+            await this.#writeRecord(currentRecord);
+            this.#ctx?.log.info("local_server.origin_moved", {
+              from: previous,
+              to: moved,
+            });
+            this.#ready(moved, previous, "port_moved");
+            await this.#syncLocalGateway(currentRecord.home, moved, previous);
+            reachable = true;
+          }
+        }
         this.#ctx?.log.info("local_server.resume_stage", {
           stage: "fast_ready_check",
           ms: Date.now() - checkStartedAt,
@@ -2453,21 +2835,29 @@ export class LocalServerModule implements Module {
         this.#options.sourceArchive &&
         !this.#options.checkout &&
         (update ||
-          !(await validateSourceRepository(record.repo).then(
+          !(await validateSourceRepository(currentRecord.repo).then(
             () => true,
             () => false,
           )))
-          ? await this.#ensureSource(record.home, signal)
-          : record.repo;
-      const serving = await this.#runResume(record, repo, signal, (next) => {
-        stage = next;
-      });
+          ? await this.#ensureSource(currentRecord.home, signal)
+          : currentRecord.repo;
+      const serving = await this.#runResume(
+        currentRecord,
+        repo,
+        signal,
+        (next) => {
+          stage = next;
+        },
+      );
       // The installer moves the web port off one another program took. The
       // record and the window follow the origin together (a launch resumes
       // only while they agree), and so does this computer's enrollment: it
       // is the same server.
-      const origin = serving.origin ?? record.origin;
-      if (repo !== record.repo) {
+      const origin =
+        serving.origin ??
+        (await this.#readInstanceOrigin(currentRecord.home)) ??
+        currentRecord.origin;
+      if (repo !== currentRecord.repo) {
         // The record moves, and the older folder goes, only once the
         // services run from the new one and answer; until then the older
         // services keep running from their folder, and Retry moves them.
@@ -2478,20 +2868,25 @@ export class LocalServerModule implements Module {
           throw new Error(
             "Linger could not restart on this version. The earlier version is still installed; try again.",
           );
-        await this.#moved({ ...record, origin }, repo);
-      } else if (origin !== record.origin)
-        await this.#writeRecord({ ...record, origin });
-      if (origin !== record.origin)
+        await this.#moved({ ...currentRecord, origin }, repo);
+      } else if (origin !== currentRecord.origin)
+        await this.#writeRecord({ ...currentRecord, origin });
+      if (origin !== currentRecord.origin)
         this.#ctx?.log.info("local_server.origin_moved", {
-          from: record.origin,
+          from: currentRecord.origin,
           to: origin,
         });
       if (update)
         this.#ctx?.log.info("local_server.source_updated", {
           source: path.basename(repo),
-          from: record.version,
+          from: currentRecord.version,
         });
-      this.#ready(origin, record.origin, "resume_ready");
+      this.#ready(origin, currentRecord.origin, "resume_ready");
+      await this.#syncLocalGateway(
+        currentRecord.home,
+        origin,
+        currentRecord.origin,
+      );
       this.#set("ready", "Linger is running on this computer.");
       this.#ctx?.log.info("local_server.resume_succeeded", {
         total_ms: Date.now() - startedAt,
@@ -2507,6 +2902,7 @@ export class LocalServerModule implements Module {
       this.#set("failed", message);
       windows?.showStartFailed(message);
     } finally {
+      this.#releaseBusy();
       this.#resuming = false;
     }
   }
@@ -2532,9 +2928,59 @@ export class LocalServerModule implements Module {
     ctx.bus.emit("setup.open");
   }
 
+  // The services can stop while the window shows them. Their supervisors
+  // restart them, so one that does not answer first gets `graceMs` to come
+  // back, checked again during it; one still silent after that (its
+  // supervisor gave up or was ended too) is resumed like a launch: the
+  // installer starts what is not running.
+  async #recoverUnreachable(
+    trigger: "retry" | "load_failed" | "watch",
+    graceMs: number,
+    throttled: boolean,
+  ): Promise<void> {
+    if (this.#recovering || this.#resuming || this.#phase !== "ready") return;
+    if (
+      throttled &&
+      this.#recoveredAt !== undefined &&
+      Date.now() - this.#recoveredAt < RECOVERY_INTERVAL_MS
+    )
+      return;
+    this.#recovering = true;
+    try {
+      let record = await this.#windowRecord();
+      if (!record || (await this.#stillAnswers(record.origin))) return;
+      const checks = graceMs > 0 ? UNREACHABLE_PROBES - 1 : 0;
+      for (let check = 0; check < checks; check++) {
+        await delay(graceMs / checks, undefined, {
+          signal: this.#abort.signal,
+        });
+        if (this.#resuming) return;
+        record = await this.#windowRecord();
+        if (!record || (await this.#stillAnswers(record.origin))) return;
+      }
+      this.#recoveredAt = Date.now();
+      this.#ctx?.log.warn("local_server.unreachable_resume", { trigger });
+      await this.#resume(record, this.#abort.signal);
+    } catch {
+      // Aborted by stop.
+    } finally {
+      this.#recovering = false;
+    }
+  }
+
   // Whether the services already answer, such as after only the app quit.
   #reachable(origin: string): Promise<boolean> {
     return answers(this.#options.fetch ?? fetch, origin);
+  }
+
+  // Whether a ready server still answers, given more time than a launch's
+  // fast check.
+  #stillAnswers(origin: string): Promise<boolean> {
+    return answers(
+      this.#options.fetch ?? fetch,
+      origin,
+      UNREACHABLE_PROBE_TIMEOUT_MS,
+    );
   }
 
   // Whether the services run another source package than this app brings,
@@ -2580,6 +3026,9 @@ export class LocalServerModule implements Module {
     onStage?: (stage: string) => void,
   ): Promise<{ source?: string; origin?: string }> {
     await this.#adoptSourceKeys(record.home);
+    // Resolved while the Node runtime is checked, so a slow PAC script does
+    // not add to the start.
+    const proxyEnv = this.#systemProxyEnv();
     onStage?.("ensure_node");
     const nodeStartedAt = Date.now();
     const node = await this.#ensureNode(signal);
@@ -2587,12 +3036,18 @@ export class LocalServerModule implements Module {
       stage: "ensure_node",
       ms: Date.now() - nodeStartedAt,
     });
+    const env = {
+      ...process.env,
+      ...(await proxyEnv),
+      LINGER_HOME: record.home,
+    };
     onStage?.("installer_resume");
     const resumeStartedAt = Date.now();
     const outcome = await new Promise<ResumeOutcome>((resolve, reject) => {
       const child = spawn(
         node,
         [
+          ...linuxNodeFdHygieneArgs(this.#options.platform),
           this.#installerScript(),
           "--home",
           record.home,
@@ -2608,53 +3063,92 @@ export class LocalServerModule implements Module {
           // The pinned Node is a console program; without this Windows
           // opens a console window for it.
           windowsHide: true,
-          env: { ...process.env, LINGER_HOME: record.home },
+          env,
           signal,
         },
       );
       let output = "";
+      let settled = false;
+      let exited = false;
+      let exitedCode: number | null = null;
+      let drainTimer: NodeJS.Timeout | undefined;
+      const finish = (code: number | null, destroyStdout = false) => {
+        if (settled) return;
+        settled = true;
+        if (drainTimer) {
+          clearTimeout(drainTimer);
+          drainTimer = undefined;
+        }
+        if (destroyStdout) child.stdout.destroy();
+        const parsed = parseResumeOutcome(output);
+        if (parsed) resolve(parsed);
+        else reject(new Error(`The installer exited with code ${code}`));
+      };
       child.stdout.on("data", (chunk: Buffer) => {
         output += chunk.toString("utf8");
+        if (exited && !settled && parseResumeOutcome(output, true))
+          finish(exitedCode, true);
       });
-      child.once("error", reject);
-      child.once("close", (code) => {
-        try {
-          const last = output.trim().split("\n").at(-1) ?? "";
-          resolve(JSON.parse(last) as ResumeOutcome);
-        } catch {
-          reject(new Error(`The installer exited with code ${code}`));
+      child.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        if (drainTimer) {
+          clearTimeout(drainTimer);
+          drainTimer = undefined;
         }
+        child.stdout.destroy();
+        reject(error);
+      });
+      child.once("close", (code) => finish(code));
+      // Detached native services spawned during --resume can inherit the
+      // stdout pipe handle on Windows and keep "close" from firing after the
+      // installer already flushed its outcome JSON and exited. Settle at once
+      // when a complete outcome line is already buffered; otherwise wait for
+      // trailing pipe chunks or end up to a short safety cap.
+      child.once("exit", (code) => {
+        if (settled) return;
+        exited = true;
+        exitedCode = code;
+        if (parseResumeOutcome(output, true)) {
+          finish(code, true);
+          return;
+        }
+        child.stdout.once("end", () => finish(code));
+        drainTimer = setTimeout(() => finish(code, true), 1_000);
+        drainTimer.unref?.();
       });
     });
     this.#ctx?.log.info("local_server.resume_stage", {
       stage: "installer_resume",
       ms: Date.now() - resumeStartedAt,
     });
+    const lookupTimings = runtimeLookupTimingFields(
+      outcome.runtimeLookupTimings,
+    );
+    if (lookupTimings)
+      this.#ctx?.log.info("local_server.installer_runtime_timings", {
+        instance: LOCAL_INSTANCE,
+        ...lookupTimings,
+      });
     if (outcome.code !== 0) {
-      const { code, reasons } = outcome.details ?? {};
+      const { code, causeCode, reasons } = outcome.details ?? {};
       const action =
-        typeof code === "string" && Object.hasOwn(RESUME_ACTIONS, code)
-          ? RESUME_ACTIONS[code]
-          : undefined;
-      const reason = Array.isArray(reasons)
-        ? reasons.find(
-            (item): item is string =>
-              typeof item === "string" &&
-              Object.hasOwn(LOCAL_MODEL_NOT_READY, item),
-          )
-        : undefined;
+        code === "LOCAL_MODELS_RECOVERY_REQUIRED" &&
+        typeof causeCode === "string" &&
+        REPLAN_ONLY_CAUSES.has(causeCode)
+          ? RESUME_REPLAN_ACTION
+          : typeof code === "string" && Object.hasOwn(RESUME_ACTIONS, code)
+            ? RESUME_ACTIONS[code]
+            : undefined;
+      const notReady = localModelNotReadyMessage(reasons);
       throw new Error(
-        [
-          reason && LOCAL_MODEL_NOT_READY[reason],
-          outcome.message || "The installation stopped",
-          action,
-        ]
+        [notReady, outcome.message || "The installation stopped", action]
           .filter(Boolean)
           .join(" "),
       );
     }
-    // The services run without the BYOK gateway; the person switches or
-    // fixes the source on the Models page, so this only leaves a trace.
+    // The services run without the BYOK gateway; the Computer mounts it
+    // again before the next Run on it, so this only leaves a trace.
     const byokGateway = outcome.details?.byokGateway as
       | { code?: unknown; message?: unknown }
       | null
@@ -2669,6 +3163,37 @@ export class LocalServerModule implements Module {
         message:
           typeof byokGateway.message === "string" ? byokGateway.message : "",
       });
+    // The services run without local models; the person can still reach the
+    // workspace and the Models page to manage local models or switch runtimes.
+    const localModelsDegraded = outcome.details?.localModelsDegraded as
+      | { code?: unknown; message?: unknown; reasons?: unknown }
+      | null
+      | undefined;
+    if (
+      localModelsDegraded &&
+      typeof localModelsDegraded === "object" &&
+      typeof localModelsDegraded.code === "string"
+    ) {
+      const degradedReasons = Array.isArray(localModelsDegraded.reasons)
+        ? localModelsDegraded.reasons.filter(
+            (item): item is string => typeof item === "string",
+          )
+        : [];
+      const degraded: LocalModelsDegradedStatus = {
+        code: localModelsDegraded.code,
+        message:
+          typeof localModelsDegraded.message === "string"
+            ? localModelsDegraded.message
+            : "",
+        ...(degradedReasons.length ? { reasons: degradedReasons } : {}),
+      };
+      this.#localModelsDegraded = degraded;
+      this.#ctx?.log.warn("local_server.local_models_unavailable", {
+        ...degraded,
+      });
+    } else {
+      this.#localModelsDegraded = undefined;
+    }
     this.#adoptRuntime(outcome.runtime);
     const { source, origin } = outcome.details ?? {};
     return {
@@ -2714,6 +3239,50 @@ export class LocalServerModule implements Module {
       keys: Object.keys(runtime.environment),
     });
     ctx.bus.emit("computer.runtime");
+  }
+
+  // Reads the desktop instance's current origin from instance.json via the
+  // shared validated loader, where the installer persists port moves as soon
+  // as a taken port is reassigned.
+  async #readInstanceOrigin(home: string): Promise<string | undefined> {
+    try {
+      const instance = await loadInstance({ name: LOCAL_INSTANCE, home });
+      return instance ? parseServerUrl(instance.origin) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Reads the desktop instance's current Runner Gateway URL from instance.json.
+  async #readInstanceGatewayUrl(home: string): Promise<string | undefined> {
+    try {
+      const instance = await loadInstance({ name: LOCAL_INSTANCE, home });
+      const port = instance?.source?.ports.nodeServices;
+      return port === undefined ? undefined : localRunnerGatewayUrl(port);
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Keeps the enrolled desktop daemon pointed at this instance's Runner
+  // Gateway when the installer reassigned node-services off a taken port.
+  async #syncLocalGateway(
+    home: string,
+    origin: string,
+    previous?: string,
+  ): Promise<void> {
+    const serverUrl = this.#ctx?.config.get().serverUrl;
+    if (
+      !serverUrl ||
+      (!sameOrigin(serverUrl, origin) &&
+        (!previous || !sameOrigin(serverUrl, previous)))
+    )
+      return;
+    const gatewayUrl = await this.#readInstanceGatewayUrl(home);
+    if (!gatewayUrl) return;
+    this.#ctx
+      ?.get<EnrollmentModule>("Enrollment")
+      .syncLocalGatewayUrl(gatewayUrl);
   }
 
   // Kept in the default home, wherever the installation went.
@@ -2800,11 +3369,100 @@ interface ResumeOutcome {
     source?: unknown;
     origin?: unknown;
     code?: unknown;
+    causeCode?: unknown;
     reasons?: unknown;
     // Why a saved BYOK source's gateway did not come back: `{ code, message }`.
     byokGateway?: unknown;
+    // Why local models did not come back on resume: `{ code, message, reasons? }`.
+    localModelsDegraded?: unknown;
   };
   runtime?: InstanceRuntime;
+  // Resume stderr is not piped (detached services could hold it open), so
+  // the runtime lookup's stage timings ride in the outcome instead.
+  runtimeLookupTimings?: unknown;
+}
+
+interface RuntimeLookupTimingFields {
+  config_ms: number;
+  runtime_ms: number;
+  local_models_ms: number;
+  tool_ms: number;
+  total_ms: number;
+}
+
+// The installer's runtime lookup timings, or undefined unless every stage is
+// a finite number; an older or newer installer must never fail the caller.
+function runtimeLookupTimingFields(
+  value: unknown,
+): RuntimeLookupTimingFields | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { config, runtime, localModels, tool, total } = value as Record<
+    string,
+    unknown
+  >;
+  const stages = [config, runtime, localModels, tool, total];
+  if (!stages.every((ms) => typeof ms === "number" && Number.isFinite(ms)))
+    return undefined;
+  return {
+    config_ms: config as number,
+    runtime_ms: runtime as number,
+    local_models_ms: localModels as number,
+    tool_ms: tool as number,
+    total_ms: total as number,
+  };
+}
+
+// The installer's `installer.runtime_lookup_timings` stderr event as log
+// fields, keyed on the event name rather than the line's wording.
+function installerTimingEvent(
+  line: string,
+): (RuntimeLookupTimingFields & { instance?: string }) | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const { event, instance, timings } = parsed as Record<string, unknown>;
+  if (event !== "installer.runtime_lookup_timings") return undefined;
+  const fields = runtimeLookupTimingFields(timings);
+  if (!fields) return undefined;
+  return { ...(typeof instance === "string" ? { instance } : {}), ...fields };
+}
+
+function parseResumeOutcomeLine(line: string): ResumeOutcome | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as { code?: unknown }).code === "number" &&
+      Number.isFinite((parsed as { code: number }).code)
+    )
+      return parsed as ResumeOutcome;
+  } catch {
+    // Ignore non-JSON lines from installer logs or detached grandchildren.
+  }
+  return undefined;
+}
+
+// Scans stdout lines in reverse for the last valid ResumeOutcome JSON object so
+// trailing non-JSON log lines from detached grandchildren never break parsing.
+function parseResumeOutcome(
+  output: string,
+  requireNewline = false,
+): ResumeOutcome | undefined {
+  const lines = output.split("\n");
+  const end = requireNewline ? lines.length - 1 : lines.length;
+  for (let index = end - 1; index >= 0; index--) {
+    const outcome = parseResumeOutcomeLine(lines[index]!);
+    if (outcome) return outcome;
+  }
+  return undefined;
 }
 
 interface LocalRecord {
@@ -2911,6 +3569,8 @@ export const anotherMeMissing = (
 };
 
 interface Job {
+  readonly runtime?: InstanceRuntime;
+  readonly setupChoice?: string;
   readonly id: string;
   readonly instance: string;
   readonly state: string;
@@ -2920,6 +3580,8 @@ interface Job {
   readonly message?: string;
   readonly origin?: string;
   readonly errorCode?: string;
+  readonly errorCauseCode?: string;
+  readonly errorReasons?: readonly string[];
   // The deployment the installer asks to approve before a local model.
   readonly localModelsPlan?: { readonly planId: string };
   readonly stages: readonly {
@@ -2951,12 +3613,13 @@ const STAGES: Record<string, readonly [LocalServerStep, number, number]> = {
 async function answers(
   fetcher: typeof fetch,
   origin: string,
+  timeoutMs = 1_000,
 ): Promise<boolean> {
   try {
     await fetcher(origin, {
       method: "HEAD",
       redirect: "manual",
-      signal: AbortSignal.timeout(1_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     return true;
   } catch {
@@ -2993,12 +3656,71 @@ const LOCAL_MODEL_FAILURES = new Set([
 // What works from the start-failure page when the local model stops a
 // restart: a restart applies the approved plan again, but only setup can
 // approve a new one or switch the runtime.
+const RESUME_REPLAN_ACTION =
+  "Set Up Again to review a new plan or choose another AI runtime.";
 const RESUME_ACTIONS: Record<string, string> = {
   LOCAL_MODELS_RECOVERY_REQUIRED:
     "Try Again to apply the approved local model plan again, or Set Up Again to review a new plan or choose another AI runtime.",
   LOCAL_MODELS_APPROVAL_REQUIRED:
     "Set Up Again to review the local model plan or choose another AI runtime.",
 };
+// Upstream stack guard codes where re-applying the same saved plan without
+// replanning cannot succeed (for example after a localmodels kit or catalog
+// update, or when the saved plan no longer fits).
+const REPLAN_ONLY_CAUSES = new Set([
+  "STACK_REPLAN_FAILED",
+  "STACK_PLAN_CHANGED",
+  "STACK_APPROVAL_MISMATCH",
+  "STACK_PLAN_INVALID",
+]);
+// Upstream apply failures where re-applying the same approved plan resumes
+// interrupted downloads or component setup without replanning over the network.
+const RETRY_APPLY_CAUSES = new Set([
+  "STACK_COMPONENT_FAILED",
+  "STACK_APPLY_INTERRUPTED",
+]);
+
+// Formats a failed installer job into user-facing guidance based on its
+// structured error code, cause code, and reason codes so Hub/disk/GPU
+// failures, interrupted downloads, and repairable setup/verification errors
+// report accurate guidance without blaming memory or hardware incompatibility.
+export function formatInstallJobFailure(
+  job: Pick<Job, "errorCode" | "errorCauseCode" | "errorReasons" | "message">,
+): string {
+  const detail = job.message
+    ? normalizeFailurePunctuation(job.message)
+    : undefined;
+  const suffix = detail ? ` (${detail})` : "";
+  if (job.errorCode === "LOCAL_MODELS_UNAVAILABLE") {
+    switch (job.errorCauseCode) {
+      case "HUB_UNREACHABLE":
+        return `Couldn't reach the model download service to prepare the local model. Check your internet connection or proxy settings and try again, or choose another AI runtime.${suffix}`;
+      case "DISK_INSUFFICIENT":
+        return `This computer doesn't have enough free disk space for the local model. Free up disk space, or choose another AI runtime, and try again.${suffix}`;
+      case "GPU_CONFLICT":
+      case "STACK_PLAN_FAILED":
+        return `This computer can't run the local model right now. Choose another AI runtime and try again.${suffix}`;
+      default:
+        // MEMORY_INSUFFICIENT, or an older localmodels kit that emits no
+        // structured stack-plan error code.
+        return `This computer can't run the local model right now. Close other programs to free memory, or choose another AI runtime, and try again.${suffix}`;
+    }
+  }
+  const notReady = localModelNotReadyMessage(job.errorReasons);
+  if (job.errorCode === "LOCAL_MODELS_RECOVERY_REQUIRED") {
+    if (
+      !notReady &&
+      job.errorCauseCode &&
+      RETRY_APPLY_CAUSES.has(job.errorCauseCode)
+    )
+      return `Local model download or setup was interrupted. Check your internet connection and try again, or choose another AI runtime.${suffix}`;
+    return `${notReady ? `${notReady} ` : ""}Local model setup couldn't finish or verify this computer's local model state and Pi configuration. Check folder permissions or repair the existing installation and try again, or choose another AI runtime.${!notReady ? suffix : ""}`;
+  }
+  if (LOCAL_MODEL_FAILURES.has(job.errorCode ?? "")) {
+    return `${notReady ? `${notReady} ` : ""}This computer can't run the local model right now. Choose another AI runtime and try again.${!notReady ? suffix : ""}`;
+  }
+  return detail || "The installation stopped";
+}
 
 // Why the local model stack was not ready, by the reason code localmodels'
 // setup binding gives.
@@ -3015,15 +3737,40 @@ const LOCAL_MODEL_NOT_READY: Record<string, string> = {
   "binding-unavailable": "The local model stack couldn't be checked.",
 };
 
+function localModelNotReadyMessage(reasons: unknown): string | undefined {
+  if (!Array.isArray(reasons)) return undefined;
+  const code = reasons.find(
+    (item): item is string =>
+      typeof item === "string" && Object.hasOwn(LOCAL_MODEL_NOT_READY, item),
+  );
+  return code ? LOCAL_MODEL_NOT_READY[code] : undefined;
+}
+
 export interface Reconnect {
   readonly windowMs: number;
   readonly maxBackoffMs: number;
 }
 
 const RECONNECT: Reconnect = { windowMs: 60_000, maxBackoffMs: 5_000 };
-// The runtime lookup runs a 120-second harness probe, with private file and
-// pinned tool checks before and after it.
-const INSTALLER_RUNTIME_TIMEOUT_MS = 180_000;
+// The runtime lookup runs a harness status probe (120 s at most) with
+// private folder and pinned tool checks around it; on Windows each of those
+// is a PowerShell ACL request of up to 30 s, so a slow machine takes a few
+// minutes and the worst case of every inner limit stays near seven. The
+// installer runs one lookup per instance and keeps its answer, so waiting
+// costs nothing and asking again joins it. This limit only ends a lookup
+// that has stopped making progress; it is not a performance budget.
+export const RUNTIME_LOOKUP_LIMIT_MS = 10 * 60_000;
+// When the setup page starts saying what the bar is waiting on.
+export const RUNTIME_LOOKUP_HINT_MS = 15_000;
+
+const FAILURES: ReadonlySet<string> = new Set<LocalServerFailure>([
+  "runtime_lookup_timed_out",
+  "runtime_lookup_unreachable",
+]);
+const localServerFailure = (code: unknown): LocalServerFailure | undefined =>
+  typeof code === "string" && FAILURES.has(code)
+    ? (code as LocalServerFailure)
+    : undefined;
 
 const TRANSIENT_CODES = new Set([
   "ECONNRESET",
@@ -3033,6 +3780,9 @@ const TRANSIENT_CODES = new Set([
   "UND_ERR_SOCKET",
   "UND_ERR_CONNECT_TIMEOUT",
   "UND_ERR_CLOSED",
+  // fetch stops waiting for response headers after 300 s; the installer may
+  // still be working on the answer.
+  "UND_ERR_HEADERS_TIMEOUT",
 ]);
 
 // The code of a transport failure worth retrying, found on the error or its
@@ -3116,7 +3866,12 @@ export class InstallerApi {
       transfer?: Transfer,
     ) => void,
     fresh = false,
-  ): Promise<{ readonly origin: string; readonly signInRequired: boolean }> {
+  ): Promise<{
+    readonly origin: string;
+    readonly signInRequired: boolean;
+    readonly setupChoice?: string;
+    readonly runtime?: InstanceRuntime;
+  }> {
     const { items } = await this.#json<{ items: Job[] }>("/api/jobs");
     const latest = items
       .filter((item) => item.instance === LOCAL_INSTANCE && !item.preparation)
@@ -3125,6 +3880,10 @@ export class InstallerApi {
     if (
       !fresh &&
       latest &&
+      // A job for another choice is the person's earlier answer: after a quit
+      // part way through the local model download, choosing a subscription
+      // must not follow that download. The installer replaces it.
+      runsPlan(latest, plan) &&
       (["queued", "running"].includes(latest.state) ||
         // A finished one only while its instance is still there; its data
         // may have been removed since. Its services must still run too: after
@@ -3164,9 +3923,10 @@ export class InstallerApi {
     }
     // The person chose the local model after seeing what it needs, so its
     // deployment plan is approved here; once, against a plan that keeps
-    // changing. A deployment that stopped part way asks for a new plan
-    // first; that is asked for once too.
+    // changing. An interrupted deployment resumes the approved plan once before
+    // giving up; a stale or incompatible saved plan replans once.
     let approved: string | undefined;
+    let retriedApply = false;
     let replanned = false;
     // Where the bar last stood, kept while the installer cannot be reached.
     let shown: [LocalServerStep, number] | undefined;
@@ -3208,8 +3968,15 @@ export class InstallerApi {
           },
         );
       }
-      if (finished(job))
-        return { origin: job.origin!, signInRequired: signInRequired(job) };
+      if (finished(job)) {
+        const live = job === latest ? undefined : job;
+        return {
+          origin: job.origin!,
+          signInRequired: signInRequired(job),
+          setupChoice: live?.runtime?.setupChoice ?? live?.setupChoice,
+          runtime: live?.runtime,
+        };
+      }
       const planId = job.localModelsPlan?.planId;
       if (
         job.state === "waiting_user" &&
@@ -3230,26 +3997,31 @@ export class InstallerApi {
         job.state === "waiting_user" &&
         job.errorCode === "LOCAL_MODELS_RECOVERY_REQUIRED" &&
         plan.runtime === "local" &&
-        !replanned
+        !job.errorReasons?.includes("binding-unavailable")
       ) {
-        replanned = true;
-        onStep("services", 0, "Deploying the local model");
-        job = await this.#json<Job>(
-          `/api/jobs/${encodeURIComponent(job.id)}/retry`,
-          { localModelsReplan: true },
-        );
-        continue;
+        const retryableApply =
+          !!job.errorCauseCode && RETRY_APPLY_CAUSES.has(job.errorCauseCode);
+        if (approved && !retriedApply && retryableApply) {
+          retriedApply = true;
+          onStep("services", 0, "Deploying the local model");
+          job = await this.#json<Job>(
+            `/api/jobs/${encodeURIComponent(job.id)}/retry`,
+            { localModelsApproval: approved },
+          );
+          continue;
+        }
+        if (!replanned && !(retriedApply && retryableApply)) {
+          replanned = true;
+          onStep("services", 0, "Deploying the local model");
+          job = await this.#json<Job>(
+            `/api/jobs/${encodeURIComponent(job.id)}/retry`,
+            { localModelsReplan: true },
+          );
+          continue;
+        }
       }
       if (!["queued", "running"].includes(job.state))
-        throw new Error(
-          // Only the planner finding no model that fits can be helped by
-          // freeing memory; free memory is what it measures at that moment.
-          job.errorCode === "LOCAL_MODELS_UNAVAILABLE"
-            ? `This computer can't run the local model right now. Close other programs to free memory, or choose another AI runtime, and try again.${job.message ? ` (${job.message})` : ""}`
-            : LOCAL_MODEL_FAILURES.has(job.errorCode ?? "")
-              ? `This computer can't run the local model right now. Choose another AI runtime and try again.${job.message ? ` (${job.message})` : ""}`
-              : job.message || "The installation stopped",
-        );
+        throw new Error(formatInstallJobFailure(job));
       await delay(this.#pollMs, undefined, { signal });
       job = await this.#poll(job.id, signal, () => {
         if (shown) onStep(shown[0], shown[1], "Reconnecting to the installer…");
@@ -3298,25 +4070,54 @@ export class InstallerApi {
   }
 
   // The runtime the installation set up, with the paths of its executable
-  // and profile.
+  // and profile. The installer answers once its lookup ends, and asking
+  // again joins the running one, so a dropped connection is asked again
+  // like a job poll; only RUNTIME_LOOKUP_LIMIT_MS in all ends the wait.
   async runtime(signal: AbortSignal): Promise<InstanceRuntime> {
-    const deadline = AbortSignal.timeout(INSTALLER_RUNTIME_TIMEOUT_MS);
-    try {
-      return await this.#json(
-        `/api/instances/${LOCAL_INSTANCE}/runtime`,
-        undefined,
-        "GET",
-        AbortSignal.any([signal, deadline]),
-      );
-    } catch (error) {
-      if (!signal.aborted && deadline.aborted)
-        throw new Error(
-          "The installer timed out while reading the selected runtime.",
-          {
-            cause: error,
-          },
+    const deadline = AbortSignal.timeout(RUNTIME_LOOKUP_LIMIT_MS);
+    const either = AbortSignal.any([signal, deadline]);
+    let since: number | undefined;
+    let wait = this.#pollMs;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.#json(
+          `/api/instances/${LOCAL_INSTANCE}/runtime`,
+          undefined,
+          "GET",
+          either,
         );
-      throw error;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (deadline.aborted)
+          throw Object.assign(
+            new Error(
+              "Checking the AI runtime on this computer did not finish in time.",
+              { cause: error },
+            ),
+            { code: "runtime_lookup_timed_out" },
+          );
+        const code = transientCode(error);
+        if (!code) throw error;
+        this.#log?.warn("local_server.installer_unreachable", {
+          stage: "runtime",
+          code,
+          attempt,
+        });
+        // A lookup that outlasted fetch's wait for an answer is still
+        // running in the installer: ask again at once to join it.
+        if (code === "UND_ERR_HEADERS_TIMEOUT") continue;
+        since ??= Date.now();
+        if (Date.now() - since >= this.#reconnect.windowMs)
+          throw Object.assign(
+            new Error(
+              "Lost the connection to the installer while checking the AI runtime.",
+              { cause: error },
+            ),
+            { code: "runtime_lookup_unreachable" },
+          );
+        await delay(wait, undefined, { signal });
+        wait = Math.min(wait * 2, this.#reconnect.maxBackoffMs);
+      }
     }
   }
 
@@ -3330,11 +4131,16 @@ export class InstallerApi {
     );
   }
 
-  runtimeLogin(start = false, code?: string): Promise<RuntimeLogin> {
+  runtimeLogin(
+    start = false,
+    code?: string,
+    method?: RuntimeLoginMethod,
+  ): Promise<RuntimeLogin> {
     return start
       ? this.#json("/api/runtime-login", {
           instance: LOCAL_INSTANCE,
           ...(code ? { code } : {}),
+          ...(method ? { method } : {}),
         })
       : this.#json(`/api/runtime-login?instance=${LOCAL_INSTANCE}`);
   }
@@ -3389,6 +4195,7 @@ interface RuntimeLogin {
   readonly url?: string;
   readonly deviceCode?: string;
   readonly acceptsCode?: boolean;
+  readonly reason?: RuntimeLoginReason;
   readonly message?: string;
 }
 
@@ -3398,6 +4205,20 @@ const isByokProtocol = (value: unknown): value is SetupByokProtocol =>
   value === "openai-responses" ||
   value === "anthropic";
 
+// The refusal the installer names in its startFailure line on stdout when
+// it could not start (startFailureLine in apps/linger-installer).
+const startRefusal = (output: string): WindowsPrivateRefusal | undefined => {
+  for (const line of output.split("\n")) {
+    if (!line.startsWith('{"startFailure"')) continue;
+    try {
+      const parsed = JSON.parse(line) as { startFailure?: unknown };
+      return windowsPrivateRefusal(parsed.startFailure);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+};
 // The installer's own words when it failed with { ok: false, message }:
 // localmodels names the address and HTTP status there.
 const byokFailure = (out: Record<string, unknown>, fallback: string): string =>
@@ -3415,6 +4236,16 @@ const recommended = (report: { recommendation?: string }) =>
   report.recommendation === "local-models"
     ? "pi"
     : (report.recommendation ?? "codex");
+
+// Whether the job installs what the plan asks for. The installer picks for
+// "recommended", which never deploys the local model (see `recommended`).
+// A job that names no choice used the saved one and is followed as before.
+const runsPlan = (job: Job, plan: LocalServerPlan): boolean =>
+  !job.setupChoice ||
+  (plan.runtime === "recommended"
+    ? job.setupChoice !== "local-models"
+    : job.setupChoice ===
+      (plan.runtime === "local" ? "local-models" : plan.runtime));
 
 export interface SetCookie {
   readonly name: string;
@@ -3685,10 +4516,81 @@ const isFile = async (file: string): Promise<boolean> => {
 
 // Windows' own bsdtar reads both the tar.gz source package and the Node zip;
 // a GNU tar earlier on PATH (Git for Windows) reads neither "C:" paths nor zips.
-const tarCommand = (): string =>
-  process.platform === "win32"
-    ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe")
-    : "tar";
+export function tarCommand(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (platform !== "win32") return "tar";
+  const systemRoot =
+    env.SystemRoot?.trim() || env.windir?.trim() || "C:\\Windows";
+  return path.win32.join(systemRoot, "System32", "tar.exe");
+}
+
+export interface UnpackArchiveOptions {
+  readonly command?: string;
+  readonly platform?: NodeJS.Platform;
+  readonly runCommand?: typeof run;
+  readonly fallback?: typeof extractArchiveFallback;
+  readonly onFallback?: (command: string) => void;
+}
+
+// Unpacks `file` (stripping its single top-level directory) into an empty
+// `unpacked` folder. If system tar is missing (for example on stripped Windows
+// images without System32\tar.exe), falls back to the pure-Node extractor and
+// surfaces an actionable error if that also fails.
+export async function unpackArchive(
+  file: string,
+  unpacked: string,
+  signal: AbortSignal,
+  options: UnpackArchiveOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  const command = options.command ?? tarCommand(platform);
+  const runCommand = options.runCommand ?? run;
+  const fallback = options.fallback ?? extractArchiveFallback;
+  await removeRetrying(unpacked);
+  await mkdir(unpacked, { recursive: true, mode: 0o700 });
+  try {
+    // Windows' tar may not read zstd; Node's zlib does, and tar reads stdin.
+    if (file.endsWith(".zst")) {
+      await runCommand(
+        command,
+        ["-xf", "-", "--strip-components=1"],
+        unpacked,
+        signal,
+        createReadStream(file, { signal }).pipe(createZstdDecompress()),
+      );
+      return;
+    }
+    await runCommand(
+      command,
+      ["-xf", path.relative(unpacked, file), "--strip-components=1"],
+      unpacked,
+      signal,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    options.onFallback?.(command);
+    await removeRetrying(unpacked);
+    await mkdir(unpacked, { recursive: true, mode: 0o700 });
+    try {
+      await fallback(file, unpacked, { strip: 1, signal });
+    } catch (fallbackError) {
+      const detail =
+        fallbackError instanceof Error
+          ? fallbackError.message
+          : String(fallbackError);
+      const hint =
+        platform === "win32"
+          ? "Restore Windows tar.exe or reinstall Linger."
+          : "Install tar or reinstall Linger.";
+      throw new Error(
+        `Failed to unpack ${path.basename(file)}: ${command} was not found (ENOENT) and the built-in extractor failed (${detail}). ${hint}`,
+        { cause: fallbackError },
+      );
+    }
+  }
+}
 
 // Resolves once the child exited and closed its stdio, so nothing of it
 // still holds the files it wrote.

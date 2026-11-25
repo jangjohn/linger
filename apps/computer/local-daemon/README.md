@@ -45,8 +45,34 @@ stops and names the open file.
 `linger-computer-daemon --config <path>` reads the owner-only config emitted by
 the `linger-computer login` flow. It discovers and version-gates the
 configured Codex, Claude, Pi, and Antigravity installations.
+Each Runtime kind has one minimum version (`native.MinimumVersions`, Codex
+0.166.0); an older installation is reported as `RUNTIME_INCOMPATIBLE` and never
+runs, so the adapters do not branch on a Runtime's version. The localmodels kit
+that installs the managed Runtimes reuses an existing one only at or above its
+own baseline, which must not sit below these minimums. The desktop
+distributions record both from the kit's release (`runtimeVersions`,
+`runtimeBaselines`), and a Go test fails when either is below a minimum. Raise a minimum only
+after a kit that installs a release at or above it ships in the desktop
+distribution pins (`apps/desktop/distribution/*.json`).
+The canary workflows run the native compatibility tests daily, because a
+user's own newer CLI reaches the Daemon before any kit locks it:
+`.github/workflows/codex-canary.yml` against npm's newest stable Codex, and
+`.github/workflows/claude-canary.yml` against the newest Claude Code on
+Anthropic's stable channel. The required `check (computer-go)` runs the same tests
+against the Codex and Claude Code the pinned kit installs (`runtimeVersions`
+in `apps/desktop/distribution/linux-x64.json`), so a Daemon change or a kit
+pin that breaks the managed Runtimes cannot land. The
+localmodels kit opens a lock update merge request for each new stable Codex
+or Claude Code at least seven days old; it should merge only after that
+Runtime's canary passes on that version.
 It performs bounded protocol and authentication probes.
-It periodically refreshes authentication and unavailable Runtimes without a restart.
+A protocol probe passes once the Runtime answers the handshake, however the
+process exits after its input closes. When the handshake fails, the daemon log
+records `runner.runtime_probe.handshake_failed` with the exit status and the
+redacted end of stderr; the diagnostic sent to TeamHub stays categorical.
+It periodically refreshes authentication and unavailable Runtimes without a
+restart. The daemon pauses those refreshes in the `upgrade-required`,
+`authentication-failed`, and `identity-conflict` Gateway states.
 The Claude check also probes idle Context homes, because each one can hold its
 own refreshed login. It reconciles only the four most recently used homes and
 runs `claude auth status` once per distinct credential, so its cost does not
@@ -60,6 +86,11 @@ identity/Registration/Assignment/Context/Operation stores, and connects only to
 the configured Linger Runner Gateway. Runtime executable paths, process
 environment, and physical workspace paths are resolved locally and never come
 from an Operation wire request.
+
+The Daemon pings the Runner Gateway connection every 10 seconds with WebSocket
+control frames and drops it when no data or Pong arrives for 30 seconds, then
+reconnects with the usual backoff, so a half-open connection never leaves Runs
+waiting on TCP retransmission.
 
 Opening the local Registration store deletes records of retired Runtimes such as
 Hermes; connecting and reconnecting report Registration observations only for
@@ -75,10 +106,14 @@ the recorded process group disappears.
 The Daemon accepts `execute` (kind `model_invoke`). `internal/daemon/model_invoke.go`
 handles admission and a concurrency limit of 3 (beyond it the reply is `busy`;
 `priority` only orders the Agent side's queue, and the Daemon accepts it without
-distinguishing), cancels on disconnect and drain, and checks before sending that
+distinguishing), cancels on disconnect and drain, loads a named Pi library model
+on demand through `ensureLocalModel` (matching `run.start`), clamps reasoning
+effort against the requested model, and checks before sending that
 the encoded `executed` (kind `model_invoke`) fits the 4 MiB frame limit (otherwise
-it reports `failed`). `internal/provider/model_invoke.go` runs one `codex exec` or
-`claude -p` in a temporary directory: the prompt goes through stdin, tools and
+it reports `failed`). `internal/provider/model_invoke.go` and
+`internal/provider/pi_model_invoke.go` run one `codex exec`, `claude -p`, or
+ephemeral `pi` RPC turn in a temporary directory, passing the requested `model`
+explicitly when supplied: the prompt goes through stdin, tools and
 user customization are off, and it refuses workspace files at the root named
 `AGENTS.md`, `AGENTS.override.md` or `CLAUDE.md` and anything under `.codex` or
 `.claude` at any depth. `internal/workspace/codex_invoke_home.go` prepares a
@@ -89,13 +124,31 @@ Claude uses the fixed `model-invoke/claude/.claude` under the state directory as
 next one. A model call does not enter the Operation ledger and takes no
 execution slot.
 
+A call that ends `failed` or `timed_out` is checked against the network its
+model needs (`internal/daemon/model_network.go`), and reported `unavailable`
+when this Computer cannot reach it, so the Agent side waits for the Computer as
+it does for a disconnected one instead of spending attempts. The endpoints come
+from the Runtime's own configuration (`internal/provider/model_endpoints.go`):
+the active Codex custom provider's `base_url`, else Codex's `chatgpt.com` and
+`api.openai.com` or the `chatgpt_base_url` and `openai_base_url` overriding
+them; Claude's `ANTHROPIC_BASE_URL`, else `api.anthropic.com`; for Pi, the base
+URL of the custom provider in `models.json` that its default model is on. The
+call is unavailable only when none of them, nor the proxy `HTTPS_PROXY`,
+`HTTP_PROXY` and `NO_PROXY` choose for each, accepts a TCP connection. A BYOK
+gateway, whose endpoint the tool probes when it mounts, and a Runtime whose
+endpoints are unknown, such as Pi on a built-in provider, need a route out of
+the machine, tested with UDP sockets connected to documentation addresses,
+which send nothing; local models need nothing. The check sends no data, waits
+at most 3 s per connection, and never runs for a call that completed or failed
+for another reason.
+
 Codex's workspace mode turns off the shell and unified exec and keeps only the
 code-mode host's `apply_patch`, with the working directory as the only writable
 root. It therefore reads no files, and the Daemon appends the workspace files'
 contents to the end of the prompt, because the `workspace-write` sandbox limits
 writes but not reads. Codex feature disables use `-c`/`--config
-features.<name>=false` rather than `--disable <name>` so older Codex versions
-ignore features they do not define instead of aborting on startup.
+features.<name>=false` rather than `--disable <name>` so a Codex release
+ignores features it does not define instead of aborting on startup.
 
 `go test -tags live_model_invoke ./internal/provider -run TestLiveCodex` runs one
 structured call and one workspace call with the locally signed-in Codex (checking
@@ -108,28 +161,121 @@ The Daemon runs the model library of the installer's `localmodels` tool for
 the Local models page. The Computer config's `local_models` section names the
 tool: `python`, `module_directory` (the sealed kit, used as `PYTHONPATH` and
 working directory), `state_directory` (`LOCALMODELS_STATE`) and
-`base_directory` (`--base-dir`). `packages/local-installation` writes it for
-the CLI Computer and the Desktop app for its own; a Computer without it, or
-whose interpreter is gone, reports `available: false` with
+`base_directory` (`--base-dir`). From `state_directory`, the Daemon derives
+sibling `tools` (`LOCALMODELS_TOOLS_DIR`), `bifrost`
+(`LOCALMODELS_BIFROST_DIR`), and `bifrost-addr` (`LOCALMODELS_BIFROST_ADDR`).
+The Daemon prefers the address in `<tools>/owned.json`. On start and apply
+calls, it checks port availability on loopback and local interfaces before
+choosing an unowned address. The default address is `127.0.0.1:18480`.
+Gateway registration failures can rotate the unowned address for the next
+attempt.
+
+The Daemon clears inherited values for these `LOCALMODELS_*` variables before
+setting them on tool calls. When the installer recorded a shared tools
+directory in the sibling `tools-dir` file (a home whose plan was applied
+before per-home isolation), the Daemon uses that directory, the Bifrost
+directory and address its `owned.json` records, and its `gateway-home` Pi
+profile. Otherwise, if the home lacks a per-home Bifrost ownership
+record, the Daemon can locate a legacy gateway through the profile in
+`model-source.json` in local mode or localmodels' default tools directory
+(`~/.local/share/localmodels/tools`, under `USERPROFILE` on Windows).
+It checks the legacy ownership record, any local-mode gateway URL, and the
+Bifrost configuration for a provider registered by a loaded library model.
+While that verification succeeds, the tool uses the legacy gateway and
+local-mode Runtime discovery prefers its existing `gateway-home` Pi profile.
+
+`packages/local-installation` writes the `local_models` config for the CLI
+Computer. The Desktop app writes it for its own Computer. A Computer without
+this config, or whose interpreter is gone, reports `available: false` with
 `TOOL_NOT_INSTALLED`. `internal/localmodels` owns the tool calls; the Daemon
 only routes `execute` (kind `local_models`) to it and sends what it publishes.
 The Daemon executes the actions the Computer owner chose; it never picks a
-model.
+model. The only action it takes on its own is loading, before a Run, the
+downloaded model that Run's Agent names.
 
 - Answer. Every action is answered `accepted` or `refused` with a
   `LocalModelActionRefusal`. `localmodels` checks every precondition before
   it starts work, so a download or load runs as a child process whose first
   event line decides the answer: a progress or result line accepts it, and an
-  error line before any progress refuses it with the tool's code and its
-  `pool`, `need_bytes` and `free_bytes` (`have_bytes` for download
-  refusals). A job that exits without an event is `TOOL_FAILED`. `unload`,
-  `remove` and `cancel` are answered when the tool finishes; `refresh` after a
-  status read. If the command's `expires_at` passes before the tool decides,
-  the Daemon sends no answer (the Gateway, waiting for the same deadline,
-  reports the action as unconfirmed) and the outcome reaches the owner only
-  through snapshots: an accepted job publishes its progress, and a late
-  refusal publishes a fresh status read. Command handling runs off the
-  connection loop.
+  error line before any progress refuses it with the tool's code (unknown
+  future codes degrade to `UNKNOWN_ERROR` rather than failing the action as
+  `TOOL_FAILED`) and its `pool`, `need_bytes` and `free_bytes` (`have_bytes`
+  for download refusals). Extended refusal codes (`GPU_UNSUPPORTED`,
+  `DRIVER_UPDATE_REQUIRED`, `RUNTIME_DEPENDENCY_MISSING`, `UNKNOWN_ERROR`)
+  are downgraded to legacy codes unless `runner.welcome`'s `service_features`
+  names `local_models_diagnostics`. A job that exits without an event is
+  `TOOL_FAILED`. `unload`, `remove` and `cancel` are answered when the tool
+  finishes; `refresh` after a status read. If the command's `expires_at`
+  passes before the tool decides, the Daemon sends no answer (the Gateway,
+  waiting for the same deadline, reports the action as unconfirmed) and the
+  outcome reaches the owner only through snapshots: an accepted job publishes
+  its progress, and a late refusal publishes a fresh status read. Command
+  handling runs off the connection loop.
+- Before a Run. A Pi Run whose model is a library row's `pi_model` reaches
+  the Daemon because the Pi catalog lists every downloaded library model
+  (Pi catalog below), and waits until that model is loaded. A model no row of the last readable snapshot
+  names (a BYOK or setup-stack model) costs no tool call and no wait; once
+  the installer lock wait below has ended, neither does a model that
+  snapshot shows loaded while its loopback engine `/health` (and saved local
+  loopback gateway `/health`, when configured) still answers. Otherwise the Daemon reads the status once; a refreshed `loaded` row is trusted unless the saved local gateway does not answer. A downloaded model that is `idle` or `failed` is loaded with
+  `library load <model>` (resetting a `HEALTH_CHECK_FAILED` row or a dead-gateway
+  `loaded` row with `library unload <model>` first, as `Act` also does for
+  owner-initiated loads) and never `--unload`, so the Daemon does not evict
+  a model to make room: a load that does not fit is refused, and the Run
+  fails with `local_model_unavailable` when the Agent Service's welcome names
+  that service feature, else with `model_unavailable` for an older service;
+  neither adds the model to the models a Runtime's login refused. A `loading` model, or one whose load the Models page
+  just started, is waited for without a second load. `pi_model` is present
+  only while the model is on the Computer; a `failed` row whose download
+  stopped (`DOWNLOAD_FAILED`, `NETWORK_UNAVAILABLE`, `DISK_INSUFFICIENT`) is
+  never loaded, and nothing is ever downloaded. The wait is bounded at 10
+  minutes. A Run cancelled while it waits leaves the load running, so the
+  next Run finds the model loaded, and concurrent Runs for one model share
+  one load; a load that ended in failure while a Run queued behind it gives
+  that Run the same error, but a Run whose own budget ran out does not. A
+  model that is not in the library, or a status read that fails, lets the
+  Run start as before.
+- Installer lock. A quit starts the installer's stop after the app is gone;
+  it cancels and unloads the library's models while holding the installer's
+  local-models lock, `operation.sqlite` beside the tool's state directory
+  (the installer's `localModelsLockFile` names the same file),
+  and the installer's resume reloads the saved `runtime_model` under the
+  same lock. A relaunch inside either window would read the models as still
+  loaded, or start a second load. So once per Daemon, before the first Run
+  decision for a library model, the Daemon takes and at once releases that
+  lock (`BEGIN EXCLUSIVE` with no busy wait, then `ROLLBACK`), retrying
+  every second while it is busy, for at most 3 minutes, and then reads the
+  status afresh. A Run that arrives during a restore therefore waits for it,
+  and the restore's load then shows as `loading`, which the Run waits on
+  instead of starting another. A missing lock file, or one that is not a
+  regular file of the current user, is not waited for. A restore that takes
+  the lock only after the probe is not ordered; its load still shows as
+  `loading` once it starts.
+- Pi catalog. localmodels registers a model with Pi only while it is
+  loaded, so after a quit Pi lists none of them, and with no model at all
+  Pi asks for a sign-in. When Pi runs on the managed local models source
+  (no saved source, or `local`; never `subscription` or BYOK) and is `ready`
+  or `authentication_required`, the Daemon adds to the Pi diagnostic it
+  reports every library row with a `pi_model` that is loaded, loading, or
+  downloaded and loadable (not an interrupted download). A model Pi listed
+  while it was loaded keeps that entry (label, reasoning effort, context
+  window), remembered in `state/local-models/pi-catalog.json`; one Pi never
+  listed gets its name, its context size and no reasoning effort. Until the
+  library has been read, and while a read fails, the remembered entries
+  stand in, so the first discovery and the hello already list them. Pi's
+  own entries and its default model stay as Pi reports them and come first
+  within the catalog bound (models are dropped past it, IDs over the bound
+  are skipped, labels are clipped). A Pi diagnostic that is
+  `authentication_required` only because its own catalog was empty is
+  reported `ready` once library models fill it; a model call (`model_invoke`)
+  on such a Pi, which names no model and finds none loaded, ends
+  `runtime_unavailable`. Remembered entries are learned only from Pi's own
+  catalog, and one goes when its row leaves the library. The runtime
+  monitor probes from Pi's own result and adds library models only to what
+  it publishes, so an authentication refresh neither keeps a merged model
+  nor undoes the `ready`; its retain rules treat a Pi published `ready` this way like a natively ready one, so a probe that times out during a load does not report it failed. A remembered entry the catalog schema would refuse is dropped, never sent. A status read whose set of such models differs
+  from the last one, including the first read that finds any and the first
+  after a failed read, asks for discovery again.
 - Jobs. A download or load runs in its own process group and writes its event
   lines to a file under `state/local-models/jobs`, which the Daemon tails, so
   a Daemon restart neither signals the job nor breaks its output. `cancel` is
@@ -142,17 +288,59 @@ model.
   one after connecting) is retried with backoff up to one minute until a read
   succeeds, so a transient failure never ends the watch.
 - Snapshots. `runner.local_models` carries `library-status/v1` mapped to
-  `LocalModelsSnapshot` (pools gain `kind` and `gpu_index`; a value outside
-  the contract's closed sets makes the read `TOOL_FAILED`). Optional model-card
-  fields (`family`, `publisher`, `architecture`, `parameters`,
-  `active_parameters`, `capabilities`, `license`, HTTPS `source_url`,
-  `prompt_tokens_per_second`) follow the same closed-set validation and
-  display-string clipping. It is sent after
+  `LocalModelsSnapshot` (pools gain `kind` and `gpu_index`, and keep the
+  tool's `external_holders`, the closeable desktop apps it found holding that
+  pool's memory, without their PIDs; `[]` stays `[]` for "none found" and an
+  omitted field stays omitted for "not reported"; sent only when
+  `runner.welcome`'s `service_features` names
+  `local_models_external_holders` and stripped otherwise; the Models page calls only those "Other
+  apps" and shows the rest of `used_bytes` beyond `holders` neutrally, since
+  an engine can hold more than its catalog estimate). Structural and
+  security invariants (`id`, unique model IDs, `fit`, `state`, `pool`,
+  `pi_model` length, non-negative speeds, HTTPS `source_url`) still fail
+  closed as `TOOL_FAILED`, while extensible display and diagnostic enums
+  degrade gracefully so newer `localmodels` releases do not break the Models
+  page: unknown `family` becomes `other`, unknown `architecture` is omitted,
+  unknown `capabilities` are dropped and deduplicated, unknown
+  `availability.reason.code` becomes `UNAVAILABLE`, unknown `error.code`
+  becomes `UNKNOWN_ERROR` (with `cause`/`path` cleared; unknown `error.cause`
+  is cleared), unknown `note.code` is dropped, unknown `download.step`
+  becomes `download`, and unknown `pool.holders[].kind` becomes `component`.
+  Optional model-card strings (`publisher`, `parameters`, `active_parameters`,
+  `license`) and diagnostic metadata are clipped to contract bounds. Extended
+  diagnostics (`GPU_UNSUPPORTED`, `DRIVER_UPDATE_REQUIRED`,
+  `RUNTIME_DEPENDENCY_MISSING`, `UNAVAILABLE`, `UNKNOWN_ERROR`, `memory_kind`,
+  driver/runtime fields) and optional `debug` metadata are sent only when
+  `runner.welcome`'s `service_features` names `local_models_diagnostics` and
+  are downgraded otherwise. Per-model inference engine fields (`engine`,
+  `engine_label`, `concurrency`, `host_ram_bytes`) are sanitized forward-
+  compatibly (unknown `engine` or out-of-range `concurrency` is omitted,
+  `engine_label` is clipped) and sent only when `runner.welcome`'s
+  `service_features` names `local_models_engine` (Computer 0.61.0 or later).
+  When `localmodels` reports a `loaded` model with configured
+  `concurrency > 1`, the Daemon runs a one-time loopback concurrency probe
+  (persisting only measured results atomically in `concurrency-probes.json`
+  under the local models cache directory, keyed by model ID, engine, engine
+  label, pool, context tokens, configured concurrency, and tool version;
+  looking up deploy auth bearer tokens and endpoint model names in
+  `<LOCALMODELS_STATE>/library/models/*.json` + `<deploy_dir>/api-key`). While
+  probing runs, the row is overlaid as `state: "loading"` with
+  `concurrency_probing: true` (sent only when `runner.welcome`'s
+  `service_features` names `local_models_concurrency_probe`, Computer 0.64.0
+  or later) and `EnsureLoaded` waits for probing to finish. A measured result
+  sets `concurrency` (`1` or `2`); transient probe errors or timeouts are not
+  cached, omit `concurrency` for that load so scheduling falls back to
+  adaptive limits, and retry on the next load. Models with omitted or `<= 1`
+  configured concurrency skip probing.
+  The snapshot is sent after
   every welcome, after every action or job end, and at most every 2 seconds
-  for progress. When a job enters a phase (download, verify, load, warm) the
-  Daemon rereads the status, which carries what the phase reserved or freed
-  (pool use, placement, models unloaded first), and applies the job's line on
-  top; later lines of the phase update that snapshot without another read.
+  for progress. When a job enters the `download` phase, the Daemon publishes
+  that progress line onto the current snapshot right away so refreshes do not
+  see the stale `absent` state while `library status` runs, then rereads the
+  status and applies the line on top; entering `verify`, `load`, or `warm`
+  rereads the status first so pool use, placement, and unloaded models appear
+  atomically before publishing. Later lines of the phase update that snapshot
+  without another read.
 - Error causes. `library status` keeps only a failed row's `code` and
   `detail`; the `cause` and `path` of a `GATEWAY_REGISTRATION_FAILED` reach
   the Daemon only on the job's error line (`GATEWAY_HOME_NOT_PRIVATE`: the
@@ -161,10 +349,20 @@ model.
   with that code; the model's next accepted job, or a row that moved on,
   drops them. They live in memory, so after a Daemon restart the row shows
   only its code.
-- Pi. The Daemon sets `PI_CODING_AGENT_DIR` on `localmodels` tool calls
-  through `OverlayEnvironment` and `workspace.PiSourceEnvironment` so loaded
-  models land in the profile Pi probes and runs. When a model is loaded on a
-  Computer with Pi enabled and not yet installed, `internal/localmodels`
+- Pi. The Daemon aligns `PI_CODING_AGENT_DIR` on `localmodels` tool calls with
+  the Pi profile Runtime discovery probes. When `<state>/model-source.json`
+  exists (`byok`, `subscription`, or `local`), it isolates tool calls through
+  the shared `localGatewayPiProfile` resolver (matching `OverlayEnvironment`
+  for `local` mode): passing an existing managed `gateway-home/.pi/agent`
+  profile (the verified legacy profile while models are loaded on that
+  gateway, then `ToolsDirectory(stateDir)`, `stateDir`, and an explicitly
+  configured legacy `gateway-home`), and omitting
+  `PI_CODING_AGENT_DIR` otherwise so `localmodels` registers models into this
+  home's `tools/gateway-home/.pi/agent` without colliding with `byok-home` or
+  personal `~/.pi/agent`. Without an applicable legacy profile or
+  `model-source.json`, tool calls follow `workspace.PiSourceEnvironment`
+  on the base environment (excluding any stale `byok-home`). When a model is
+  loaded on a Computer with Pi enabled and not yet installed, `internal/localmodels`
   installs the pinned Pi runtime asynchronously in the background under
   `HarnessRoot` (passing the bundled Node binary via `--node` when available,
   matching the installer's 2 m status/plan and 20 m apply budgets, and backing
@@ -179,17 +377,49 @@ model.
 
 `internal/localmodels/source.go` runs `localmodels source status|check|models|apply`
 for `execute` commands of kind `model_source`, on their own goroutine so they
-never block Operation commands; `apply` is serialized. A BYOK key reaches the
-tool on stdin, never in argv or logs, together with the address as base URL,
-path and endpoint and the protocol the owner's client chose; `check` sends one
-request there and `models` lists base URL + path + `/models`. The BYOK summary
-carries `path` and `endpoint` only after a `runner.welcome` that names the
-`byok_endpoint` service feature. `localmodels` writes
-`<state>/model-source.json`; the Daemon only adds the `runtime_paths` that the
-same `apply` reported. It re-reads the file on every discovery tick to overlay
-the Runtimes' environment (`OverlayEnvironment`) and executable paths
-(`OverlayRuntimePaths`), and under BYOK lists only the BYOK model in each
+never block Operation commands; `apply` is serialized, maps timeouts to
+`MODEL_SOURCE_TIMEOUT`, scrubs submitted BYOK API keys and recognizable
+credentials (`redact.Text`) from tool error messages before they leave the
+Computer, and logs structured refusal codes. Read-only `status`, `check`, and
+`models` calls use 40 s budgets inside the Runner Gateway's 45 s timeout, and
+`apply` fits inside a 165 s total budget under the Gateway's 180 s timeout
+(giving `source apply` up to 150 s while reserving 15 s for synchronous
+post-apply Runtime discovery, or up to 30 s when `source apply` finishes
+earlier). Output decoding scans sequential JSON documents so
+JSONL progress lines followed by pretty-printed JSON parse reliably. A BYOK key
+reaches the tool on stdin, never in argv or logs, together with the address as
+base URL, path and endpoint and the protocol the owner's client chose; `check`
+sends one request there and `models` lists base URL + path + `/models`. The BYOK
+summary carries `path` and `endpoint` only after a `runner.welcome` that names
+the `byok_endpoint` service feature. `localmodels` writes
+`<state>/model-source.json` without `runtime_paths`; on `source apply`, BYOK
+`remount`, and installer `applySource`, the caller merges valid executable
+non-harness paths from before the rewrite alongside any `runtime_paths` that
+`apply` reported, without pinning paths inside `<home>/runtime/harness`. The
+Daemon re-reads the file on every discovery tick to overlay the Runtimes'
+environment (`OverlayEnvironment`) and executable paths (`OverlayRuntimePaths`),
+scanning `<home>/runtime/harness/bin/<runtime>` and the highest-version
+`<home>/runtime/harness/tools/<runtime>/<version>/<runtime>` on each read so
+managed Runtime updates take effect without rewriting `model-source.json`. It
+also drops any stale `byok-home` entry in `local` mode in favor of the managed
+`gateway-home` Pi profile, never falls back to cloud models in `local` mode
+(`agentRuntimeModel`), and under BYOK lists only the BYOK model in each
 Runtime's catalog.
+
+Before a Run or model call on a Runtime whose profile is the BYOK source's,
+the Daemon checks the saved loopback gateway's `/health` (`EnsureGateway` in
+`source_gateway.go`), off the admission lock. A gateway that does not answer,
+because the endpoint was down when Linger started or a quit stopped it, is
+mounted again with `source apply --mode byok` from the configuration
+`localmodels` saved, serialized with `apply`; the kit probes the endpoint
+first. A failed mount fails the Run before its Runtime starts, with the
+public failure code of the tool's structured code: `BYOK_UNREACHABLE` and
+`NETWORK_UNAVAILABLE` become `network_error`, `BYOK_AUTH_FAILED`
+`authentication_required`; any other stays `execution_failed`. Model calls
+answer `unavailable` for the two network codes, `auth_required` for
+`BYOK_AUTH_FAILED` and `runtime_unavailable` for any other, with the tool's
+code in the reason. Runs that waited for a remount that failed meanwhile share its
+error instead of probing the endpoint again.
 
 ## Codex models cache
 
@@ -207,6 +437,26 @@ background as soon as it starts, so the stamp only saves the blocking fetch.
 API-key and signed-out homes have no account identity and are not seeded;
 Codex does not fetch the catalog for them.
 
+## Runtime system prompts
+
+An Agent's instructions replace each Runtime's own system prompt, which would
+otherwise tell the model it is a coding assistant and, for Claude, which Claude
+model it is:
+
+- Codex takes them as `baseInstructions`.
+- Claude takes them as the initialize request's `systemPrompt`. Claude Code's
+  own prompt lists Claude model IDs and names a Claude model, which a
+  non-Claude model behind BYOK or a local model takes for its identity. Claude
+  still sends its one-line Agent SDK preamble first. The Daemon ends the prompt
+  with the working directory: Claude 2.1.322 also sends its environment
+  (working directory, platform, date) as a separate system message, but an
+  older supported release may put it only in its own prompt. The Claude
+  settings also set an empty `attribution`, so Claude does not tell the model
+  to sign commits and pull requests as Claude Code.
+- Pi takes them as `--system-prompt`, which drops its built-in
+  coding-assistant prompt, tool list and pointers to Pi's own docs.
+- Antigravity appends them; see [Antigravity](#antigravity).
+
 ## Personal instructions
 
 An Agent run follows only the instructions the Daemon gives it, never the
@@ -221,14 +471,39 @@ Computer user's own instruction files:
   projection left is removed. `instructions`, `developer_instructions`,
   `model_instructions_file` and `experimental_instructions_file` are dropped
   from the projected `config.toml` and its profiles.
-- Pi runs with `--no-context-files` and an empty `--system-prompt`, so it keeps
-  its built-in prompt instead of the user's `SYSTEM.md`.
+- Pi runs with `--no-context-files`, and it always gets `--system-prompt` and
+  `--append-system-prompt`, empty when there is nothing to pass, so it reads
+  neither the user's `SYSTEM.md` nor their `APPEND_SYSTEM.md`.
 - Antigravity is the exception: its ACP server has no switch that turns off
   the user's own rules, skills and `~/.gemini/config/mcp_config.json`, so an
   Antigravity run sees them next to the Daemon's instructions and servers.
 
 The user's own Claude Skills and the Skills of plugins they installed are still
 offered to Agents (`internal/workspace/claude_skills.go`).
+
+## Shell text check
+
+An Agent's shell rewrites text in double quotes, an unquoted heredoc, or a bare
+word before a command reads it: `$1` to `$9` become empty and backquoted text
+runs as a command, so `teamhub message send --content "$180"` sends `80`.
+Before a shell command runs, the Daemon refuses a `teamhub` command whose
+arguments, heredoc or here-string, or a pipeline stage that feeds it, hold such
+text, and the refusal tells the Agent to pass the text on stdin with a quoted
+heredoc (`internal/permission/shell_text.go`). Named variables such as `"$id"`,
+`$(...)`, and the positional parameters of a shell function pass.
+
+- Claude checks it in its tool policy, on both the PreToolUse hook and
+  `can_use_tool`.
+- Codex runs `linger-computer-daemon shell-text-hook` as a
+  PreToolUse hook for every shell command. Codex on Windows runs PowerShell,
+  so it gets no hook.
+- Pi loads the managed extension (`extensions/pi-mcp.mjs`) for every Run. It
+  runs the same hook before a `bash` call that names `teamhub` and holds `$` or
+  a backquote.
+- Antigravity is not checked: its permission request can only allow or reject
+  a call, with no reason the Agent would read.
+
+A hook that cannot run lets the command through.
 
 ## Antigravity
 
@@ -256,15 +531,40 @@ for a browser sign-in when signed out.
   stored is not a usable session: `session/load` accepts it, but the prompt
   then fails, so Linger never assigns one. A stored session replays at least
   the prompt that made it, so a load that replays no prompt, or that
-  Antigravity refuses, ends as `session_not_found` before anything is
-  emitted, and the Run continues once in a new session. A Run yields to the
-  scheduler only after native work, because its session holds no prompt
+  Antigravity refuses, finds no session and returns `session_not_found` so Agent
+  Service can clear the persisted session and restart the Run cleanly in a fresh
+  native session with recent messages. A resumed Run still reports its
+  turn-started event before `session/load`, because loading takes seconds
+  and the Room shows the Agent working from that event. A Run yields to
+  the scheduler only after native work, because its session holds no prompt
   before that.
+- On a fresh `run.start` that names `previous_session` (Computer 0.63.0 or
+  later), the provider executor reads the superseded native session through
+  `runtimehistory`, writes a bounded, redacted Markdown tail to
+  `./playground/.previous-context.md`, and appends that path to the turn's
+  `<system-reminder>` only when the file was written.
+- A tool call is named by Antigravity's own tool name, such as
+  `run_command`; its title is the whole command line, which the call's
+  redacted input already shows.
+- `run_command` moves a command that outlasts its `WaitMsBeforeAsync` to the
+  background and ends the turn with `end_turn`. Once the command finishes,
+  Antigravity continues on its own with no new prompt. The process stops when
+  the Run ends, which would kill the command and lose the reply. So a turn
+  that ends with an open tool call keeps the Run open. The Run ends once no
+  tool call is open and the session has sent nothing for 15 seconds. ACP has
+  no event for the end of such a continuation. If `agy` exits during the wait,
+  the Run fails. The wait ends after 30 minutes, because a backgrounded
+  server never finishes and a Run has no time budget.
+- The Run's reply is its last text message, even when tool calls follow it,
+  because Agent Service reads the reply from the stream the same way.
 - The Daemon's instructions go in `_meta.antigravity.systemPrompt.append`, and
   its MCP servers in the session's `mcpServers`.
 - `session/request_permission` goes to the Run's permission review when the
-  Context has one, with `execute` calls reviewed as shell commands. Otherwise
-  the adapter selects the allow option, as Pi runs without review.
+  Context has one, with `execute` calls reviewed as shell commands from
+  `rawInput.CommandLine`. A completed `run_command` whose `rawOutput.exit_code`
+  is not zero finishes as failed. Otherwise
+  the adapter selects the allow option, as the Runtime runs with the Agent's
+  full local authority.
 - Antigravity reports a model error, such as a rejected API key, as reply text
   and ends the turn with `end_turn`. With no structured signal, such a Run
   completes and the Room shows the text.
@@ -293,12 +593,20 @@ the current SID and ACL, not POSIX permission bits. Writing a separate credentia
 does not change the permissions of an existing parent directory.
 
 The installer and the Daemon refuse a private path when another account can
-replace one of its parent directories. One exception applies: the Codex Windows
-sandbox may hold that right on a parent, such as AppData. The sandbox acts
+replace one of its parent directories, naming the offending ancestor path and
+SID. Ancestors trust the current user, `SYSTEM`, `BUILTIN\Administrators`,
+`TrustedInstaller`, built-in Administrator/Domain/Enterprise Admin SIDs
+(`S-1-5-21-*-*-*-500|512|519`), and direct individual/domain/Entra members of
+local `BUILTIN\Administrators` (excluding broad well-known groups). One
+additional exception applies on ancestor access rules: the Codex Windows
+sandbox may hold replace rights on a parent, such as AppData. The sandbox acts
 through the `CodexSandboxUsers` group and the capability SIDs in
-`%USERPROFILE%\.codex\cap_sid`. A sandboxed Codex command can therefore replace
-such a parent; Linger accepts this so it installs beside Codex. Private paths
-themselves still grant access only to the current user and SYSTEM.
+`%USERPROFILE%\.codex\cap_sid` (or `%CODEX_HOME%\cap_sid`). A sandboxed Codex
+command can therefore replace such a parent; Linger accepts this so it installs
+beside Codex. Private paths themselves still grant access only to the current
+user and SYSTEM. Their owner is the current user or, when that user is an
+administrator, Administrators, which owns what an elevated process (Run as
+administrator, the built-in Administrator) creates.
 
 Process recovery uses the creation time and a held process handle, so a reused
 process ID is never mistaken for the original. Ordinary tasks are held by a Job
@@ -501,11 +809,25 @@ The Daemon admits only background, output-file-free scripts, fits the time limit
 On macOS, `click` takes `delivery_mode: "foreground"` and `action`: the first for web controls that react only to a real pointer, the second for accessibility actions such as `show_alternate_ui`.
 
 The macOS and Linux developer instructions identify the public entry. Codex
-0.163.0 and later calls the public tools directly, outside code mode and
-deferred tool search. Earlier versions use their standard tool discovery.
-Claude Code defers its own `WebSearch` and `WebFetch` behind `ToolSearch`, so
-every Claude Operation's developer instructions also name them and how to load
-them; Codex's `web_search` is not deferred and gets no such line.
+calls the public tools directly, outside code mode and deferred tool search.
+Web tools depend on the link the Runtime reaches its model through
+(`RuntimeModel.Link`). On a vendor subscription, Claude Code keeps `WebSearch`
+and `WebFetch`, deferred behind `ToolSearch`, so its developer instructions name
+them and how to load them; Codex keeps its own `web_search`. Both are told to
+use their own tools first and, when those fail, `teamhub web search` and
+`teamhub web open`, which search and read through the search providers the user
+set up, or DuckDuckGo without a key. On an API link, an endpoint and key set up
+in the Runtime's own configuration, provider-hosted search may not run, so the
+instructions name `teamhub web search`, `open` and `list` and tell the model to
+use them instead of its own web tools. A Runtime whose profile is a
+localmodels-managed gateway profile (local models or BYOK, see
+`localmodels.GatewayRuntime`) is on an API link that cannot run provider-hosted
+search at all: Codex launches with `web_search="disabled"` after every user
+override, Claude's `--tools` leaves out `WebSearch` and `WebFetch`, and the
+instructions name only the `teamhub web` commands. Pi has no web tools of its
+own and always gets that `teamhub web` line. Without a TeamHub CLI for the
+Agent, only Claude's own tools are named. A parked Codex process launched with
+the other web setting is not reused.
 
 On macOS these tools show only the fields the Computer routes. They hide Cua's `scope` and `capture_id`; only `click` takes `delivery_mode`, as described above.
 Within `ui_exec`, scripts can call individual input methods. An input to a
@@ -787,6 +1109,23 @@ managed runtime harness installs it so) lacks; the Daemon puts the bundle's
 with its dependencies resolves its own jiti first. Node reads `NODE_PATH` at
 startup, so the extension then restores the value Pi inherited, and the
 commands Pi starts never resolve a package from the bundle.
+
+The same extension carries Pi's permission review and dynamic MCP attachment, so
+resident Pi processes and provider pre-starts load it with an empty managed MCP
+config file and `mcp__*` in `--tools`. On Room-presence `provider.prepare`, Pi
+starts with a 40-second timeout, verifies `get_state` and applies any clamped
+thinking level, then parks without submitting a prompt. When a Run adopts a
+parked Pi process whose MCP server set changed, the Daemon writes the new
+front-rewritten `linger-mcp.json`, verifies `get_commands` exposes
+`linger-sync-mcp`, runs `/linger-sync-mcp` and reads the structured verdict from
+its `linger.mcp_sync` RPC dialog before submitting the prompt; an attachment
+failure recycles the process and falls back to a cold spawn. Its `tool_call`
+hook opens an RPC `input` dialog titled `linger.permission_review` for each
+`bash` and `mcp__*` call, with the call as JSON. The Daemon answers it with a
+JSON verdict from the Run's permission review, with `bash` reviewed as a shell
+command. A Run without review gets an allow verdict, because a resident Pi
+process may serve both kinds of Run. A missing or unreadable verdict blocks the
+call. The Daemon cancels any other extension dialog.
 
 The compatibility probe of the pinned Playwright catalog is
 `TestPinnedPlaywrightCatalog`; it needs `LINGER_PLAYWRIGHT_COMPAT_ENTRY` and

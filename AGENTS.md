@@ -124,7 +124,10 @@ Memory, and Voice services.
   `scripts/local-defaults.env`; `scripts/with-local-env.mjs` only merges files.
 - The repository is English-only: docs, code, comments, logs, user-facing
   strings, prompts, Skills, tests, fixtures, and benchmark data.
-  `make check-repository-gate` rejects CJK ideographs in changed files.
+  `make check-repository-gate` rejects CJK ideographs in changed files. The
+  only exceptions are the translation catalogs under
+  `apps/web/src/i18n/locales/` (Web client) and `apps/desktop/src/i18n/locales/`
+  (desktop shell); text in another language goes nowhere else.
   - NO: a test fixture with a literal Chinese sentence.
   - OK: the same text as escaped code points (`"\u4f60\u597d"`), or kana,
     accented Latin, or emoji when any unspaced script will do.
@@ -135,8 +138,10 @@ New and changed code follows these targets. Do not migrate untouched code only
 to comply.
 
 - HTTP errors use one envelope,
-  `{"error": {"code", "message", "request_id", "details"?}}`, with UPPER_SNAKE
-  codes declared in the OpenAPI component. Go handlers write it through
+  `{"error": {"code", "message", "request_id", "details"?}}`, with codes
+  declared in the OpenAPI component: UPPER_SNAKE on the public Product (Web)
+  API, lower snake_case on the Agent API and internal contracts, whose codes
+  the teamhub CLI passes through (see `apps/teamhub-cli/AGENTS.md`). Go handlers write it through
   `writeError`; never return a bare `{"error": "..."}` or a hand-built `gin.H`.
 - Logging: Go uses `slog`; Node services log through the injected
   `createJsonLogger` from `@linger/service-kit/node`, never `console.*`

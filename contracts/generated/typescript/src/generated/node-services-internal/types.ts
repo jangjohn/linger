@@ -1336,8 +1336,11 @@ export interface components {
       computer_id: string;
       agent_id: string;
       tool_session_id: string;
-      /** @enum {string} */
-      server: "browser" | "playground";
+      /**
+       * @description feishu_mail runs TeamHub's Feishu Mail calls through the owner's own lark-cli login.
+       * @enum {string}
+       */
+      server: "browser" | "playground" | "feishu_mail";
       tool_name: string;
       arguments: {
         [key: string]: unknown;
@@ -1532,6 +1535,9 @@ export interface components {
       | "MEMORY_INSUFFICIENT"
       | "DISK_INSUFFICIENT"
       | "PLATFORM_UNSUPPORTED"
+      | "GPU_UNSUPPORTED"
+      | "DRIVER_UPDATE_REQUIRED"
+      | "RUNTIME_DEPENDENCY_MISSING"
       | "LOAD_NO_ROOM"
       | "DOWNLOAD_FAILED"
       | "CHECKSUM_MISMATCH"
@@ -1542,6 +1548,7 @@ export interface components {
       | "MODEL_FILES_MISSING"
       | "GATEWAY_REGISTRATION_FAILED"
       | "CANCELLED"
+      | "UNKNOWN_ERROR"
       | "TOOL_NOT_INSTALLED"
       | "TOOL_FAILED";
     /** @description A place a model can live: gpu:<index>, system (RAM beside GPUs), or unified (RAM of a host without discrete GPUs). */

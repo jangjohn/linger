@@ -12,6 +12,7 @@ import {
   toolPresentation,
   toolInputFromEntries,
 } from "../runtime-status/runtime-tool-presentation";
+import { runtimeStatusMessages as m } from "../runtime-status/runtime-status.messages";
 import {
   AgentAvatarStatusContext,
   type AgentAvatarStatus,
@@ -19,10 +20,15 @@ import {
 import {
   isRunInterruption,
   runtimeFailureMessage,
+  runtimeFailureReason,
 } from "../runtime-status/runtime-failure-message";
 import type { RuntimeExecutionFailure } from "../runtime-status/runtime-presentation-events";
 import { Fragment, type ReactNode, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
+import { commonMessages } from "@/i18n/common.messages";
+import type { Translate } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT, useTranslation } from "@/i18n/use-translation";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -189,6 +195,8 @@ export function MessageTimeline({
   focusedMessageHighlight,
   workspaceAgentIds = EMPTY_STATIC_AGENT_ACTOR_IDS,
 }: MessageTimelineProps) {
+  const translation = useTranslation();
+  const { t } = translation;
   const { filePreviewError, previewMessageFile } =
     useMessageFilePreview(onOpenMessageFile);
   const referenceTitles = useMemo(
@@ -212,8 +220,9 @@ export function MessageTimeline({
         cache: runtimeViewCache.current,
         runStatuses,
         runtimePresentationEventsByRunStatusId,
+        t,
       }),
-    [runStatuses, runtimePresentationEventsByRunStatusId],
+    [runStatuses, runtimePresentationEventsByRunStatusId, t],
   );
   const hasTimelineContent = Boolean(
     candidateMessages.length || pendingMessages.length || voiceLiveDraft,
@@ -223,7 +232,7 @@ export function MessageTimeline({
       statuses: new Map(
         runtimeStatusViews.flatMap((row) =>
           isLiveAgentRunStatus(row)
-            ? [[row.runStatus.agent.id, avatarStatus(row)] as const]
+            ? [[row.runStatus.agent.id, avatarStatus(row, t)] as const]
             : [],
         ),
       ),
@@ -240,7 +249,7 @@ export function MessageTimeline({
         );
       },
     }),
-    [onOpenProfile, onOpenAgentActivity, runtimeStatusViews],
+    [onOpenProfile, onOpenAgentActivity, runtimeStatusViews, t],
   );
   const renderMessage = (message: TeamHubMessage, index: number) => {
     const previous = candidateMessages[index - 1];
@@ -250,7 +259,7 @@ export function MessageTimeline({
         {startsConversation ? (
           <div className="room-conversation-time text-center text-xs text-app-subtle">
             <time dateTime={message.created_at}>
-              {formatMessageTime(message.created_at)}
+              {formatMessageTime(message.created_at, translation)}
             </time>
           </div>
         ) : null}
@@ -352,13 +361,17 @@ export function MessageTimeline({
                       >
                         {formatMessageTime(
                           new Date(message.createdAt).toISOString(),
+                          translation,
                         )}
                       </time>
                     </div>
                   ) : null}
                   <PendingMessageRow
                     actorId={currentActorId}
-                    actorName={actorDisplayNames[currentActorId ?? ""] ?? "You"}
+                    actorName={
+                      actorDisplayNames[currentActorId ?? ""] ??
+                      t(commonMessages.you)
+                    }
                     startsGroup={
                       startsConversation || (index === 0 && startsOwnGroup)
                     }
@@ -393,13 +406,15 @@ export function MessageTimeline({
 /**
  * Each Run's last view, kept while the Run stays listed. A Run is projected
  * again only when its status or its event list is a new object, so one Run's
- * runtime event does not re-project every other Run.
+ * runtime event does not re-project every other Run. A view holds the words
+ * of the language it was projected in, so a language switch projects again.
  */
 type RuntimeTimelineViewCache = Map<
   string,
   {
     records: readonly TeamHubRuntimePresentationEventRecord[] | undefined;
     runStatus: TeamHubRunStatus;
+    t: Translate;
     view: AgentRunStatusView | undefined;
   }
 >;
@@ -408,6 +423,7 @@ export function buildRuntimeTimelineViews({
   cache,
   runStatuses,
   runtimePresentationEventsByRunStatusId,
+  t,
 }: {
   /** Reused and pruned to the given Runs on every pass. */
   cache?: RuntimeTimelineViewCache;
@@ -415,6 +431,7 @@ export function buildRuntimeTimelineViews({
   runtimePresentationEventsByRunStatusId: Readonly<
     Record<string, readonly TeamHubRuntimePresentationEventRecord[]>
   >;
+  t: Translate;
 }) {
   const runtimeStatusViews: AgentRunStatusView[] = [];
   const listed = new Set<string>();
@@ -422,11 +439,13 @@ export function buildRuntimeTimelineViews({
     const records = runtimePresentationEventsByRunStatusId[runStatus.id];
     const cached = cache?.get(runStatus.id);
     const view =
-      cached?.runStatus === runStatus && cached.records === records
+      cached?.runStatus === runStatus &&
+      cached.records === records &&
+      cached.t === t
         ? cached.view
-        : runtimeTimelineView(runStatus, records);
+        : runtimeTimelineView(runStatus, records, t);
     listed.add(runStatus.id);
-    cache?.set(runStatus.id, { records, runStatus, view });
+    cache?.set(runStatus.id, { records, runStatus, t, view });
     if (view) runtimeStatusViews.push(view);
   }
   for (const runStatusId of cache?.keys() ?? []) {
@@ -438,11 +457,12 @@ export function buildRuntimeTimelineViews({
 function runtimeTimelineView(
   runStatus: TeamHubRunStatus,
   records: readonly TeamHubRuntimePresentationEventRecord[] | undefined,
+  t: Translate,
 ) {
   const presentation = records
     ? projectRuntimeChatPresentation(records)
     : undefined;
-  const history = resolveAgentRunStatusHistory({ runStatus, presentation });
+  const history = resolveAgentRunStatusHistory({ runStatus, presentation, t });
   if (history.length === 0) return undefined;
   return createAgentRunStatusView(runStatus, history, history.at(-1)!.key);
 }
@@ -457,6 +477,7 @@ function TypingDots({ className = "" }: { className?: string }) {
   );
 }
 
+// Compared in code; `stateLabels` holds the words shown for each.
 type AgentRuntimeState =
   | "Canceled"
   | "Completed"
@@ -469,6 +490,20 @@ type AgentRuntimeState =
   | "Waiting for your input"
   | "Working";
 
+const stateLabels: Record<AgentRuntimeState, Message<string>> = {
+  Canceled: m.stateCanceled,
+  Completed: m.stateCompleted,
+  Failed: m.stateFailed,
+  "Needs attention": m.stateNeedsAttention,
+  Recovering: m.stateRecovering,
+  // An Agent writing its reply reads as typing, like a person.
+  Responding: m.stateTyping,
+  Stopped: m.stateStopped,
+  Thinking: m.stateThinking,
+  "Waiting for your input": m.stateWaitingForInput,
+  Working: m.stateWorking,
+};
+
 interface AgentRuntimeStatusSegment {
   activities: readonly RuntimeActivityPresentation[];
   key: string;
@@ -479,7 +514,6 @@ interface AgentRuntimeStatusSegment {
   outputs: readonly RuntimeOutputPresentation[];
   plan?: RuntimePlanPresentation;
   state: AgentRuntimeState;
-  summary: string;
   /** The Run ended with follow-ups whose delivery is unconfirmed. */
   unconfirmedFollowUps?: true;
 }
@@ -504,9 +538,11 @@ function isLiveAgentRunStatus(runtimeStatus: AgentRunStatusView) {
 function resolveAgentRunStatusHistory({
   runStatus,
   presentation,
+  t,
 }: {
   runStatus: Pick<TeamHubRunStatus, "status">;
   presentation?: RuntimeChatPresentation;
+  t: Translate;
 }): readonly AgentRuntimeStatusSegment[] {
   if (presentation) {
     const history = presentation.items
@@ -520,6 +556,7 @@ function resolveAgentRunStatusHistory({
           outputs: item.outputs,
           plan: item.plan,
           status: item.status,
+          t,
           terminalOutcome: item.terminalOutcome,
           failure: item.failure,
           title: item.title,
@@ -529,9 +566,9 @@ function resolveAgentRunStatusHistory({
     if (history.length > 0) return history;
     if (!presentation.currentStatus) {
       return runStatus.status === "active"
-        ? [fallbackAgentRuntimeStatusSegment()]
+        ? [fallbackAgentRuntimeStatusSegment(t)]
         : runStatus.status === "aborted"
-          ? [stoppedAgentRuntimeStatusSegment()]
+          ? [stoppedAgentRuntimeStatusSegment(t)]
           : [];
     }
     return [
@@ -539,36 +576,41 @@ function resolveAgentRunStatusHistory({
         first: true,
         key: "snapshot",
         status: presentation.currentStatus,
+        t,
         title: presentation.currentTitle,
       }),
     ];
   }
 
   return runStatus.status === "active"
-    ? [fallbackAgentRuntimeStatusSegment()]
+    ? [fallbackAgentRuntimeStatusSegment(t)]
     : runStatus.status === "aborted"
-      ? [stoppedAgentRuntimeStatusSegment()]
+      ? [stoppedAgentRuntimeStatusSegment(t)]
       : [];
 }
 
-function fallbackAgentRuntimeStatusSegment(): AgentRuntimeStatusSegment {
+function fallbackAgentRuntimeStatusSegment(
+  t: Translate,
+): AgentRuntimeStatusSegment {
   return resolveAgentRuntimeStatusSegment({
     first: true,
     key: "snapshot",
     status: "working",
+    t,
   });
 }
 
 // An aborted Run status covers both failed and canceled Runs; until its
 // presentation events arrive, the outcome and its cause are not known.
-function stoppedAgentRuntimeStatusSegment(): AgentRuntimeStatusSegment {
+function stoppedAgentRuntimeStatusSegment(
+  t: Translate,
+): AgentRuntimeStatusSegment {
   return {
     activities: [],
     key: "stopped",
-    line: { tone: "warn", text: "Run stopped" },
+    line: { tone: "warn", text: t(m.runStopped) },
     outputs: [],
     state: "Stopped",
-    summary: "Run stopped",
   };
 }
 
@@ -580,6 +622,7 @@ function resolveAgentRuntimeStatusSegment({
   outputs = [],
   plan,
   status,
+  t,
   terminalOutcome,
   title,
   unconfirmedInputIds,
@@ -594,6 +637,7 @@ function resolveAgentRuntimeStatusSegment({
   outputs?: readonly RuntimeOutputPresentation[];
   plan?: RuntimePlanPresentation;
   status: "queued" | "working" | "thinking";
+  t: Translate;
   terminalOutcome?: "canceled" | "completed" | "failed";
   failure?: RuntimeExecutionFailure;
   /** The thinking summary while the status is thinking. */
@@ -608,30 +652,8 @@ function resolveAgentRuntimeStatusSegment({
   const activeActivity =
     activeActivities.find((activity) => activity.kind === "recovery") ??
     activeActivities[0];
-  const terminalSummary =
-    terminalOutcome === "completed"
-      ? "Run completed"
-      : terminalOutcome === "canceled"
-        ? "Run canceled"
-        : terminalOutcome === "failed"
-          ? runtimeFailureMessage(failure)
-          : undefined;
   const unconfirmed = Boolean(terminalOutcome && unconfirmedInputIds?.length);
-  const summary =
-    (unconfirmed
-      ? `${terminalOutcome === "failed" ? `${terminalSummary}. ` : ""}Follow-up delivery unconfirmed. Resend it if the Agent did not answer.`
-      : undefined) ??
-    terminalSummary ??
-    (activeActivity?.kind === "interaction"
-      ? "Waiting for your input"
-      : undefined) ??
-    (activeActivity ? activitySummary(activeActivity) : undefined) ??
-    (status === "queued"
-      ? "Thinking"
-      : status === "thinking"
-        ? "Planning the next step"
-        : "Working on your request");
-  const state =
+  const state: AgentRuntimeState =
     unconfirmed && terminalOutcome !== "failed"
       ? "Needs attention"
       : terminalOutcome === "completed"
@@ -655,7 +677,7 @@ function resolveAgentRuntimeStatusSegment({
   // the entries of its current group in order (see statusLineQueue). Dots
   // wait for the Agent's first Activity or thinking, and Working follows a
   // message once it has gone out (an output closes its Segment).
-  const queue = statusLineQueue(marks, activities);
+  const queue = statusLineQueue(marks, activities, t);
   const lineRunning = activities
     .filter(
       (activity) =>
@@ -666,36 +688,46 @@ function resolveAgentRuntimeStatusSegment({
   const stateActivity =
     lineRunning.find((activity) => activity.kind === "recovery") ??
     lineRunning.find((activity) => activity.kind === "interaction");
+  const failureReason =
+    state === "Failed" ? runtimeFailureReason(t, failure) : undefined;
+  // An interrupted Run says why it stopped, and that a follow-up may be lost.
+  const stoppedText = unconfirmed
+    ? t(m.stoppedFollowUpUnconfirmed, {
+        reason: runtimeFailureMessage(t, failure),
+      })
+    : runtimeFailureMessage(t, failure);
   const line: AgentStatusLineContent =
     state === "Failed"
       ? {
           tone: "danger",
-          text:
-            terminalSummary === "Run failed"
-              ? terminalSummary
-              : `Run failed: ${terminalSummary}`,
+          text: failureReason
+            ? t(m.runFailedWith, { reason: failureReason })
+            : t(m.runFailed),
         }
       : state === "Stopped"
-        ? { tone: "warn", text: summary }
+        ? { tone: "warn", text: stoppedText }
         : state === "Needs attention"
-          ? { tone: "warn", text: "Follow-up delivery unconfirmed" }
+          ? { tone: "warn", text: t(m.followUpUnconfirmed) }
           : stateActivity
             ? {
                 tone: "live",
-                text: activityStatusLine(stateActivity.kind).steps[0]!,
+                text: activityStatusLine(t, stateActivity.kind).steps[0]!,
                 runningActivityId: stateActivity.activityId,
               }
             : status === "queued"
               ? { tone: "wait" }
               : outputs.length > 0 && lineRunning.length === 0
-                ? { tone: "live", text: "Working" }
+                ? { tone: "live", text: t(m.stateWorking) }
                 : queue.length > 0
                   ? queue.at(-1)!.content
                   : status === "thinking"
-                    ? { tone: "live", text: title?.trim() || "Thinking" }
+                    ? {
+                        tone: "live",
+                        text: title?.trim() || t(m.stateThinking),
+                      }
                     : first && activities.length === 0
                       ? { tone: "wait" }
-                      : { tone: "live", text: "Working" };
+                      : { tone: "live", text: t(m.stateWorking) };
   const lineQueue =
     queue.length > 0 && line === queue.at(-1)!.content ? queue : undefined;
   return {
@@ -706,7 +738,6 @@ function resolveAgentRuntimeStatusSegment({
     outputs,
     plan,
     state,
-    summary,
     ...(unconfirmed ? { unconfirmedFollowUps: true as const } : {}),
   };
 }
@@ -721,6 +752,7 @@ function resolveAgentRuntimeStatusSegment({
 function statusLineQueue(
   marks: readonly RuntimeStatusMark[],
   activities: readonly RuntimeActivityPresentation[],
+  t: Translate,
 ): AgentStatusLineItem[] {
   const byId = new Map(
     activities.map((activity) => [activity.activityId, activity]),
@@ -728,7 +760,9 @@ function statusLineQueue(
   let items: { key: string; text: string; runningActivityId?: string }[] = [];
   for (const mark of marks) {
     if (mark.type === "thinking") {
-      items = [{ key: mark.key, text: mark.title?.trim() || "Thinking" }];
+      items = [
+        { key: mark.key, text: mark.title?.trim() || t(m.stateThinking) },
+      ];
       continue;
     }
     const activity = byId.get(mark.activityId);
@@ -744,6 +778,7 @@ function statusLineQueue(
         ? { runningActivityId: activity.activityId }
         : {};
     const named = activityStatusLine(
+      t,
       activity.kind,
       toolInputFromEntries(activity.entries),
     );
@@ -778,10 +813,10 @@ function statusLineQueue(
   }));
 }
 
-function activitySummary(activity: RuntimeActivityPresentation) {
-  if (activity.kind === "interaction") return "Waiting for your input";
-  if (activity.kind === "response") return "Preparing a reply";
-  return toolPresentation(activity.kind).summary;
+function activitySummary(activity: RuntimeActivityPresentation, t: Translate) {
+  if (activity.kind === "interaction") return t(m.stateWaitingForInput);
+  if (activity.kind === "response") return t(m.preparingReply);
+  return toolPresentation(t, activity.kind).summary;
 }
 
 function createAgentRunStatusView(
@@ -800,13 +835,16 @@ function createAgentRunStatusView(
   };
 }
 
-function avatarStatus(row: AgentRunStatusView): AgentAvatarStatus {
+function avatarStatus(
+  row: AgentRunStatusView,
+  t: Translate,
+): AgentAvatarStatus {
   return {
-    status: runtimeStatusDisplayState(row.state),
+    status: t(stateLabels[row.state]),
     activities: row.activities.flatMap((activity) =>
       activity.outcome
         ? []
-        : [{ id: activity.activityId, label: activitySummary(activity) }],
+        : [{ id: activity.activityId, label: activitySummary(activity, t) }],
     ),
   };
 }
@@ -864,6 +902,7 @@ export function AgentStreamingStatusDock({
   /** Shown only while that Agent has no Run status; it offers no Stop. */
   typingAgent?: AgentStreamingTypingAgent;
 }) {
+  const t = useT();
   const runtimeViewCache = useRef<RuntimeTimelineViewCache>(new Map());
   const runtimeStatuses = useMemo(
     () =>
@@ -871,8 +910,9 @@ export function AgentStreamingStatusDock({
         runStatuses,
         runtimePresentationEventsByRunStatusId,
         runtimeViewCache.current,
+        t,
       ),
-    [runStatuses, runtimePresentationEventsByRunStatusId],
+    [runStatuses, runtimePresentationEventsByRunStatusId, t],
   );
   const entries = useMemo<AgentStreamingDockEntry[]>(() => {
     const next: AgentStreamingDockEntry[] = runtimeStatuses.map(
@@ -934,8 +974,10 @@ export function AgentStreamingStatusDock({
   const attentionCount = entries.filter(
     (entry) => entry.runtimeStatus?.state === "Needs attention",
   ).length;
-  const statusLabel =
-    failedCount || attentionCount ? "Agent status" : "Agents working";
+  const openActivityLabel =
+    failedCount || attentionCount
+      ? t(m.openAgentStatusActivity)
+      : t(m.openAgentsWorkingActivity);
   const shownEntry = entries.find((entry) => entry.key === line.current?.id);
   const shownActivity = shownEntry?.runtimeStatus
     ? {
@@ -961,7 +1003,7 @@ export function AgentStreamingStatusDock({
       >
         <div className="flex min-h-7 max-w-full items-center gap-1">
           <button
-            aria-label={`Open ${statusLabel} activity`}
+            aria-label={openActivityLabel}
             className="flex min-h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-1 text-left text-xs text-app-muted transition-colors hover:bg-app-hover focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-app-focus disabled:hover:bg-transparent"
             disabled={!shownActivity}
             onClick={() => {
@@ -978,7 +1020,10 @@ export function AgentStreamingStatusDock({
             }}
             title={
               shownEntry && line.current
-                ? `${shownEntry.agent.display_name}: ${statusLineText(line.current.content)}`
+                ? t(m.labeled, {
+                    label: shownEntry.agent.display_name,
+                    value: statusLineText(line.current.content, t),
+                  })
                 : undefined
             }
             type="button"
@@ -1097,6 +1142,7 @@ function dockRuntimeStatuses(
     Record<string, readonly TeamHubRuntimePresentationEventRecord[]>
   >,
   cache: RuntimeTimelineViewCache,
+  t: Translate,
 ) {
   const latestByAgent = new Map<string, TeamHubRunStatus>();
   for (const runStatus of runStatuses) {
@@ -1121,6 +1167,7 @@ function dockRuntimeStatuses(
     cache,
     runStatuses: [...latestByAgent.values()],
     runtimePresentationEventsByRunStatusId,
+    t,
   }).filter(
     (row) =>
       isLiveAgentRunStatus(row) ||
@@ -1135,8 +1182,8 @@ function dockEntryLine(entry: AgentStreamingDockEntry): AgentStatusLineContent {
   return { tone: "wait" };
 }
 
-function statusLineText(content: AgentStatusLineContent) {
-  return content.tone === "wait" ? "Starting" : content.text;
+function statusLineText(content: AgentStatusLineContent, t: Translate) {
+  return content.tone === "wait" ? t(m.starting) : content.text;
 }
 
 /** The line's text; a long-running Activity's minutes follow it directly. */
@@ -1147,6 +1194,7 @@ function StatusLineText({
   content: AgentStatusLineContent;
   minutes?: number;
 }) {
+  const t = useT();
   if (content.tone === "wait")
     return <TypingDots className="text-app-subtle" />;
   const text = (
@@ -1167,7 +1215,7 @@ function StatusLineText({
     <span className="flex min-w-0 items-center gap-1">
       {text}
       <span className="shrink-0 leading-4 text-app-subtle tabular-nums">
-        · {minutes}m
+        · {t(m.elapsedMinutes, { minutes })}
       </span>
     </span>
   );
@@ -1209,10 +1257,6 @@ function StatusLineRoll({
       ) : null}
     </span>
   );
-}
-
-function runtimeStatusDisplayState(state: AgentRuntimeState) {
-  return state === "Responding" ? "Typing" : state;
 }
 
 function LinkedSourceMessagePanel({
@@ -1266,21 +1310,23 @@ function LinkedSourceMessagePanel({
   tenantId: string;
   workspaceAgentIds: ReadonlySet<string>;
 }) {
+  const t = useT();
   return (
     <section
-      aria-label="Linked source Message"
+      aria-label={t(m.linkedSourceMessage)}
       className="border-b border-app-border bg-app-surface-soft"
     >
       <div className="room-readable px-4 py-3 md:px-0">
         <div className="mb-2 flex min-h-8 items-center justify-between gap-3">
           <p className="text-xs font-semibold text-app-muted">
-            Linked source Message
+            {t(m.linkedSourceMessage)}
           </p>
           <Button
-            aria-label="Close linked source Message"
+            data-voice-close
+            aria-label={t(m.closeLinkedSourceMessage)}
             onClick={onClose}
             size="compactIcon"
-            title="Close linked source Message"
+            title={t(m.closeLinkedSourceMessage)}
             tone="ghost"
           >
             <Icon icon={Cancel01Icon} size={14} />
@@ -1288,7 +1334,7 @@ function LinkedSourceMessagePanel({
         </div>
         {linkedSource.kind === "loading" ? (
           <div className="flex gap-2.5 py-3" role="status">
-            <span className="sr-only">Loading source Message…</span>
+            <span className="sr-only">{t(m.loadingSourceMessage)}</span>
             <Skeleton className="size-9 shrink-0 rounded-full" />
             <div className="min-w-0 flex-1 pt-1">
               <div className="flex items-center gap-2">
@@ -1305,10 +1351,10 @@ function LinkedSourceMessagePanel({
             role="alert"
           >
             <p className="text-sm text-app-muted">
-              Source Message is unavailable.
+              {t(m.sourceMessageUnavailable)}
             </p>
             <Button onClick={linkedSource.retry} size="compact">
-              Retry
+              {t(commonMessages.retry)}
             </Button>
           </div>
         ) : (

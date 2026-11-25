@@ -8,6 +8,8 @@ import {
 } from "react";
 
 import { Icon } from "@/components/ui/icon";
+import { commonMessages } from "@/i18n/common.messages";
+import { useT } from "@/i18n/use-translation";
 
 export type DialogSize = "sm" | "md" | "lg" | "xl";
 
@@ -60,6 +62,7 @@ export function ModalDialog({
   /** Rendering a title opts the dialog into the shared header/body/footer chrome. */
   title?: ReactNode;
 }) {
+  const t = useT();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeFromBackdrop = useEffectEvent(() => onClose());
   const headingId = useId();
@@ -135,7 +138,8 @@ export function ModalDialog({
               ) : null}
             </div>
             <button
-              aria-label="Close"
+              data-voice-close
+              aria-label={t(commonMessages.close)}
               className="app-dialog-close"
               ref={closeButtonRef}
               onClick={onClose}

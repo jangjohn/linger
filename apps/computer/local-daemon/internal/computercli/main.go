@@ -35,11 +35,15 @@ func defaultDeps() deps {
 		rawTerminal:      rawStdin,
 		checkUserSession: checkUserSession,
 		checkRuntime:     checkRuntime,
+		interruptible: func(ctx context.Context) (context.Context, context.CancelFunc) {
+			return signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		},
 		diagnoseRuntimes: diagnoseRuntimes,
 		newClient:        newDaemonClient,
 		probeGateway:     probeGatewayNetwork,
 		productRuntime:   bundledNodeCheck,
 		readLogs:         streamComputerLogs,
+		runInteractive:   runRuntimeInteractive,
 		startDaemon: func(ctx context.Context, configPath string) error {
 			return startDetachedDaemon(ctx, configPath, environment, commandName)
 		},

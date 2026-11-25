@@ -4,16 +4,26 @@ import {
   ArrowUp01Icon,
   Cancel01Icon,
   Loading03Icon,
-  Maximize01Icon,
   Mic01Icon,
   PauseIcon,
+  PictureInPictureExitIcon,
   PictureInPictureOnIcon,
   PlayIcon,
   StopIcon,
 } from "@hugeicons/core-free-icons";
-import { useState, type PointerEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 import { Icon } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
+import { commonMessages } from "@/i18n/common.messages";
+import type { Translate } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT } from "@/i18n/use-translation";
 import {
   isTranscriptRecoveryPaused,
   useOptionalVoiceControl,
@@ -31,6 +41,7 @@ import {
   useSurfaceAction,
   useVoiceArming,
 } from "./voice-focus-state";
+import { recordingMessages as m } from "./recording.messages";
 
 export type RecordingView = "transcript" | "ask";
 
@@ -49,31 +60,36 @@ export interface RecordingPanels {
  */
 export function VoiceFocusSurface({
   autoStart = false,
+  fill = false,
   floating = "page",
   onExit,
   onFloat,
   onMoveStart,
-  onShowMain,
+  onReturn,
   onViewChange,
   panels,
   view,
 }: {
   autoStart?: boolean;
+  /** The in-page window has a height of its own, which the surface fills
+   *  instead of growing with its transcript. */
+  fill?: boolean;
   /** A picture-in-picture window fills its own window instead of floating. */
   floating?: "page" | "pip";
   onExit: () => void;
-  /** Returns the page window to the always-on-top browser window. */
+  /** Returns the page window to the always-on-top window. */
   onFloat?: () => void;
   /** Starts moving the in-page window from its title bar. */
   onMoveStart?: (event: PointerEvent<HTMLDivElement>) => void;
-  /** Brings the main window back, from a floating window of the desktop app. */
-  onShowMain?: () => void;
+  /** Brings the always-on-top window back into the page. */
+  onReturn?: () => void;
   onViewChange?: (view: RecordingView | undefined) => void;
   /** Present once a recording runs; before that only the transcript shows. */
   panels?: RecordingPanels;
   /** The open view; undefined minimizes the window to its top row. */
   view?: RecordingView;
 }) {
+  const t = useT();
   const livekit = useOptionalVoiceControl();
   const voice = livekit;
   const { actionError, actionPending, run } = useSurfaceAction();
@@ -101,6 +117,14 @@ export function VoiceFocusSurface({
   const pauseState = pause.captureId === capture?.id ? pause : { pausedMs: 0 };
   const paused = pauseState.pausedAt !== undefined;
   const [confirmingStop, setConfirmingStop] = useState(false);
+  // Keep recording and Escape hand focus back to Stop once it is shown again.
+  const stopButton = useRef<HTMLButtonElement>(null);
+  const focusStopAfterConfirm = useRef(false);
+  useEffect(() => {
+    if (confirmingStop || !focusStopAfterConfirm.current) return;
+    focusStopAfterConfirm.current = false;
+    stopButton.current?.focus();
+  }, [confirmingStop]);
   // "Reconnecting microphone" only follows a microphone that was up during
   // this recording; connecting it right after Start is not a reconnection.
   const microphoneWasUp = useMicrophoneUpDuringRecording(
@@ -117,12 +141,13 @@ export function VoiceFocusSurface({
   const captureFailed = captureStatus === "failed";
   const standby = voice.listenerStatus === "standby";
   const recoveryFailed = isTranscriptRecoveryPaused(voice.captureState);
+  const stopFailed = Boolean(voice.retryStop);
   const failedState =
     livekit?.captureState.status === "failed"
       ? livekit.captureState
       : undefined;
   const captureError = failedState
-    ? captureFailureDescription(failedState.reason)
+    ? captureFailureDescription(failedState.reason, t)
     : undefined;
   const inputInterrupted =
     captureActive &&
@@ -134,6 +159,11 @@ export function VoiceFocusSurface({
     voice.listenerStatus === "enabling";
   const transcriptIncomplete =
     captureActive && capture?.last_failure_code === "transcript_incomplete";
+  // A Capture stays "starting" until the recorder confirms its first audio. A
+  // failure code on it means Start failed and TeamHub is retrying, so the
+  // transcript is all that is being kept.
+  const audioNotSaved =
+    captureStatus === "starting" && Boolean(capture?.last_failure_code);
   // Starting connects on demand, so an unbound or blocked microphone still
   // needs the affordance; a bound-but-idle listener and an imminent
   // auto-start do not offer it twice.
@@ -154,42 +184,62 @@ export function VoiceFocusSurface({
       !voice.boundDevice);
   const visibleItems = idle ? [] : voice.transcriptItems;
   const partial = idle || captureError ? undefined : voice.partialTranscript;
-  const title = recoveryFailed
-    ? "Recording saved. Transcript recovery paused"
-    : inputInterrupted
-      ? "Recording input was interrupted"
-      : standby
-        ? "Recording is continuing in another tab"
+  const titleMessage = stopFailed
+    ? m.titleStopFailed
+    : recoveryFailed
+      ? m.titleRecoveryPaused
+      : inputInterrupted
+        ? m.titleInputInterrupted
+        : standby
+          ? m.titleOtherTab
+          : idle
+            ? armTitle(armStatus)
+            : focusTitle(captureStatus);
+  const title = t(titleMessage);
+  const subtitleMessage = stopFailed
+    ? undefined
+    : recoveryFailed
+      ? m.subtitleRecoveryPaused
+      : inputInterrupted
+        ? m.subtitleInputInterrupted
         : idle
-          ? armTitle(armStatus)
-          : focusTitle(captureStatus);
-  const subtitle = recoveryFailed
-    ? "Retry transcription or download the original recording."
-    : inputInterrupted
-      ? "Recorded content can still be saved."
-      : idle
-        ? armSubtitle(armStatus, microphonePermission)
-        : focusSubtitle(captureStatus);
+          ? armSubtitle(armStatus, microphonePermission)
+          : focusSubtitle(captureStatus);
+  const subtitle = subtitleMessage && t(subtitleMessage);
   const statusMessage =
     !captureError &&
+    !stopFailed &&
     (inputReconnecting
-      ? "Reconnecting microphone; audio delivery is not yet confirmed"
+      ? t(m.statusReconnectingMicrophone)
       : livekit?.transcriptStatus === "recovering"
-        ? "Reconnecting transcript updates; saved text will sync after reconnection"
+        ? t(m.statusReconnectingTranscript)
         : livekit?.captureSyncStatus === "recovering"
-          ? "Reconnecting recording status; waiting for server confirmation"
-          : transcriptIncomplete
-            ? inputInterrupted
-              ? "Some transcript segments are unconfirmed. Recovery will be attempted after stopping."
-              : "Some transcript segments are unconfirmed. Recording continues; recovery will be attempted after stopping."
-            : finalizing
-              ? "Generating recording and transcript files"
-              : undefined);
+          ? t(m.statusReconnectingRecording)
+          : audioNotSaved
+            ? t(m.statusAudioNotSaved)
+            : paused && captureActive
+              ? t(m.statusMicrophoneMuted)
+              : transcriptIncomplete
+                ? inputInterrupted
+                  ? t(m.statusUnconfirmedAfterStop)
+                  : t(m.statusUnconfirmed)
+                : finalizing
+                  ? t(m.statusGeneratingFiles)
+                  : undefined);
   const surfaceError =
+    (stopFailed ? t(m.stopFailed) : undefined) ??
     actionError ??
     armError ??
     captureError ??
     (autoArming || armStatus === "arming" ? undefined : voice.listenerError);
+  // "Listening…" claims speech is being transcribed right now; a muted,
+  // disconnected or failing microphone or transcript says none is available.
+  const listeningForSpeech =
+    captureActive &&
+    connected &&
+    !paused &&
+    !transcriptIncomplete &&
+    !surfaceError;
   // Stop ends the recording and releases the microphone; saving continues in
   // the background while the window shows its progress.
   const leave = async () => {
@@ -206,13 +256,15 @@ export function VoiceFocusSurface({
   const shown: RecordingView | undefined = panels ? view : "transcript";
   const pip = floating === "pip";
   // A minimized window is one row tall, in the page or floating, and a page
-  // window can sit at the bottom of the viewport; Stop asks inside that row.
-  const compactConfirmation = !shown;
+  // window can sit at the bottom of the viewport; Stop asks inside that row,
+  // in place of Pause and Stop.
+  const confirmInRow = confirmingStop && !shown;
   // The listening title is the quiet default; anything else is news.
-  const notice = captureActive && title !== listeningTitle ? title : undefined;
+  const notice =
+    captureActive && titleMessage !== m.titleListening ? title : undefined;
   const tabs: { id: RecordingView; label: string }[] = [
-    { id: "transcript", label: "Transcript" },
-    { id: "ask", label: "Ask" },
+    { id: "transcript", label: t(m.transcriptTab) },
+    { id: "ask", label: t(m.askTab) },
   ];
   const togglePause = () =>
     run(async () => {
@@ -241,6 +293,89 @@ export function VoiceFocusSurface({
     }
     setConfirmingStop(true);
   };
+  const keepRecording = () => {
+    focusStopAfterConfirm.current = true;
+    setConfirmingStop(false);
+  };
+  const timer = (
+    <span className="flex shrink-0 items-center gap-2">
+      <span aria-hidden="true" className={styles.liveBars}>
+        <i />
+        <i />
+        <i />
+        <i />
+      </span>
+      <span
+        aria-label={t(m.duration)}
+        className={`flex shrink-0 items-center gap-2 font-mono text-sm leading-5 tracking-normal tabular-nums ${paused ? "text-app-subtle" : "text-app-ink"}`}
+      >
+        <span className="sr-only">
+          {t(paused ? m.recordingPaused : m.recording)}
+        </span>
+        <VoiceRecordingTime
+          pausedAt={pauseState.pausedAt}
+          pausedMs={pauseState.pausedMs}
+          startedAt={capture?.created_at}
+        />
+      </span>
+    </span>
+  );
+  const confirmation = (
+    // Escape keeps recording, like the alertdialog's safe button.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Escape answers this alertdialog; its choices are buttons
+    <div
+      aria-describedby="recording-stop-description"
+      aria-labelledby="recording-stop-title"
+      aria-modal="true"
+      className={
+        confirmInRow ? "order-first flex min-w-0 max-w-full" : styles.confirm
+      }
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.stopPropagation();
+        keepRecording();
+      }}
+      role="alertdialog"
+    >
+      <h2
+        className={confirmInRow ? "sr-only" : styles.confirmTitle}
+        id="recording-stop-title"
+      >
+        {t(m.confirmStopTitle)}
+      </h2>
+      <p
+        className={confirmInRow ? "sr-only" : styles.confirmDescription}
+        id="recording-stop-description"
+      >
+        {t(m.confirmStopBody)}
+      </p>
+      <div
+        className={confirmInRow ? "flex min-w-0 gap-2" : "flex flex-col gap-2"}
+      >
+        <button
+          className={`${styles.confirmStop} ${confirmInRow ? styles.confirmInRow : ""}`}
+          onClick={() => {
+            // A failed stop shows its reason in the window behind.
+            setConfirmingStop(false);
+            void run(leave);
+          }}
+          type="button"
+        >
+          <Icon icon={StopIcon} size={12} />
+          <span className="truncate">{t(m.stopAndSave)}</span>
+        </button>
+        <button
+          // eslint-disable-next-line jsx-a11y/no-autofocus -- the safe choice is focused on purpose because the user just asked to stop recording
+          autoFocus
+          className={`${styles.confirmKeep} ${confirmInRow ? styles.confirmInRow : ""}`}
+          onClick={keepRecording}
+          type="button"
+        >
+          <span className="truncate">{t(m.keepRecording)}</span>
+        </button>
+      </div>
+    </div>
+  );
   const titleBar = (
     <div
       className={`${styles.titleBar} ${pip ? "bg-app-canvas" : "voice-window-title rounded-t-2xl"}`}
@@ -248,11 +383,11 @@ export function VoiceFocusSurface({
     >
       {panels ? (
         <button
-          aria-label={shown ? "Minimize recording" : "Open recording"}
+          aria-label={t(shown ? m.minimize : m.open)}
           className={styles.windowButton}
           disabled={confirmingStop}
           onClick={() => onViewChange?.(shown ? undefined : "transcript")}
-          title={shown ? "Minimize; recording continues" : "Open recording"}
+          title={t(shown ? m.minimizeHint : m.open)}
           type="button"
         >
           {shown ? (
@@ -262,28 +397,28 @@ export function VoiceFocusSurface({
           )}
         </button>
       ) : null}
-      <span className="flex-1">{pip ? null : "Meeting"}</span>
+      <span className="flex-1">{pip ? null : t(m.meeting)}</span>
       {onFloat ? (
         <button
-          aria-label="Float recording window"
+          aria-label={t(m.float)}
           className={styles.windowButton}
           disabled={confirmingStop}
           onClick={onFloat}
-          title="Float over other tabs and apps"
+          title={t(m.floatHint)}
           type="button"
         >
           <Icon icon={PictureInPictureOnIcon} />
         </button>
       ) : null}
-      {onShowMain ? (
+      {onReturn ? (
         <button
-          aria-label="Show Linger window"
+          aria-label={t(m.returnToLinger)}
           className={styles.windowButton}
-          onClick={onShowMain}
-          title="Show the Linger window; recording continues"
+          onClick={onReturn}
+          title={t(m.returnHint)}
           type="button"
         >
-          <Icon icon={Maximize01Icon} />
+          <Icon icon={PictureInPictureExitIcon} />
         </button>
       ) : null}
     </div>
@@ -292,159 +427,102 @@ export function VoiceFocusSurface({
     <>
       {titleBar}
       <section
-        aria-label="Hardware voice focus"
+        aria-label={t(m.surface)}
         className={
           pip
             ? "relative flex min-h-0 flex-1 flex-col bg-app-canvas text-app-ink"
-            : `relative flex max-h-[min(720px,calc(100dvh-132px))] min-h-0 flex-col overflow-hidden rounded-b-2xl bg-app-canvas text-app-ink ${styles.window}`
+            : `relative flex min-h-0 flex-col overflow-hidden rounded-b-2xl bg-app-canvas text-app-ink ${styles.window} ${
+                fill ? "flex-1" : "max-h-[min(720px,calc(100dvh-132px))]"
+              }`
         }
         data-paused={paused || undefined}
       >
-        <header className="flex h-14 shrink-0 items-center gap-2 px-4">
-          {captureActive ? (
-            <>
-              <span aria-hidden="true" className={styles.liveBars}>
-                <i />
-                <i />
-                <i />
-                <i />
-              </span>
-              <span
-                aria-label="Recording duration"
-                className={`flex shrink-0 items-center gap-2 font-mono text-sm leading-5 tracking-normal tabular-nums ${paused ? "text-app-subtle" : "text-app-ink"}`}
-              >
-                <span className="sr-only">
-                  {paused ? "Recording paused" : "Recording"}
-                </span>
-                <VoiceRecordingTime
-                  pausedAt={pauseState.pausedAt}
-                  pausedMs={pauseState.pausedMs}
-                  startedAt={capture?.created_at}
-                />
-              </span>
-            </>
-          ) : (
-            <h1
-              className="min-w-0 truncate text-sm leading-5 font-medium text-app-ink"
-              title={title}
-            >
-              {title}
-            </h1>
-          )}
+        {/* A window narrower than its controls keeps their icons and drops
+          the words, which stay as each control's name. */}
+        <header className="@container flex h-14 shrink-0 items-center gap-2 px-4">
           {captureActive && !notice ? (
             <h1 className="sr-only">{title}</h1>
           ) : null}
-          <span className="flex-1" />
-          {captureActive ? (
-            <button
-              aria-label={paused ? "Resume recording" : "Pause recording"}
-              aria-pressed={paused}
-              className={styles.control}
-              data-active={paused || undefined}
-              disabled={standbyOrMic || actionPending}
-              onClick={() => void togglePause()}
-              title={paused ? "Resume recording" : "Pause recording"}
-              type="button"
-            >
-              {paused ? (
-                <Icon icon={PlayIcon} size={14} />
+          {confirmInRow ? (
+            // The question takes the place of Pause and Stop. The timer stays
+            // beside it while both fit; otherwise it wraps onto a second line
+            // that the row clips, so no label in any language covers it.
+            <div className="-m-0.5 flex h-9 min-w-0 flex-1 flex-row-reverse flex-wrap content-start items-center justify-between gap-2 overflow-hidden p-0.5">
+              {captureActive ? timer : null}
+              {confirmation}
+            </div>
+          ) : (
+            <>
+              {captureActive ? (
+                timer
               ) : (
-                <Icon icon={PauseIcon} size={14} />
+                <h1
+                  className="min-w-0 truncate text-sm leading-5 font-medium text-app-ink"
+                  title={title}
+                >
+                  {title}
+                </h1>
               )}
-              {paused ? "Resume" : "Pause"}
-            </button>
-          ) : null}
-          <button
-            aria-label={captureActive ? "Stop recording" : "Close recording"}
-            className={styles.control}
-            disabled={actionPending}
-            onClick={close}
-            title={captureActive ? "Stop recording" : "Close recording"}
-            type="button"
-          >
-            {captureActive ? (
-              <Icon icon={StopIcon} size={14} />
-            ) : (
-              <Icon icon={Cancel01Icon} size={14} />
-            )}
-            {captureActive ? "Stop" : "Close"}
-          </button>
+              <span className="flex-1" />
+              {captureActive ? (
+                <button
+                  aria-label={t(paused ? m.resumeRecording : m.pauseRecording)}
+                  aria-pressed={paused}
+                  className={styles.control}
+                  data-active={paused || undefined}
+                  disabled={standbyOrMic || actionPending}
+                  onClick={() => void togglePause()}
+                  title={t(paused ? m.resumeRecording : m.pauseRecording)}
+                  type="button"
+                >
+                  {paused ? (
+                    <Icon icon={PlayIcon} size={14} />
+                  ) : (
+                    <Icon icon={PauseIcon} size={14} />
+                  )}
+                  <span className="@max-[255px]:sr-only">
+                    {t(paused ? m.resume : m.pause)}
+                  </span>
+                </button>
+              ) : null}
+              <button
+                aria-label={t(
+                  captureActive ? m.stopRecording : m.closeRecording,
+                )}
+                className={styles.control}
+                // Only Close closes the window by voice; Stop ends the recording
+                // and asks first, as its English name never closed it.
+                data-voice-close={captureActive ? undefined : ""}
+                disabled={actionPending}
+                onClick={close}
+                ref={stopButton}
+                title={t(captureActive ? m.stopRecording : m.closeRecording)}
+                type="button"
+              >
+                {captureActive ? (
+                  <Icon icon={StopIcon} size={14} />
+                ) : (
+                  <Icon icon={Cancel01Icon} size={14} />
+                )}
+                <span className="@max-[255px]:sr-only">
+                  {t(captureActive ? m.stop : commonMessages.close)}
+                </span>
+              </button>
+            </>
+          )}
         </header>
-        {confirmingStop ? (
+        {confirmingStop && !confirmInRow ? (
           <div
             className={`${styles.confirmLayer} ${pip ? "overflow-y-auto" : ""}`}
           >
-            <div
-              aria-describedby="recording-stop-description"
-              aria-labelledby="recording-stop-title"
-              aria-modal="true"
-              className={
-                compactConfirmation ? "w-full min-w-0" : styles.confirm
-              }
-              role="alertdialog"
-            >
-              <h2
-                className={
-                  compactConfirmation ? "sr-only" : styles.confirmTitle
-                }
-                id="recording-stop-title"
-              >
-                Stop recording?
-              </h2>
-              <p
-                className={
-                  compactConfirmation ? "sr-only" : styles.confirmDescription
-                }
-                id="recording-stop-description"
-              >
-                The recording is saved and summarized. You can find it in
-                Meetings.
-              </p>
-              <div
-                className={
-                  compactConfirmation ? "flex gap-2" : "flex flex-col gap-2"
-                }
-              >
-                <button
-                  className={
-                    compactConfirmation
-                      ? `${styles.confirmStop} flex-1 whitespace-nowrap`
-                      : styles.confirmStop
-                  }
-                  onClick={() => {
-                    // A failed stop shows its reason in the window behind.
-                    setConfirmingStop(false);
-                    void run(leave);
-                  }}
-                  type="button"
-                >
-                  <Icon icon={StopIcon} size={12} />
-                  Stop & save
-                </button>
-                <button
-                  // eslint-disable-next-line jsx-a11y/no-autofocus -- the safe choice is focused on purpose because the user just asked to stop recording
-                  autoFocus
-                  className={
-                    compactConfirmation
-                      ? `${styles.confirmKeep} flex-1 whitespace-nowrap`
-                      : styles.confirmKeep
-                  }
-                  onClick={() => {
-                    setConfirmingStop(false);
-                  }}
-                  type="button"
-                >
-                  Keep recording
-                </button>
-              </div>
-            </div>
+            {confirmation}
           </div>
         ) : null}
         {shown ? (
           <>
             {panels ? (
               <div
-                aria-label="Recording views"
+                aria-label={t(m.views)}
                 className="flex shrink-0 items-center gap-1 border-b border-app-border px-4 py-2"
                 role="tablist"
               >
@@ -476,6 +554,12 @@ export function VoiceFocusSurface({
                   ? () => void run(reconnect)
                   : undefined
               }
+              onRetryStop={
+                voice.retryStop
+                  ? () =>
+                      void run(() => voice.retryStop?.() ?? Promise.resolve())
+                  : undefined
+              }
               reconnecting={actionPending}
               statusMessage={statusMessage}
               subtitle={subtitle}
@@ -496,7 +580,7 @@ export function VoiceFocusSurface({
               >
                 <div className="flex w-full flex-col items-center gap-4 px-5 py-3">
                   <div
-                    aria-label="Voice focus transcript"
+                    aria-label={t(m.transcript)}
                     aria-live="polite"
                     className="w-full space-y-1"
                     role="log"
@@ -516,20 +600,24 @@ export function VoiceFocusSurface({
                     ) : null}
                     {visibleItems.length === 0 && !partial ? (
                       <p className="py-3 text-center text-[12px] leading-[18px] text-app-muted">
-                        {idle
-                          ? "This recording’s transcript will appear here. View previous transcripts in the chat."
-                          : captureError
-                            ? "No transcript is available yet."
-                            : "Listening…"}
+                        {t(
+                          idle
+                            ? m.transcriptPlaceholder
+                            : listeningForSpeech
+                              ? m.listening
+                              : m.noTranscript,
+                        )}
                       </p>
                     ) : null}
                     {canStart ? (
                       <div className="flex justify-center pt-1">
                         <Button onClick={() => void arm()} tone="primary">
                           <Icon icon={Mic01Icon} size={16} />
-                          {captureFailed || recoveryFailed
-                            ? "Start new recording"
-                            : "Start recording"}
+                          {t(
+                            captureFailed || recoveryFailed
+                              ? m.startNewRecording
+                              : m.startRecording,
+                          )}
                         </Button>
                       </div>
                     ) : null}
@@ -549,14 +637,13 @@ export function VoiceFocusSurface({
   );
 }
 
-const listeningTitle = "I’m listening to the meeting...";
-
 function VoiceFocusNotices({
   finalizing,
   gapCount,
   gapDurationMs,
   notice,
   onReconnect,
+  onRetryStop,
   reconnecting,
   statusMessage,
   subtitle,
@@ -567,11 +654,13 @@ function VoiceFocusNotices({
   gapDurationMs: number;
   notice?: string;
   onReconnect?: () => void;
+  onRetryStop?: () => void;
   reconnecting: boolean;
   statusMessage: string | false | undefined;
   subtitle?: string;
   surfaceError?: string;
 }) {
+  const t = useT();
   if (
     !notice &&
     !subtitle &&
@@ -610,8 +699,10 @@ function VoiceFocusNotices({
             size={12}
           />
           <span>
-            Input missed {gapCount === 1 ? "once" : `${gapCount} times`} (
-            {Math.max(1, Math.round(gapDurationMs / 1000))}s not recorded)
+            {t(m.inputMissed, {
+              count: gapCount,
+              seconds: Math.max(1, Math.round(gapDurationMs / 1000)),
+            })}
           </span>
         </p>
       ) : null}
@@ -625,6 +716,18 @@ function VoiceFocusNotices({
           {surfaceError}
         </p>
       ) : null}
+      {onRetryStop ? (
+        <div>
+          <Button
+            disabled={reconnecting}
+            onClick={onRetryStop}
+            size="compact"
+            tone="ghost"
+          >
+            {t(m.retryStop)}
+          </Button>
+        </div>
+      ) : null}
       {onReconnect ? (
         <div>
           <Button
@@ -634,7 +737,7 @@ function VoiceFocusNotices({
             tone="ghost"
           >
             <Icon icon={Mic01Icon} size={14} />
-            Reconnect microphone
+            {t(m.reconnectMicrophone)}
           </Button>
         </div>
       ) : null}
@@ -663,6 +766,10 @@ function speakerColor(label: string) {
 }
 
 function VoiceFocusTranscriptRow({ item }: { item: VoiceTranscriptItem }) {
+  const t = useT();
+  // The client names an unnamed speaker "Speaker N"; the number is kept.
+  const number = item.speakerLabel?.match(/^Speaker (\d+)$/)?.[1];
+  const speaker = number ? t(m.speaker, { number }) : item.speakerLabel;
   // Town message rows: a 13px name line over 14px body text, starting
   // straight with the speaker.
   return (
@@ -671,7 +778,7 @@ function VoiceFocusTranscriptRow({ item }: { item: VoiceTranscriptItem }) {
         <span
           className={`text-[14px] leading-[18px] font-medium ${speakerColor(item.speakerLabel)}`}
         >
-          {item.speakerLabel}
+          {speaker}
         </span>
       ) : null}
       <p className="m-0 text-sm leading-5 text-app-body">{item.text}</p>
@@ -680,24 +787,24 @@ function VoiceFocusTranscriptRow({ item }: { item: VoiceTranscriptItem }) {
 }
 
 function focusTitle(captureStatus: VoiceCaptureState["status"]) {
-  if (captureStatus === "failed") return "Recording save failed";
-  if (captureStatus === "recovering")
-    return "Recording saved; recovering transcript";
-  if (captureStatus === "finalizing") return "Saving recording...";
-  return listeningTitle;
+  if (captureStatus === "failed") return m.titleSaveFailed;
+  if (captureStatus === "recovering") return m.titleRecovering;
+  if (captureStatus === "finalizing") return m.titleSaving;
+  return m.titleListening;
 }
 
-function focusSubtitle(captureStatus: VoiceCaptureState["status"]) {
-  if (captureStatus === "failed")
-    return "Received transcript segments remain available here.";
-  if (captureStatus === "recovering")
-    return "The microphone can be disconnected; recovery will continue in the background.";
-  if (captureStatus === "finalizing")
-    return "Finishing the transcript and audio file.";
+function focusSubtitle(
+  captureStatus: VoiceCaptureState["status"],
+): Message<string> | undefined {
+  if (captureStatus === "failed") return m.subtitleSaveFailed;
+  if (captureStatus === "recovering") return m.subtitleRecovering;
+  if (captureStatus === "finalizing") return m.subtitleSaving;
   return undefined;
 }
 
-function captureFailureDescription(reason: unknown): string {
+// The server's failure codes are worded here in English until they are
+// translated with the other server-sent text; the client's own fallback is not.
+function captureFailureDescription(reason: unknown, t: Translate): string {
   const message =
     reason instanceof Error
       ? reason.message
@@ -715,7 +822,7 @@ function captureFailureDescription(reason: unknown): string {
     case "Voice Capture failed":
     case undefined:
     case "":
-      return "The recording could not be saved.";
+      return t(m.saveFailed);
     default:
       return message;
   }

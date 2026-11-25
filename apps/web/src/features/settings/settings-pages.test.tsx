@@ -169,7 +169,7 @@ describe("Settings surfaces", () => {
       within(settingsNav)
         .getAllByRole("link")
         .map((link) => link.textContent?.replace(/\s+/g, " ").trim()),
-    ).toEqual(["Profile", "Security", "Computers", "Models"]);
+    ).toEqual(["Profile", "Security", "Computers", "Models", "Language"]);
     expect(
       screen.queryByRole("button", { name: "Log out" }),
     ).not.toBeInTheDocument();
@@ -359,6 +359,25 @@ describe("Settings surfaces", () => {
     expect(
       screen.queryByRole("article", { name: "Profile content" }),
     ).toBeNull();
+  });
+
+  it("wraps mobile Settings section links cleanly so Models and Language are not clipped at 390px width", async () => {
+    const runtime = await testRuntime();
+    renderSettings(runtime);
+
+    const nav = await screen.findByRole("navigation", {
+      name: "Settings sections",
+    });
+    expect(nav).toHaveClass("flex-wrap");
+    expect(nav).not.toHaveClass("overflow-x-auto");
+
+    const links = within(nav).getAllByRole("link");
+    expect(
+      links.map((link) => link.textContent?.replace(/\s+/g, " ").trim()),
+    ).toEqual(["Profile", "Security", "Computers", "Models", "Language"]);
+    for (const link of links) {
+      expect(link).toHaveClass("shrink-0");
+    }
   });
 });
 

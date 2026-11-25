@@ -255,7 +255,7 @@ func TestProactiveRoutinesEventsAndListeners(t *testing.T) {
 		t.Fatal(err)
 	}
 	var statements []string
-	for _, provider := range []string{"gmail", "outlook", "google_calendar", "slack", "notion"} {
+	for _, provider := range []string{"gmail", "outlook", "google_calendar", "slack", "notion", "feishu_mail"} {
 		statements = append(statements,
 			`INSERT INTO external_connection_upstreams(upstream_id,account_id,user_id,toolkit_slug,auth_config_id)
                 VALUES('ca_alice_`+provider+`','account_alice','linger:test:account:account_alice','`+provider+`','ac_`+provider+`')`,
@@ -339,7 +339,8 @@ func TestProactiveRoutinesEventsAndListeners(t *testing.T) {
 	if err := proactive.New(pool, nil, nil).SweepListeners(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil("app listeners not installed", func() bool { return appListeners() == 4 })
+	// Gmail, Google Calendar, Slack (1 binding each) plus Outlook (inbox + calendar = 2 bindings).
+	waitUntil("app listeners not installed", func() bool { return appListeners() == 6 })
 	if countRows(t, env, `SELECT count(*) FROM room_routine_listeners WHERE connection_id='connection_alice_notion'`) != 0 {
 		t.Fatal("Notion got a listener")
 	}

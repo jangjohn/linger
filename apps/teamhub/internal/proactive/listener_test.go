@@ -14,35 +14,50 @@ import (
 func TestListenerAppsHearOnlyWhatIsNewsToTheHuman(t *testing.T) {
 	for _, check := range []struct {
 		provider string
+		ordinal  int
 		event    reminder.ListenerEvent
 		want     bool
 	}{
-		{"gmail", reminder.ListenerEvent{Source: "gmail", LabelIDs: []string{"INBOX", "UNREAD"}}, true},
-		{"gmail", reminder.ListenerEvent{Source: "gmail", LabelIDs: []string{"SENT"}}, false},
-		{"outlook", reminder.ListenerEvent{Source: "outlook"}, true},
-		{"google_calendar", reminder.ListenerEvent{Source: "gcal", EventKind: "cancelled"}, true},
-		{"slack", reminder.ListenerEvent{Source: "slack", EventKind: "message", IsMention: true}, true},
-		{"slack", reminder.ListenerEvent{Source: "slack", EventKind: "message"}, false},
+		{"gmail", 0, reminder.ListenerEvent{Source: "gmail", LabelIDs: []string{"INBOX", "UNREAD"}}, true},
+		{"gmail", 0, reminder.ListenerEvent{Source: "gmail", LabelIDs: []string{"SENT"}}, false},
+		{"outlook", 0, reminder.ListenerEvent{Source: "outlook"}, true},
+		{"outlook", 1, reminder.ListenerEvent{Source: "outlook_calendar", EventKind: "updated"}, true},
+		{"outlook", 1, reminder.ListenerEvent{Source: "outlook_calendar", EventKind: "moved"}, false},
+		{"google_calendar", 0, reminder.ListenerEvent{Source: "gcal", EventKind: "cancelled"}, true},
+		{"outlook_calendar", 0, reminder.ListenerEvent{Source: "outlook_calendar", EventKind: "cancelled"}, true},
+		{"slack", 0, reminder.ListenerEvent{Source: "slack", EventKind: "message", IsMention: true}, true},
+		{"slack", 0, reminder.ListenerEvent{Source: "slack", EventKind: "message"}, false},
+		{"feishu_mail", 0, reminder.ListenerEvent{Source: "feishu_mail", EventKind: "message"}, true},
 	} {
-		if got := reminder.MatchEvent(listenerApps[check.provider].spec, check.event); got != check.want {
-			t.Errorf("%s listener heard %+v: %v, want %v", check.provider, check.event, got, check.want)
+		specs := listenerApps[check.provider].specs
+		if check.ordinal >= len(specs) {
+			t.Fatalf("%s missing spec ordinal %d", check.provider, check.ordinal)
+		}
+		if got := reminder.MatchEvent(specs[check.ordinal], check.event); got != check.want {
+			t.Errorf("%s[%d] listener heard %+v: %v, want %v", check.provider, check.ordinal, check.event, got, check.want)
 		}
 	}
 }
 
 func TestListenerEventNamesOneMatterPerThreadOrCalendarEvent(t *testing.T) {
-	mail, ok := EventFromListener(reminder.ListenerEvent{Source: "gmail", EventID: "m2", MessageID: "m2", ThreadID: "t1", From: "lisa@example.com", To: "owner@example.com", Subject: "Quote confirmation"})
-	if !ok || mail.ExternalID != "t1" || mail.State != "m2" || mail.Kind != "new_mail" || mail.Summary != "From: lisa@example.com\nTo: owner@example.com\nSubject: Quote confirmation" {
+	mail, ok := EventFromListener(reminder.ListenerEvent{Source: "gmail", EventID: "m2", MessageID: "m2", ThreadID: "t1", LabelIDs: []string{"INBOX", "UNREAD"}, From: "lisa@example.com", To: "owner@example.com", Subject: "Quote confirmation"})
+	if !ok || mail.ExternalID != "t1" || mail.State != "m2" || mail.Kind != "new_mail" ||
+		mail.Summary != "Message ID: m2\nThread ID: t1\nLabels: INBOX, UNREAD\nFrom: lisa@example.com\nTo: owner@example.com\nSubject: Quote confirmation" {
 		t.Fatalf("mail=%+v ok=%v", mail, ok)
 	}
+	feishuMail, ok := EventFromListener(reminder.ListenerEvent{Source: "feishu_mail", EventID: "f1", MessageID: "f1", ThreadID: "ft1", From: "li@example.com", Subject: "Quote", Snippet: "Signed"})
+	if !ok || feishuMail.Kind != "new_mail" || feishuMail.ExternalID != "ft1" || feishuMail.State != "f1" {
+		t.Fatalf("Feishu Mail event = %+v", feishuMail)
+	}
 	outlook, ok := EventFromListener(reminder.ListenerEvent{Source: "outlook", EventID: "o1", MessageID: "o1", From: "Director Wang <wang@partner.cn>", Subject: "Contract", Snippet: "Confirm by Thursday"})
-	if !ok || outlook.ExternalID != "o1" || outlook.Source != "outlook" || outlook.Summary != "From: Director Wang <wang@partner.cn>\nSubject: Contract\nBody: Confirm by Thursday" {
+	if !ok || outlook.ExternalID != "o1" || outlook.Source != "outlook" || outlook.Summary != "Message ID: o1\nFrom: Director Wang <wang@partner.cn>\nSubject: Contract\nBody: Confirm by Thursday" {
 		t.Fatalf("outlook=%+v ok=%v", outlook, ok)
 	}
 
 	moved := reminder.ListenerEvent{Source: "gcal", EventID: "e1:2026-10-22T01:00:00Z", MessageID: "e1", EventKind: "updated", Summary: "Review meeting", Start: "2026-10-23T10:00:00+08:00", End: "2026-10-23T11:00:00+08:00"}
 	event, ok := EventFromListener(moved)
-	if !ok || event.ExternalID != "e1" || event.Kind != "calendar_updated" || event.OccursAt == nil || !event.OccursAt.Equal(time.Date(2026, 10, 23, 2, 0, 0, 0, time.UTC)) {
+	if !ok || event.ExternalID != "e1" || event.Kind != "calendar_updated" || event.OccursAt == nil || !event.OccursAt.Equal(time.Date(2026, 10, 23, 2, 0, 0, 0, time.UTC)) ||
+		event.Summary != "Change: updated\nEvent ID: e1\nEvent: Review meeting\nStart: 2026-10-23 10:00 +08:00\nEnd: 2026-10-23 11:00 +08:00" {
 		t.Fatalf("calendar=%+v ok=%v", event, ok)
 	}
 	// A location or description edit at the same time must be judged again.
@@ -65,9 +80,19 @@ func TestListenerEventNamesOneMatterPerThreadOrCalendarEvent(t *testing.T) {
 	if allDay.OccursAt == nil || !allDay.OccursAt.Equal(time.Date(2026, 10, 23, 16, 0, 0, 0, time.UTC)) {
 		t.Fatalf("all-day start=%v, want Beijing midnight", allDay.OccursAt)
 	}
+	outlookCal, ok := EventFromListener(reminder.ListenerEvent{Source: reminder.ListenerOutlookCalendar, EventID: "oe1:2026-10-22T01:00:00Z", MessageID: "oe1", EventKind: "created", Summary: "Client sync", Start: "2026-10-23T02:00:00Z", End: "2026-10-23T03:00:00Z", Location: "Room A"})
+	// Outlook reports times in UTC; the wake shows them in local time.
+	if !ok || outlookCal.Source != reminder.ListenerOutlookCalendar || outlookCal.ExternalID != "oe1" || outlookCal.Kind != "calendar_created" || outlookCal.OccursAt == nil || !outlookCal.OccursAt.Equal(time.Date(2026, 10, 23, 2, 0, 0, 0, time.UTC)) ||
+		!strings.Contains(outlookCal.Summary, "\nStart: 2026-10-23 10:00 +08:00\nEnd: 2026-10-23 11:00 +08:00\n") {
+		t.Fatalf("outlook calendar=%+v ok=%v", outlookCal, ok)
+	}
+	if !strings.Contains(allDay.Summary, "\nStart: 2026-10-24") {
+		t.Fatalf("all-day summary=%q", allDay.Summary)
+	}
 
 	reply, ok := EventFromListener(reminder.ListenerEvent{Source: "slack", EventID: "C1:2.0", ChannelID: "C1", Channel: "sales", MessageID: "2.0", ThreadID: "1.0", Sender: "U2", Text: "<@U1> can the quote go out today?"})
-	if !ok || reply.ExternalID != "C1:1.0" || reply.State != "2.0" || !strings.Contains(reply.Summary, "Channel: #sales") {
+	if !ok || reply.ExternalID != "C1:1.0" || reply.State != "2.0" ||
+		reply.Summary != "Message ID: 2.0\nChannel: #sales\nChannel ID: C1\nThread ID: 1.0\nSender: U2\nContent: <@U1> can the quote go out today?" {
 		t.Fatalf("slack=%+v ok=%v", reply, ok)
 	}
 
@@ -92,9 +117,11 @@ func TestMailEventRetainsFactsBeyondProviderPreviewAndOldSummaryLimit(t *testing
 }
 
 func TestSparseCalendarCancellationStillHasJudgeEvidence(t *testing.T) {
-	event, ok := EventFromListener(reminder.ListenerEvent{Source: "gcal", EventID: "cancelled:cancelled", MessageID: "cancelled", EventKind: "cancelled"})
-	if !ok || !strings.Contains(event.Summary, "Status: cancelled") || !strings.Contains(event.Summary, "Event ID: cancelled") {
-		t.Fatal("sparse cancellation lost before judgment")
+	for _, source := range []string{reminder.ListenerGCal, reminder.ListenerOutlookCalendar} {
+		event, ok := EventFromListener(reminder.ListenerEvent{Source: source, EventID: "cancelled:cancelled", MessageID: "cancelled", EventKind: "cancelled"})
+		if !ok || event.Summary != "Change: cancelled\nEvent ID: cancelled" {
+			t.Fatalf("%s sparse cancellation lost before judgment", source)
+		}
 	}
 }
 

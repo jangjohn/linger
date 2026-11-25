@@ -216,6 +216,8 @@ export class ContextExecutor<TRuntimeSettings> {
   #permanentDeletionPromise: Promise<void> | null = null;
   #steerRead: Promise<void> | null = null;
   #steerReadAgain = false;
+  readonly #sessionRecoveredRunIds = new Set<string>();
+  readonly #partialWorkRecoveredRunIds = new Set<string>();
 
   constructor(options: ContextExecutorOptions<TRuntimeSettings>) {
     const { record, ghost } = options;
@@ -1704,6 +1706,9 @@ export class ContextExecutor<TRuntimeSettings> {
         ...(features.matched.includes(TOOL_APPROVAL_FEATURE_ID)
           ? { permissionReview: true as const }
           : {}),
+        // Enable Runtime stop-hook bridging only when a matched Context
+        // feature declares `onRunBeforeStop`.
+        ...(features.hasRunStopHooks ? { stopHook: true as const } : {}),
         renderDeveloperInstructions: (facts) =>
           instructedAgent(features, this.#ghost.agent, this.record, facts)
             .developerInstructions,
@@ -1752,6 +1757,10 @@ export class ContextExecutor<TRuntimeSettings> {
       }
       // A retried Run keeps the resources its first attempt started with.
       let retainedExecutionRunId: string | undefined;
+      const archivedPreviousSession =
+        mode === "start"
+          ? (state.consumeClearedSession?.() ?? undefined)
+          : undefined;
       const execution = new RunLoop({
         executionContextRef: this.ref,
         activationFinishedAtMs: () => this.#activationFinishedAtMs,
@@ -1760,6 +1769,9 @@ export class ContextExecutor<TRuntimeSettings> {
         runtimeName: activated.runtimeName,
         runtimeSession: activated.runtimeSession,
         newSession: mode === "start",
+        ...(archivedPreviousSession
+          ? { previousSession: archivedPreviousSession }
+          : {}),
         ...(activeRuntime.prepareNextRun
           ? {
               prepareNextRun: async (nextSignal: AbortSignal) => {
@@ -1825,11 +1837,33 @@ export class ContextExecutor<TRuntimeSettings> {
             ),
           ),
         onRunEvent: (event) => features.onRunEvent(event),
+        ...(features.hasRunStopHooks
+          ? {
+              onRunBeforeStop: (input, signal) =>
+                features.evaluateRunBeforeStop(input, signal),
+            }
+          : {}),
         onRunClaimed: (runId, messages) => {
           for (const message of messages)
             this.#observeInboxInput(message, { kind: "enqueue", runId });
         },
         onWorkStateRefreshed: () => this.#takeUpMessageSteers(),
+        canRecoverSession: (runId) => !this.#sessionRecoveredRunIds.has(runId),
+        consumePartialWorkRecovery: (runId) =>
+          this.#partialWorkRecoveredRunIds.delete(runId),
+        onSessionRecoveryFailed: (runId) => {
+          if (this.#sessionRecoveredRunIds.size >= 256) {
+            this.#sessionRecoveredRunIds.clear();
+          }
+          this.#sessionRecoveredRunIds.add(runId);
+        },
+        onSessionRecoveryRequested: (runId, reason, hadPriorProgress) =>
+          this.#restartRuntimeForSessionRecovery(
+            activeRuntime,
+            runId,
+            reason,
+            hadPriorProgress,
+          ),
       });
       this.#activatedRuntime = activated;
       this.#execution = execution;
@@ -1961,6 +1995,52 @@ export class ContextExecutor<TRuntimeSettings> {
         error,
       });
     }
+  }
+
+  // The current native session is missing or exceeded its context window: drain
+  // this Runtime and reactivate in a fresh native session so the requeued Run
+  // resumes with recent product messages and an exported previous transcript.
+  #restartRuntimeForSessionRecovery(
+    runtime: ActivatedContextRuntime,
+    runId: string,
+    reason: "session_not_found" | "context_too_long",
+    hadPriorProgress: boolean,
+  ): void {
+    if (this.#sessionRecoveredRunIds.size >= 256) {
+      this.#sessionRecoveredRunIds.clear();
+    }
+    this.#sessionRecoveredRunIds.add(runId);
+    if (hadPriorProgress) {
+      if (this.#partialWorkRecoveredRunIds.size >= 256) {
+        this.#partialWorkRecoveredRunIds.clear();
+      }
+      this.#partialWorkRecoveredRunIds.add(runId);
+    }
+    if (this.#activatedRuntime !== runtime || this.#stopped) return;
+    this.#providerReady = false;
+    this.#execution?.requestDrain({ cancelActive: false });
+    this.#notifyActivityChanged();
+    this.#log("warn", "runtime.lifecycle.session_recovery", {
+      runId,
+      reason,
+    });
+    if (
+      this.#desiredRuntimeState !== "active" ||
+      this.#runtimeRecoveryPromise
+    ) {
+      return;
+    }
+    const recovery = this.#recoverRuntime(runtime)
+      .catch((error: unknown) => {
+        this.#log("error", "runtime.recovery.failed", { error });
+      })
+      .finally(() => {
+        if (this.#runtimeRecoveryPromise === recovery) {
+          this.#runtimeRecoveryPromise = null;
+        }
+        this.#notifyActivityChanged();
+      });
+    this.#runtimeRecoveryPromise = recovery;
   }
 
   // The Agent's effective resources changed before the next Run: drain the

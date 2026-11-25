@@ -205,6 +205,7 @@ components:
           RUNTIME_INCOMPATIBLE,
           RUNTIME_DIAGNOSTIC_FAILED,
           LOCAL_COMPUTER_OFFLINE,
+          LOCAL_COMPUTER_UPGRADE_REQUIRED,
         ]
     LocalAgentRuntimeStatus:
       type: object
@@ -511,6 +512,24 @@ components:
       type: string
       enum: [online, error, offline, unknown]
       description: Runtime availability. Managed Task execution is represented by active_task_count.
+    TenantAgentAvailabilityReason:
+      type: string
+      enum:
+        [
+          online,
+          status_unavailable,
+          reconnecting,
+          authentication_required,
+          waiting_for_computer,
+          runtime_not_installed,
+          runtime_incompatible,
+          runtime_error,
+        ]
+      description: >-
+        Why the Agent has its status, as a stable code clients word in their own language.
+        `label` and `current_activity.summary` carry the same state in English for clients
+        that do not know the code. With `runtime_error` the summary is the Runtime's own
+        diagnostic text.
     TenantAgentCurrentActivity:
       type: object
       additionalProperties: false
@@ -535,6 +554,9 @@ components:
           type: string
           minLength: 1
           maxLength: 120
+          description: English wording of the status, the fallback for clients that do not know `reason`.
+        reason:
+          $ref: "#/components/schemas/TenantAgentAvailabilityReason"
         active_task_count:
           type: integer
           format: int64
@@ -637,6 +659,32 @@ components:
           $ref: "./common.yaml#/components/schemas/Id"
         room_id:
           $ref: "./common.yaml#/components/schemas/Id"
+        background_failure:
+          $ref: "#/components/schemas/AnotherMeBackgroundFailure"
+    AnotherMeBackgroundFailure:
+      type: object
+      additionalProperties: false
+      required: [consecutive_failures, reason]
+      description: >-
+        Present while the Another Me's background model calls (Wiki, Memory, daily reports) have
+        failed at least three times in a row; absent again after the next one completes.
+      properties:
+        consecutive_failures:
+          type: integer
+          minimum: 3
+        reason:
+          $ref: "#/components/schemas/AnotherMeBackgroundFailureReason"
+    AnotherMeBackgroundFailureReason:
+      type: string
+      description: >-
+        Why the latest background model call failed: the Runtime is incompatible or its model is not
+        available to the account, the Runtime needs sign-in, the Runtime is unavailable, or a cause
+        the Human cannot act on. Clients show an unknown value as unknown.
+      enum:
+        - runtime_incompatible
+        - runtime_auth_required
+        - runtime_unavailable
+        - unknown
     TenantAgentPage:
       type: object
       additionalProperties: false

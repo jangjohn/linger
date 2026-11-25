@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -31,6 +31,7 @@ import {
 
 import { NODE_RUNTIME_VERSION } from "../../../../scripts/local-computer-node-distributions.mjs";
 import { rename } from "node:fs/promises";
+import { composeProject } from "@linger/local-installation/instance";
 
 import { CredentialStore } from "./computer-credential.js";
 import { EnrollmentModule } from "./enrollment.js";
@@ -43,6 +44,7 @@ import {
   checkLocation,
   computerNotOnline,
   followHttps,
+  formatInstallJobFailure,
   hasNativePostgres,
   InstallerApi,
   installLocation,
@@ -50,6 +52,8 @@ import {
   parseSetCookie,
   LocalServerUnverifiedError,
   proveLocalServer,
+  RUNTIME_LOOKUP_HINT_MS,
+  RUNTIME_LOOKUP_LIMIT_MS,
   SignInRejectedError,
   signInFailure,
   signInWithPassword,
@@ -74,6 +78,28 @@ if (isWindowsHost) vi.setConfig({ testTimeout: 20_000 });
 const waitForInstaller = (check: () => unknown) =>
   vi.waitFor(check, { timeout: isWindowsHost ? 10_000 : 1_000 });
 
+// Fake timers that still advance with real time, for the installer stub's
+// subprocess; AbortSignal.timeout runs on them too, since the native one
+// uses a timer outside Vitest's fake clock.
+const fakeClock = () => {
+  vi.useFakeTimers({
+    shouldAdvanceTime: true,
+    toFake: ["setTimeout", "clearTimeout", "Date"],
+  });
+  const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const controller = new AbortController();
+    setTimeout(
+      () => controller.abort(new DOMException("timed out", "TimeoutError")),
+      ms,
+    );
+    return controller.signal;
+  });
+  return () => {
+    timeout.mockRestore();
+    vi.useRealTimers();
+  };
+};
+
 // Prints what the real installer prints and writes its private launcher.
 const FAKE_INSTALLER = String.raw`
 const fs = require("node:fs");
@@ -83,6 +109,11 @@ const home = args[args.indexOf("--home") + 1];
 if (args.includes("--user-keys")) {
   const changes = JSON.parse(fs.readFileSync(0, "utf8"));
   fs.writeFileSync(path.join(home, "keys-args.json"), JSON.stringify(args));
+  // As the installer reports a folder the ACL program refused.
+  if (Object.values(changes).includes("refused")) {
+    process.stdout.write(JSON.stringify({ error: "Windows private path validation failed", refusal: { code: "WINDOWS_PRIVATE_PATH_UNSAFE", reason: "UNSAFE_PARENT_ACCESS" } }) + "\n");
+    process.exit(1);
+  }
   if (Object.values(changes).includes("bad")) {
     process.stdout.write(JSON.stringify({ error: "COMPOSIO_API_KEY is not a valid key" }) + "\n");
     process.exit(1);
@@ -123,8 +154,14 @@ if (args.includes("--inspect")) {
   fs.writeFileSync(path.join(home, "runtime", "inspect-args.json"), JSON.stringify(args));
   const hardware = { totalMemoryBytes: 64 * 1024 ** 3, diskFreeBytes: 200 * 1024 ** 3, gpus: [{ name: "RTX 4090" }] };
   const eligible = !fs.existsSync(path.join(target, "small-computer"));
+  const modelFile = path.join(target, "inspect-model");
+  const modelName = fs.existsSync(path.join(target, "unnamed-model"))
+    ? ""
+    : fs.existsSync(modelFile)
+      ? fs.readFileSync(modelFile, "utf8").trim()
+      : "qwen3-8b";
   const estimate = eligible
-    ? { model: fs.existsSync(path.join(target, "unnamed-model")) ? "" : "qwen3-8b", downloadBytes: 6 * 1024 ** 3, diskBytes: 8 * 1024 ** 3, memoryBytes: 12 * 1024 ** 3 }
+    ? { model: modelName, downloadBytes: 6 * 1024 ** 3, diskBytes: 8 * 1024 ** 3, memoryBytes: 12 * 1024 ** 3 }
     : { model: "", downloadBytes: null, diskBytes: null, memoryBytes: null };
   if (fs.existsSync(path.join(home, "tool-download"))) {
     // The first check downloads the localmodels tool, counted before the report.
@@ -139,20 +176,42 @@ if (args.includes("--inspect")) {
     process.exit(1);
   }
   process.stderr.write("Checked this computer in 1.5s.\n");
-  const lowMemory = eligible && fs.existsSync(path.join(target, "low-memory"));
-  const reasons = eligible
+  const portBlocked = fs.existsSync(path.join(target, "port-in-use"));
+  const oldDriver = !portBlocked && fs.existsSync(path.join(target, "old-driver"));
+  const lowMemory = eligible && !portBlocked && !oldDriver && fs.existsSync(path.join(target, "low-memory"));
+  const reasons = portBlocked
+    ? [{ code: "gateway-port-in-use", message: "Gateway port 8080 is held by another process." }]
+    : oldDriver
+    ? [
+        {
+          code: "cuda-driver-update-required",
+          message: "Driver 535.98 supports CUDA 12.1; requires CUDA >= 12.4.",
+          detectedCudaVersion: "12.1",
+          requiredCudaVersion: "12.4",
+          driverVersion: "535.98",
+        },
+        {
+          code: "cuda-driver-version-unknown",
+          message: "Could not read driver CUDA version.",
+          detectedCudaVersion: "invalid prose",
+          requiredCudaVersion: "12.4",
+          driverVersion: "[N/A]",
+        },
+      ]
+    : eligible
     ? lowMemory
       ? [{ code: "free-memory-required", message: "Close other programs before installing.", freeBytes: 2899102924, requiredBytes: 13689304433 }]
       : []
     : [{ code: "facts-unavailable", message: "nvidia-smi was not found" }];
-  // With the plan priced on capacity, the installer recommends a runtime.
-  const recommendation = eligible && !lowMemory ? "local-models" : "codex";
+  // With the plan priced on capacity or temporarily blocked, the installer recommends a runtime.
+  const recommendation = eligible && !lowMemory && !oldDriver && !portBlocked ? "local-models" : "codex";
   const local = {
-    eligible: eligible && !lowMemory,
-    state: lowMemory ? "blocked-now" : eligible ? "ready" : "unavailable",
+    eligible: eligible && !lowMemory && !oldDriver && !portBlocked,
+    state: portBlocked || oldDriver || lowMemory ? "blocked-now" : eligible ? "ready" : "unavailable",
     ...(lowMemory ? { basis: "capacity", memory: { ramAvailableBytes: 2899102924, ramRequiredBytes: 13689304433 } } : {}),
   };
-  process.stdout.write(JSON.stringify({ hardware, localModels: { ...local, reasons, estimate }, recommendation }) + "\n");
+  const finalEstimate = oldDriver || portBlocked ? { model: "", downloadBytes: null, diskBytes: null, memoryBytes: null } : estimate;
+  process.stdout.write(JSON.stringify({ hardware, localModels: { ...local, reasons, estimate: finalEstimate }, recommendation }) + "\n");
   process.exit(0);
 }
 fs.mkdirSync(path.join(home, "installer"), { recursive: true });
@@ -172,9 +231,21 @@ if (args.includes("--resume")) {
   const originFile = path.join(home, "resume-origin");
   const origin = fs.existsSync(originFile) ? fs.readFileSync(originFile, "utf8") : "http://localhost:3000";
   const outcome = failure ? JSON.parse(failure) : { message: code ? "Native teamhub stopped" : "ok", details: { source, origin } };
-  process.stdout.write("noise\n" + JSON.stringify({ code, ...outcome, ...(runtime ? { runtime } : {}) }) + "\n");
+  // resume-timings.json holds the outcome's runtimeLookupTimings.
+  const timingsFile = path.join(home, "resume-timings.json");
+  const runtimeLookupTimings = fs.existsSync(timingsFile) ? JSON.parse(fs.readFileSync(timingsFile, "utf8")) : undefined;
+  process.stdout.write("noise\n" + JSON.stringify({ code, ...outcome, ...(runtime ? { runtime } : {}), ...(runtimeLookupTimings ? { runtimeLookupTimings } : {}) }) + "\n");
   process.exit(code);
 }
+if (fs.existsSync(path.join(home, "start-refused"))) {
+  // As the installer stops when the ACL program refuses its home.
+  process.stdout.write(JSON.stringify({ startFailure: { code: "WINDOWS_PRIVATE_PATH_UNSAFE", reason: "UNSAFE_OWNER" } }) + "\n");
+  process.stderr.write("Installer could not start (WINDOWS_PRIVATE_PATH_UNSAFE): Windows private path validation failed\n");
+  process.exit(1);
+}
+// serve-stderr holds what the serving installer writes to stderr.
+const serveStderr = path.join(home, "serve-stderr");
+if (fs.existsSync(serveStderr)) process.stderr.write(fs.readFileSync(serveStderr, "utf8"));
 const origin = "http://127.0.0.1:4321";
 fs.writeFileSync(
   path.join(home, "installer", "launch.html"),
@@ -238,7 +309,7 @@ const DONE = {
 // a retried job runs to DONE.
 const installerApi = (
   jobs: Record<string, unknown>[] = [],
-  finish: Record<string, unknown> = DONE,
+  finish: Record<string, unknown> | Record<string, unknown>[] = DONE,
   setup: Response = Response.json({ recommendation: "local-models" }),
   running: Record<string, unknown> | Record<string, unknown>[] = {
     state: "running",
@@ -247,16 +318,21 @@ const installerApi = (
   // Whether the instance's login exists before a job is created.
   installed = true,
 ) => {
+  const finishes = Array.isArray(finish) ? finish : [finish];
   const updates = [running].flat();
   const created: unknown[] = [];
   const retried: unknown[] = [];
   const canceled: string[] = [];
   // The runtime the installation set up and its sign-in; tests change them.
+  // The installer answers runtime lookups once `lookup` settles, as its
+  // one lookup per instance ends; `asked` counts the requests.
   const runtime: {
     setupChoice: string;
     environment: Record<string, string>;
     login: Record<string, unknown>;
     logins: unknown[];
+    lookup: Promise<void>;
+    asked: number;
   } = {
     setupChoice: "claude",
     environment: {
@@ -265,6 +341,8 @@ const installerApi = (
     },
     login: { state: "ready" },
     logins: [],
+    lookup: Promise.resolve(),
+    asked: 0,
   };
   let polls = 0;
   const job = (fields: Record<string, unknown>) => ({
@@ -310,9 +388,7 @@ const installerApi = (
         job(
           ++polls <= updates.length
             ? updates[polls - 1]!
-            : retried.length
-              ? DONE
-              : finish,
+            : (finishes[retried.length] ?? DONE),
         ),
       );
     if (url.pathname === `/api/instances/${LOCAL_INSTANCE}/login`)
@@ -329,11 +405,20 @@ const installerApi = (
             password: "pw",
             origin: "http://localhost:3000",
           });
-    if (url.pathname === `/api/instances/${LOCAL_INSTANCE}/runtime`)
+    if (url.pathname === `/api/instances/${LOCAL_INSTANCE}/runtime`) {
+      runtime.asked++;
+      const { signal } = init;
+      await new Promise<void>((resolve, reject) => {
+        const stop = () => reject(signal!.reason);
+        if (signal?.aborted) stop();
+        signal?.addEventListener("abort", stop, { once: true });
+        void runtime.lookup.then(resolve);
+      });
       return Response.json({
         setupChoice: runtime.setupChoice,
         environment: runtime.environment,
       });
+    }
     if (url.pathname === "/api/runtime-login" && init.method === "DELETE") {
       runtime.logins.push("cancel");
       runtime.login = { state: "idle" };
@@ -421,6 +506,7 @@ const fixture = (
   const loadServer = vi.fn();
   const enroll = vi.fn(async () => {});
   const unenroll = vi.fn(async () => {});
+  const syncLocalGatewayUrl = vi.fn(() => false);
   let context: ModuleContext | undefined;
   const signIn = vi.fn(async () => {});
   // The installed server proves itself unless a test says otherwise.
@@ -470,6 +556,7 @@ const fixture = (
         ...stubModule("Enrollment"),
         enroll,
         unenroll,
+        syncLocalGatewayUrl,
         start: async (ctx: ModuleContext) => {
           context = ctx;
         },
@@ -492,6 +579,7 @@ const fixture = (
     bus,
     enroll,
     unenroll,
+    syncLocalGatewayUrl,
     config: () => context!.config.get(),
     signIn,
     proveServer,
@@ -663,6 +751,31 @@ describe("LocalServerModule", () => {
     expect(packaging).toContain("LSMinimumSystemVersion=MINIMUM_MACOS");
   });
 
+  it("uses the runtime returned by the completed install without another lookup", async () => {
+    const runtime = {
+      setupChoice: "pi",
+      environment: { LINGER_PI_PATH: "/managed/pi" },
+    };
+    const api = installerApi([], {
+      state: "succeeded",
+      origin: "http://localhost:3000",
+      runtime,
+    });
+    const lookup = vi.spyOn(InstallerApi.prototype, "runtime");
+    try {
+      const f = fixture(withCheckout, {}, checkout, api);
+      await f.host.start();
+      await f.module.begin();
+      expect(f.host.ctx.config.get().runtimeEnvironment).toEqual(
+        runtime.environment,
+      );
+      expect(lookup).not.toHaveBeenCalled();
+      await f.host.stop("quit");
+    } finally {
+      lookup.mockRestore();
+    }
+  });
+
   it("installs from the pinned source, signs in and connects this computer", async () => {
     const root = tempDirectory();
     const archive = sourceArchive(root);
@@ -751,12 +864,16 @@ describe("LocalServerModule", () => {
     // only its runtime stage waits for the sign-in.
     const api = installerApi([], {
       state: "succeeded",
+      setupChoice: "codex",
       origin: "http://localhost:3000",
       stages: [
         { id: "runtime", state: "waiting_user" },
         { id: "computer", state: "skipped" },
       ],
     });
+    const requests = vi.spyOn(api, "handle");
+    const lookups = () =>
+      requests.mock.calls.filter(([url]) => url.pathname.endsWith("/runtime"));
     api.runtime.setupChoice = "codex";
     api.runtime.login = { state: "idle" };
     const openExternal = vi.fn(async () => {});
@@ -769,6 +886,7 @@ describe("LocalServerModule", () => {
     await f.host.start();
     const done = f.module.begin();
     await waitForInstaller(() => expect(f.module.status().step).toBe("signin"));
+    expect(lookups()).toHaveLength(0);
     expect(f.module.status()).toMatchObject({
       phase: "installing",
       message: "Sign in to Codex",
@@ -777,41 +895,59 @@ describe("LocalServerModule", () => {
     expect(f.module.status().steps).toContain("signin");
     expect(f.enroll).not.toHaveBeenCalled();
 
-    // The runtime's own login runs in the installer; its page opens once.
+    // The runtime's own login runs in the installer. On Linux, Codex's
+    // browser login leaves its page to this app, which opens it once.
+    const oauth =
+      "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=x";
+    api.runtime.login = { state: "waiting_user", url: oauth };
+    await f.module.startSignIn();
+    expect(api.runtime.logins).toEqual([
+      { instance: LOCAL_INSTANCE, method: "browser" },
+    ]);
+    expect(f.module.status().signIn).toEqual({
+      runtime: "codex",
+      state: "waiting_user",
+      url: oauth,
+    });
+    await waitForInstaller(() => expect(openExternal).toHaveBeenCalledTimes(1));
+    expect(openExternal).toHaveBeenCalledWith(oauth);
+
+    // A code for another device instead; its page opens too.
     api.runtime.login = {
       state: "waiting_user",
       url: "https://auth.openai.com/codex/device",
       deviceCode: "ABCD-1234",
     };
-    await f.module.startSignIn();
-    expect(api.runtime.logins).toEqual([{ instance: LOCAL_INSTANCE }]);
+    await f.module.startSignIn(undefined, true);
     expect(f.module.status().signIn).toEqual({
       runtime: "codex",
       state: "waiting_user",
       url: "https://auth.openai.com/codex/device",
       deviceCode: "ABCD-1234",
     });
-    await waitForInstaller(() => expect(openExternal).toHaveBeenCalledTimes(1));
-    expect(openExternal).toHaveBeenCalledWith(
+    await waitForInstaller(() => expect(openExternal).toHaveBeenCalledTimes(2));
+    expect(openExternal).toHaveBeenLastCalledWith(
       "https://auth.openai.com/codex/device",
     );
 
     // Claude Code's page shows a code to paste back.
     await f.module.startSignIn("pasted-code");
     expect(api.runtime.logins).toEqual([
-      { instance: LOCAL_INSTANCE },
+      { instance: LOCAL_INSTANCE, method: "browser" },
+      { instance: LOCAL_INSTANCE, method: "device" },
       { instance: LOCAL_INSTANCE, code: "pasted-code" },
     ]);
 
     // Signing in finishes in the browser; the next check sees it.
     api.runtime.login = { state: "ready" };
     await done;
+    expect(lookups()).toHaveLength(1);
     expect(f.module.status()).toMatchObject({
       phase: "ready",
       signIn: { runtime: "codex", state: "signed_in" },
     });
     expect(f.module.status().steps).toContain("signin");
-    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledTimes(2);
     expect(f.enroll).toHaveBeenCalled();
     expect(f.host.ctx.config.get().runtimeEnvironment).toEqual(
       api.runtime.environment,
@@ -895,6 +1031,77 @@ describe("LocalServerModule", () => {
       signIn: { runtime: "claude", state: "signed_in" },
     });
     expect(openExternal).toHaveBeenCalledTimes(1);
+    await f.host.stop("quit");
+  });
+
+  it("says when no browser opens, and why a sign-in ended", async () => {
+    const api = installerApi([], {
+      state: "succeeded",
+      origin: "http://localhost:3000",
+      stages: [{ id: "runtime", state: "waiting_user" }],
+    });
+    api.runtime.setupChoice = "codex";
+    api.runtime.login = { state: "idle" };
+    const openExternal = vi.fn(async (_url: string): Promise<void> => {
+      throw new Error("xdg-open exited with 3");
+    });
+    const f = fixture(
+      (home) => ({ ...withCheckout(home), openExternal, signInPollMs: 5 }),
+      {},
+      checkout,
+      api,
+    );
+    await f.host.start();
+    const done = f.module.begin();
+    await waitForInstaller(() =>
+      expect(f.module.status().signIn?.state).toBe("required"),
+    );
+    const login = {
+      state: "waiting_user" as const,
+      url: "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=x",
+    };
+    api.runtime.login = login;
+    await f.module.startSignIn();
+    // No browser opened: the step says so, and the next checks keep it.
+    await waitForInstaller(() =>
+      expect(f.module.status().signIn).toEqual({
+        runtime: "codex",
+        ...login,
+        browserFailed: true,
+      }),
+    );
+    await delay(30);
+    expect(f.module.status().signIn?.browserFailed).toBe(true);
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    // Opening it by hand works now.
+    openExternal.mockResolvedValueOnce(undefined);
+    await f.module.openSignInPage();
+    expect(f.module.status().signIn).toEqual({ runtime: "codex", ...login });
+
+    // The installer says why it ended; the step keeps the reason.
+    api.runtime.login = {
+      state: "failed",
+      reason: "timed_out",
+      message: "Sign-in timed out. Retry or sign in later.",
+    };
+    await waitForInstaller(() =>
+      expect(f.module.status().signIn).toEqual({
+        runtime: "codex",
+        state: "failed",
+        reason: "timed_out",
+        message: "Sign-in timed out. Retry or sign in later.",
+      }),
+    );
+    api.runtime.login = { state: "idle" };
+    await delay(30);
+    expect(f.module.status().signIn?.reason).toBe("timed_out");
+
+    api.runtime.login = { state: "ready" };
+    await done;
+    expect(f.module.status().signIn).toEqual({
+      runtime: "codex",
+      state: "signed_in",
+    });
     await f.host.stop("quit");
   });
 
@@ -1702,6 +1909,71 @@ describe("LocalServerModule", () => {
     info.mockRestore();
   });
 
+  it("marks checked Inkling 2 Mini models with featuredInkling using the shared matcher", async () => {
+    const f = fixture({ checkout: "/src" }, {}, (home) => {
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        path.join(home, "inspect-model"),
+        "thinkingmachines/Inkling-2-Mini",
+      );
+    });
+    await f.host.start();
+    f.module.inspect();
+    await waitForInstaller(() =>
+      expect(f.module.status().localModels).toMatchObject({
+        state: "checked",
+        eligible: true,
+        model: {
+          name: "thinkingmachines/Inkling-2-Mini",
+          featuredInkling: true,
+        },
+      }),
+    );
+  });
+
+  it("forwards validated CUDA driver versions without leaking tool prose", async () => {
+    const info = vi.spyOn(silentLog, "info");
+    const f = fixture({ checkout: "/src" }, {}, (home) => {
+      mkdirSync(home, { recursive: true });
+      writeFileSync(path.join(home, "old-driver"), "");
+    });
+    await f.host.start();
+    f.module.inspect();
+    await waitForInstaller(() =>
+      expect(f.module.status().localModels).toMatchObject({
+        state: "checked",
+        eligible: false,
+        reasons: [
+          {
+            code: "cuda-driver-update-required",
+            detectedCudaVersion: "12.1",
+            requiredCudaVersion: "12.4",
+            driverVersion: "535.98",
+          },
+          {
+            code: "cuda-driver-version-unknown",
+            requiredCudaVersion: "12.4",
+          },
+        ],
+        recommendation: "codex",
+      }),
+    );
+    const serialized = JSON.stringify(f.module.status());
+    expect(serialized).not.toContain("invalid prose");
+    expect(serialized).not.toContain("Driver 535.98 supports CUDA 12.1");
+    expect(info).toHaveBeenCalledWith(
+      "local_server.inspected",
+      expect.objectContaining({
+        eligible: false,
+        reasons: [
+          "cuda-driver-update-required: Driver 535.98 supports CUDA 12.1; requires CUDA >= 12.4.",
+          "cuda-driver-version-unknown: Could not read driver CUDA version.",
+        ],
+      }),
+    );
+    info.mockRestore();
+  });
+
   it("holds a local model that needs free memory until a check finds it", async () => {
     const info = vi.spyOn(silentLog, "info");
     const f = fixture({ checkout: "/src" }, {}, (home) => {
@@ -1750,6 +2022,26 @@ describe("LocalServerModule", () => {
     info.mockRestore();
   });
 
+  it("marks localModels blockedNow even when plan is null (such as gateway-port-in-use)", async () => {
+    const f = fixture({ checkout: "/src" }, {}, (home) => {
+      mkdirSync(home, { recursive: true });
+      writeFileSync(path.join(home, "port-in-use"), "");
+    });
+    await f.host.start();
+    f.module.inspect();
+    await waitForInstaller(() =>
+      expect(f.module.status().localModels).toMatchObject({
+        state: "checked",
+        eligible: false,
+        blockedNow: true,
+        reasons: [{ code: "gateway-port-in-use" }],
+        recommendation: "codex",
+      }),
+    );
+    expect(f.module.status().localModels).not.toHaveProperty("model");
+    await f.host.stop("quit");
+  });
+
   it("approves the deployment of the chosen local model", async () => {
     const api = installerApi([], {
       state: "waiting_user",
@@ -1772,6 +2064,91 @@ describe("LocalServerModule", () => {
     await f.host.stop("quit");
   });
 
+  it("waits out a slow runtime lookup, says what it waits on and finishes", async () => {
+    const restore = fakeClock();
+    try {
+      const api = installerApi([], {
+        state: "succeeded",
+        origin: "http://localhost:3000",
+      });
+      let finish!: () => void;
+      api.runtime.lookup = new Promise((resolve) => {
+        finish = resolve;
+      });
+      const f = fixture(withCheckout, {}, checkout, api);
+      // As the desktop's enrollment does once signed in.
+      f.enroll.mockImplementation(async () => {
+        f.host.ctx.config.update({ computerId: "computer-1" });
+      });
+      await f.host.start();
+      const done = f.module.begin();
+      await waitForInstaller(() => expect(api.runtime.asked).toBe(1));
+      expect(f.module.status()).toMatchObject({ phase: "installing" });
+      expect(f.module.status().waiting).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(RUNTIME_LOOKUP_HINT_MS);
+      expect(f.module.status()).toMatchObject({
+        phase: "installing",
+        waiting: "runtime",
+      });
+      // The lookup took 104 s on a reporter's Windows computer (#549),
+      // past the 60 s the desktop once allowed it (#385).
+      await vi.advanceTimersByTimeAsync(104_000 - RUNTIME_LOOKUP_HINT_MS);
+      finish();
+      await done;
+      expect(f.module.status().phase).toBe("ready");
+      expect(f.module.status().waiting).toBeUndefined();
+      expect(api.runtime.asked).toBe(1);
+      expect(f.host.ctx.config.get()).toMatchObject({
+        runtimeEnvironment: api.runtime.environment,
+        computerId: "computer-1",
+      });
+      await f.host.stop("quit");
+    } finally {
+      restore();
+    }
+  });
+
+  it("names a runtime lookup that never ends, and Try Again picks up its late answer", async () => {
+    const restore = fakeClock();
+    try {
+      const api = installerApi([], {
+        state: "succeeded",
+        origin: "http://localhost:3000",
+      });
+      let finish!: () => void;
+      api.runtime.lookup = new Promise((resolve) => {
+        finish = resolve;
+      });
+      const f = fixture(withCheckout, {}, checkout, api);
+      f.enroll.mockImplementation(async () => {
+        f.host.ctx.config.update({ computerId: "computer-1" });
+      });
+      await f.host.start();
+      const first = f.module.begin().catch((error: unknown) => error);
+      await waitForInstaller(() => expect(api.runtime.asked).toBe(1));
+      await vi.advanceTimersByTimeAsync(RUNTIME_LOOKUP_LIMIT_MS);
+      expect(await first).toMatchObject({ code: "runtime_lookup_timed_out" });
+      expect(f.module.status()).toMatchObject({
+        phase: "failed",
+        failure: "runtime_lookup_timed_out",
+      });
+      expect(f.module.status().waiting).toBeUndefined();
+      expect(f.enroll).not.toHaveBeenCalled();
+      expect(f.host.ctx.config.get().computerId).toBeFalsy();
+      // The installer's lookup ends after the desktop stopped waiting and
+      // keeps its answer; Try Again (or the next launch) gets it at once.
+      finish();
+      await f.module.begin();
+      expect(api.runtime.asked).toBe(2);
+      expect(f.module.status()).toMatchObject({ phase: "ready" });
+      expect(f.module.status().failure).toBeUndefined();
+      expect(f.host.ctx.config.get().computerId).toBe("computer-1");
+      await f.host.stop("quit");
+    } finally {
+      restore();
+    }
+  });
+
   it("asks for a new local model plan after a stopped deployment", async () => {
     const f = fixture(
       withCheckout,
@@ -1789,6 +2166,53 @@ describe("LocalServerModule", () => {
     await f.host.stop("quit");
   });
 
+  it("does not replan on binding-unavailable and reports the structured reason", async () => {
+    const f = fixture(
+      withCheckout,
+      {},
+      checkout,
+      installerApi([], {
+        state: "waiting_user",
+        errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+        errorReasons: ["binding-unavailable"],
+        message:
+          "The upstream tool could not verify the local stack binding: Restore the existing install and try again.",
+      }),
+    );
+    await f.host.start();
+    await expect(f.module.begin({ runtime: "local" })).rejects.toThrow(
+      "The local model stack couldn't be checked. Local model setup couldn't finish or verify this computer's local model state and Pi configuration. Check folder permissions or repair the existing installation and try again, or choose another AI runtime.",
+    );
+    expect(f.api.retried).toEqual([]);
+    await f.host.stop("quit");
+  });
+
+  it("reports a repairable setup or verification error without double periods for LOCAL_MODELS_RECOVERY_REQUIRED", () => {
+    const formatted = formatInstallJobFailure({
+      errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+      message:
+        "The upstream tool could not verify the local stack binding: Pi's configuration or this computer's state cannot be read safely. Restore the existing install and try again.. Existing resources were preserved.",
+    });
+    expect(formatted).not.toContain("can't run the local model");
+    expect(formatted).toContain(
+      "couldn't finish or verify this computer's local model state and Pi configuration",
+    );
+    expect(formatted).toContain("Check folder permissions or repair");
+    expect(formatted).not.toContain("..");
+    expect(formatted).toContain(
+      "Restore the existing install and try again. Existing resources were preserved.",
+    );
+
+    const withReason = formatInstallJobFailure({
+      errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+      message: "The upstream tool could not verify the local stack binding.",
+      errorReasons: ["binding-unavailable"],
+    });
+    expect(withReason).toBe(
+      "The local model stack couldn't be checked. Local model setup couldn't finish or verify this computer's local model state and Pi configuration. Check folder permissions or repair the existing installation and try again, or choose another AI runtime.",
+    );
+  });
+
   it("asks to free memory only when no local model fits", async () => {
     const f = fixture(
       withCheckout,
@@ -1804,6 +2228,226 @@ describe("LocalServerModule", () => {
       "Close other programs to free memory",
     );
     await f.host.stop("quit");
+  });
+
+  it("reports Hub reachability and disk failures accurately without blaming memory", async () => {
+    for (const [causeCode, expected, forbidden] of [
+      [
+        "HUB_UNREACHABLE",
+        "Couldn't reach the model download service",
+        "free memory",
+      ],
+      ["DISK_INSUFFICIENT", "enough free disk space", "free memory"],
+      [
+        "GPU_CONFLICT",
+        "Choose another AI runtime and try again.",
+        "free memory",
+      ],
+      [
+        "STACK_PLAN_FAILED",
+        "Choose another AI runtime and try again.",
+        "free memory",
+      ],
+      ["MEMORY_INSUFFICIENT", "Close other programs to free memory", "disk"],
+    ] as const) {
+      const f = fixture(
+        withCheckout,
+        {},
+        checkout,
+        installerApi([], {
+          state: "waiting_user",
+          errorCode: "LOCAL_MODELS_UNAVAILABLE",
+          errorCauseCode: causeCode,
+          message: `upstream cause ${causeCode}`,
+        }),
+      );
+      await f.host.start();
+      const failure = f.module.begin({ runtime: "local" });
+      await expect(failure).rejects.toThrow(expected);
+      await expect(failure).rejects.not.toThrow(forbidden);
+      await f.host.stop("quit");
+    }
+  });
+
+  it("retries the approved plan once on interrupted download instead of blind replanning", async () => {
+    const planId = "a".repeat(64);
+    const f = fixture(
+      withCheckout,
+      {},
+      checkout,
+      installerApi(
+        [],
+        [
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_APPROVAL_REQUIRED",
+            localModelsPlan: { planId },
+          },
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+            errorCauseCode: "STACK_COMPONENT_FAILED",
+            message: "Local model setup failed at: llm.",
+          },
+          DONE,
+        ],
+      ),
+    );
+    await f.host.start();
+    await f.module.begin({ runtime: "local" });
+    expect(f.api.retried).toEqual([
+      { localModelsApproval: planId },
+      { localModelsApproval: planId },
+    ]);
+    expect(f.module.status().phase).toBe("ready");
+    await f.host.stop("quit");
+  });
+
+  it("stops without blind replanning when retrying the approved plan fails again with STACK_COMPONENT_FAILED", async () => {
+    const planId = "a".repeat(64);
+    const f = fixture(
+      withCheckout,
+      {},
+      checkout,
+      installerApi(
+        [],
+        [
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_APPROVAL_REQUIRED",
+            localModelsPlan: { planId },
+          },
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+            errorCauseCode: "STACK_COMPONENT_FAILED",
+            message: "Local model setup failed at: llm.",
+          },
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+            errorCauseCode: "STACK_COMPONENT_FAILED",
+            message: "Local model setup failed at: llm.",
+          },
+        ],
+      ),
+    );
+    await f.host.start();
+    const failure = f.module.begin({ runtime: "local" });
+    await expect(failure).rejects.toThrow(
+      "Local model download or setup was interrupted",
+    );
+    await expect(failure).rejects.not.toThrow("free memory");
+    expect(f.api.retried).toEqual([
+      { localModelsApproval: planId },
+      { localModelsApproval: planId },
+    ]);
+    await f.host.stop("quit");
+  });
+
+  it("still replans once when an approved plan fails with a non-retryable recovery cause", async () => {
+    for (const causeCode of ["STACK_PLAN_CHANGED", "SEARCH_UNAVAILABLE"]) {
+      const firstPlan = "a".repeat(64);
+      const secondPlan = "b".repeat(64);
+      const f = fixture(
+        withCheckout,
+        {},
+        checkout,
+        installerApi(
+          [],
+          [
+            {
+              state: "waiting_user",
+              errorCode: "LOCAL_MODELS_APPROVAL_REQUIRED",
+              localModelsPlan: { planId: firstPlan },
+            },
+            {
+              state: "waiting_user",
+              errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+              errorCauseCode: causeCode,
+            },
+            {
+              state: "waiting_user",
+              errorCode: "LOCAL_MODELS_APPROVAL_REQUIRED",
+              localModelsPlan: { planId: secondPlan },
+            },
+            DONE,
+          ],
+        ),
+      );
+      await f.host.start();
+      await f.module.begin({ runtime: "local" });
+      expect(f.api.retried).toEqual([
+        { localModelsApproval: firstPlan },
+        { localModelsReplan: true },
+        { localModelsApproval: secondPlan },
+      ]);
+      expect(f.module.status().phase).toBe("ready");
+      await f.host.stop("quit");
+    }
+  });
+
+  it("replans once when STACK_COMPONENT_FAILED arrives without a prior approval in this run", async () => {
+    const replannedPlan = "c".repeat(64);
+    const f = fixture(
+      withCheckout,
+      {},
+      checkout,
+      installerApi(
+        [],
+        [
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+            errorCauseCode: "STACK_COMPONENT_FAILED",
+            message: "Local model setup failed at: llm.",
+          },
+          {
+            state: "waiting_user",
+            errorCode: "LOCAL_MODELS_APPROVAL_REQUIRED",
+            localModelsPlan: { planId: replannedPlan },
+          },
+          DONE,
+        ],
+      ),
+    );
+    await f.host.start();
+    await f.module.begin({ runtime: "local" });
+    expect(f.api.retried).toEqual([
+      { localModelsReplan: true },
+      { localModelsApproval: replannedPlan },
+    ]);
+    expect(f.module.status().phase).toBe("ready");
+    await f.host.stop("quit");
+  });
+
+  it("emits local-server.busy while installing and releases it on both success and failure", async () => {
+    const events: boolean[] = [];
+    const ok = fixture(withCheckout, {}, checkout, installerApi());
+    ok.bus.on("local-server.busy", (busy) => events.push(busy));
+    await ok.host.start();
+    await ok.module.begin({ runtime: "local" });
+    expect(events).toEqual([true, false]);
+    await ok.host.stop("quit");
+
+    events.length = 0;
+    const failed = fixture(
+      withCheckout,
+      {},
+      checkout,
+      installerApi([], {
+        state: "waiting_user",
+        errorCode: "LOCAL_MODELS_UNAVAILABLE",
+        errorCauseCode: "HUB_UNREACHABLE",
+      }),
+    );
+    failed.bus.on("local-server.busy", (busy) => events.push(busy));
+    await failed.host.start();
+    await expect(failed.module.begin({ runtime: "local" })).rejects.toThrow(
+      "model download service",
+    );
+    expect(events).toEqual([true, false]);
+    await failed.host.stop("quit");
   });
 
   it("starts again past an attempt that stopped waiting for the person", async () => {
@@ -1879,6 +2523,55 @@ describe("LocalServerModule", () => {
     });
     // A checkout downloads nothing.
     expect(f.module.status().steps).not.toContain("download");
+    await f.host.stop("quit");
+  });
+
+  it("logs the serving installer's timing events at info and other stderr at warn", async () => {
+    const f = fixture(withCheckout, {}, (home) => {
+      checkout(home);
+      writeFileSync(
+        path.join(home, "serve-stderr"),
+        `${JSON.stringify({
+          event: "installer.runtime_lookup_timings",
+          instance: "desktop",
+          timings: {
+            config: 1,
+            runtime: 2,
+            localModels: 3,
+            tool: 4,
+            total: 10,
+          },
+        })}\nSomething else\n`,
+      );
+    });
+    const info = vi.spyOn(silentLog, "info");
+    const warn = vi.spyOn(silentLog, "warn");
+    await f.host.start();
+    await f.module.begin({ runtime: "claude" });
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith("local_server.installer_stderr", {
+        line: "Something else",
+      }),
+    );
+    expect(info).toHaveBeenCalledWith(
+      "local_server.installer_runtime_timings",
+      {
+        instance: "desktop",
+        config_ms: 1,
+        runtime_ms: 2,
+        local_models_ms: 3,
+        tool_ms: 4,
+        total_ms: 10,
+      },
+    );
+    expect(warn).not.toHaveBeenCalledWith(
+      "local_server.installer_stderr",
+      expect.objectContaining({
+        line: expect.stringContaining("runtime_lookup_timings"),
+      }),
+    );
+    info.mockRestore();
+    warn.mockRestore();
     await f.host.stop("quit");
   });
 
@@ -2086,6 +2779,98 @@ describe("LocalServerModule", () => {
     await f.host.stop("quit");
   });
 
+  it.each([
+    ["a subscription runtime", { runtime: "codex" } as const, "codex"],
+    // The subscription on a computer whose pick is the local model.
+    ["the installer's pick", { runtime: "recommended" } as const, "pi"],
+  ])(
+    "does not follow the local model download after %s is chosen instead",
+    async (_name, plan, setupChoice) => {
+      // The person chose the local model, quit part way through its
+      // download, and chose again; the installer kept that job running.
+      const f = fixture(
+        withCheckout,
+        {},
+        checkout,
+        installerApi([
+          {
+            id: "download",
+            instance: LOCAL_INSTANCE,
+            setupChoice: "local-models",
+            state: "running",
+            stage: "runtime",
+            message: "Downloading the local model…",
+            createdAt: "2026-11-03T00:00:00Z",
+            stages: [{ id: "runtime", state: "running" }],
+          },
+        ]),
+      );
+      await f.host.start();
+      const messages: string[] = [];
+      f.host.ctx.bus.on("local-server.changed", () =>
+        messages.push(f.module.status().message),
+      );
+      await f.module.begin(plan);
+      expect(f.api.created).toEqual([
+        { instance: LOCAL_INSTANCE, setupChoice },
+      ]);
+      expect(messages).not.toContain("Downloading the local model…");
+      expect(f.module.status().phase).toBe("ready");
+      await f.host.stop("quit");
+    },
+  );
+
+  it("installs the local model chosen after a subscription setup", async () => {
+    const subscription = {
+      id: "old",
+      instance: LOCAL_INSTANCE,
+      setupChoice: "codex",
+      state: "succeeded",
+      origin: "http://localhost:3000",
+      createdAt: "2026-11-03T00:00:00Z",
+      stages: [],
+    };
+    // Its services still answer, so the same choice would follow it.
+    const answering = (home: string) => ({
+      ...withCheckout(home),
+      fetch: (async () => new Response(null)) as typeof fetch,
+    });
+    const same = fixture(answering, {}, checkout, installerApi([subscription]));
+    await same.host.start();
+    await same.module.begin({ runtime: "codex" });
+    expect(same.api.created).toEqual([]);
+    await same.host.stop("quit");
+    for (const state of ["succeeded", "running"]) {
+      const f = fixture(
+        answering,
+        {},
+        checkout,
+        installerApi(
+          [{ ...subscription, state }],
+          DONE,
+          undefined,
+          // The new job stays queued until the running one has stopped,
+          // which takes until the end of a step such as starting services.
+          state === "running"
+            ? [
+                { state: "queued" },
+                { state: "queued" },
+                { state: "queued" },
+                { state: "running", stage: "images" },
+              ]
+            : undefined,
+        ),
+      );
+      await f.host.start();
+      await f.module.begin({ runtime: "local" });
+      expect(f.api.created).toEqual([
+        { instance: LOCAL_INSTANCE, setupChoice: "local-models" },
+      ]);
+      expect(f.module.status().phase).toBe("ready");
+      await f.host.stop("quit");
+    }
+  });
+
   it("installs again when a finished installation's data is gone", async () => {
     const f = fixture(
       withCheckout,
@@ -2291,6 +3076,150 @@ describe("LocalServerModule", () => {
     });
     expect(f.signIn).not.toHaveBeenCalled();
     await f.host.stop("quit");
+  });
+
+  it("keeps the installer's refusal of a folder with the failure it caused", async () => {
+    const f = fixture(withCheckout, {}, checkout);
+    await f.host.start();
+    try {
+      writeFileSync(path.join(f.home, "start-refused"), "");
+      await expect(f.module.begin()).rejects.toThrow(
+        "The installer stopped while starting. Installer could not start (WINDOWS_PRIVATE_PATH_UNSAFE): Windows private path validation failed",
+      );
+      expect(f.module.status()).toMatchObject({
+        phase: "failed",
+        refusal: {
+          code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+          reason: "UNSAFE_OWNER",
+        },
+      });
+      rmSync(path.join(f.home, "start-refused"));
+      await expect(
+        f.module.begin({ runtime: "claude", keys: { composio: "refused" } }),
+      ).rejects.toThrow("Keys could not be saved");
+      expect(f.module.status().refusal).toEqual({
+        code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+        reason: "UNSAFE_PARENT_ACCESS",
+      });
+      // Another failure does not carry it on.
+      await expect(
+        f.module.begin({ runtime: "claude", keys: { composio: "bad" } }),
+      ).rejects.toThrow("COMPOSIO_API_KEY is not a valid key");
+      expect(f.module.status().phase).toBe("failed");
+      expect(f.module.status().refusal).toBeUndefined();
+    } finally {
+      await f.host.stop("quit");
+    }
+  });
+
+  it("pre-checks both the install home and Computer daemon directory on Windows before unpacking", async () => {
+    const checked: string[] = [];
+    const daemonDir = "C:\\Users\\me\\AppData\\Roaming\\Linger\\computer";
+    const winCheckout = (home: string) => {
+      checkout(home);
+      writeFileSync(
+        path.join(path.dirname(home), "installer", "distribution.json"),
+        JSON.stringify({
+          platform: "win32",
+          arch: "x64",
+          nativeSources: [{ target: "win32-x64" }],
+        }),
+      );
+    };
+    const f = fixture(
+      (home) => ({
+        ...withCheckout(home),
+        platform: "win32",
+        arch: "x64",
+        daemonDirectory: daemonDir,
+        checkPrivateLocation: async (directory) => {
+          checked.push(directory);
+          if (directory === daemonDir) {
+            throw Object.assign(
+              new Error(
+                `Windows private path validation failed: ${daemonDir} is inside a folder other accounts on this computer can rename or replace (ancestor: C:\\Users\\me\\AppData\\Roaming, sid: S-1-5-21-1-2-3-1007).`,
+              ),
+              {
+                code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+                reason: "UNSAFE_PARENT_ACCESS",
+              },
+            );
+          }
+        },
+      }),
+      {},
+      winCheckout,
+    );
+    await f.host.start();
+    try {
+      await expect(f.module.begin()).rejects.toThrow(
+        `Desktop Computer directory validation failed: Windows private path validation failed: ${daemonDir}`,
+      );
+      expect(checked).toEqual([f.home, daemonDir]);
+      expect(f.module.status()).toMatchObject({
+        phase: "failed",
+        step: "prepare",
+      });
+      // Daemon directory refusal must not masquerade as an install-location refusal.
+      expect(f.module.status().refusal).toBeUndefined();
+      // Installer never launched because preflight stopped in prepare.
+      expect(existsSync(path.join(f.home, "installer", "args.json"))).toBe(
+        false,
+      );
+    } finally {
+      await f.host.stop("quit");
+    }
+  });
+
+  it("preserves the Windows private-path refusal when home preflight fails", async () => {
+    const winCheckout = (home: string) => {
+      checkout(home);
+      writeFileSync(
+        path.join(path.dirname(home), "installer", "distribution.json"),
+        JSON.stringify({
+          platform: "win32",
+          arch: "x64",
+          nativeSources: [{ target: "win32-x64" }],
+        }),
+      );
+    };
+    const f = fixture(
+      (home) => ({
+        ...withCheckout(home),
+        platform: "win32",
+        arch: "x64",
+        daemonDirectory: "C:\\Users\\me\\AppData\\Roaming\\Linger\\computer",
+        checkPrivateLocation: async () => {
+          throw Object.assign(
+            new Error(
+              "Windows private path validation failed: home is inside a folder other accounts on this computer can rename or replace (ancestor: C:\\Users\\me, sid: S-1-5-21-1-2-3-1007).",
+            ),
+            {
+              code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+              reason: "UNSAFE_PARENT_ACCESS",
+            },
+          );
+        },
+      }),
+      {},
+      winCheckout,
+    );
+    await f.host.start();
+    try {
+      await expect(f.module.begin()).rejects.toThrow(
+        "Windows private path validation failed",
+      );
+      expect(f.module.status()).toMatchObject({
+        phase: "failed",
+        step: "prepare",
+        refusal: {
+          code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+          reason: "UNSAFE_PARENT_ACCESS",
+        },
+      });
+    } finally {
+      await f.host.stop("quit");
+    }
   });
 });
 
@@ -2583,6 +3512,63 @@ describe("LocalServerModule after a restart", () => {
     await f.host.stop("quit");
   });
 
+  it("logs the runtime lookup timings a resume outcome carries", async () => {
+    const f = fixture({}, enrolled, (home) => {
+      record(home);
+      writeFileSync(
+        path.join(home, "resume-timings.json"),
+        JSON.stringify({
+          config: 1,
+          runtime: 2,
+          localModels: 3,
+          tool: 4,
+          total: 10,
+        }),
+      );
+    });
+    const info = vi.spyOn(silentLog, "info");
+    await f.host.start();
+    await waitForInstaller(() => expect(f.module.status().phase).toBe("ready"));
+    expect(info).toHaveBeenCalledWith(
+      "local_server.installer_runtime_timings",
+      {
+        instance: LOCAL_INSTANCE,
+        config_ms: 1,
+        runtime_ms: 2,
+        local_models_ms: 3,
+        tool_ms: 4,
+        total_ms: 10,
+      },
+    );
+    info.mockRestore();
+    await f.host.stop("quit");
+  });
+
+  it("ignores malformed runtime lookup timings in a resume outcome", async () => {
+    const f = fixture({}, enrolled, (home) => {
+      record(home);
+      writeFileSync(
+        path.join(home, "resume-timings.json"),
+        JSON.stringify({
+          config: "1",
+          runtime: 2,
+          localModels: 3,
+          tool: 4,
+          total: 10,
+        }),
+      );
+    });
+    const info = vi.spyOn(silentLog, "info");
+    await f.host.start();
+    await waitForInstaller(() => expect(f.module.status().phase).toBe("ready"));
+    expect(info).not.toHaveBeenCalledWith(
+      "local_server.installer_runtime_timings",
+      expect.anything(),
+    );
+    info.mockRestore();
+    await f.host.stop("quit");
+  });
+
   it("follows the origin the installer moved the services to", async () => {
     const f = fixture({}, enrolled, (home) => {
       record(home);
@@ -2606,6 +3592,74 @@ describe("LocalServerModule after a restart", () => {
     expect(f.module.status()).toMatchObject({
       origin: "http://localhost:3001",
     });
+    await f.host.stop("quit");
+  });
+
+  it("syncs the local Runner Gateway URL when node-services moved to a new port on resume", async () => {
+    const writeDesktopInstance = (
+      home: string,
+      webPort: number,
+      nodeServicesPort: number,
+    ) => {
+      const instanceRoot = path.join(home, "instances", LOCAL_INSTANCE);
+      mkdirSync(instanceRoot, { recursive: true, mode: 0o700 });
+      chmodSync(instanceRoot, 0o700);
+      const file = path.join(instanceRoot, "instance.json");
+      writeFileSync(
+        file,
+        JSON.stringify({
+          schemaVersion: 1,
+          name: LOCAL_INSTANCE,
+          mode: "source-native",
+          root: instanceRoot,
+          project: composeProject(instanceRoot, LOCAL_INSTANCE),
+          origin: `http://localhost:${webPort}`,
+          port: webPort,
+          releaseDir: "/source",
+          computerConfig: path.join(instanceRoot, "computer", "config.json"),
+          computerExecutable: "/source/computer/linger-computer",
+          source: {
+            repo: "/source",
+            ports: {
+              web: webPort,
+              teamhub: 59891,
+              nodeServices: nodeServicesPort,
+              document: 59903,
+              postgres: 62622,
+            },
+          },
+        }),
+        { mode: 0o600 },
+      );
+      chmodSync(file, 0o600);
+    };
+    const f = fixture({}, enrolled, (home) => {
+      record(home);
+      writeDesktopInstance(home, 3000, 59894);
+    });
+    await f.host.start();
+    await waitForInstaller(() => expect(f.module.status().phase).toBe("ready"));
+    expect(f.syncLocalGatewayUrl).toHaveBeenCalledWith(
+      "ws://127.0.0.1:59894/v1/runner-gateway",
+    );
+    await f.host.stop("quit");
+  });
+
+  it("reports ownsWindow true before resume finishes and false for a remote server", async () => {
+    const f = fixture({}, enrolled, (home) => {
+      record(home);
+      writeFileSync(path.join(home, "resume-fails"), "");
+    });
+    await f.host.start();
+    // Even while resume fails/prepares and servesWindow() is false, ownsWindow()
+    // identifies this window as pointing at the installed local server.
+    await waitForInstaller(() =>
+      expect(f.module.status().phase).toBe("failed"),
+    );
+    expect(await f.module.servesWindow()).toBe(false);
+    expect(await f.module.ownsWindow()).toBe(true);
+    f.host.ctx.config.update({ serverUrl: "https://remote.example.com" });
+    expect(await f.module.ownsWindow()).toBe(false);
     await f.host.stop("quit");
   });
 
@@ -2847,6 +3901,33 @@ describe("LocalServerModule after a restart", () => {
     await f.host.stop("quit");
   });
 
+  it("keeps an older source folder a running process still starts from", async () => {
+    const root = tempDirectory();
+    const archive = sourceArchive(root);
+    const f = installedBy(archive);
+    const sources = path.join(f.home, "desktop", "source");
+    const previous = path.join(sources, "previous");
+    // A service the move did not reach still runs from the older folder.
+    const service = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", path.join(previous, "server.mjs")],
+      { stdio: "ignore" },
+    );
+    try {
+      await new Promise((resolve) => service.once("spawn", resolve));
+      await f.host.start();
+      await waitForInstaller(() =>
+        expect(f.module.status().phase).toBe("ready"),
+      );
+      expect(readdirSync(sources).sort()).toEqual(
+        [archive.sha256.slice(0, 16), "previous"].sort(),
+      );
+      await f.host.stop("quit");
+    } finally {
+      service.kill("SIGKILL");
+    }
+  });
+
   it("shows the start failure when moving to the newer source package fails", async () => {
     const root = tempDirectory();
     const archive = sourceArchive(root);
@@ -3076,6 +4157,152 @@ describe("LocalServerModule after a restart", () => {
     expect(f.showStartFailed).toHaveBeenCalledWith(
       "The local model's Pi can't load extensions, which every Linger run needs. The upstream tool could not verify the local stack binding. Try Again to apply the approved local model plan again, or Set Up Again to review a new plan or choose another AI runtime.",
     );
+    await f.host.stop("quit");
+  });
+
+  it.each([
+    "STACK_REPLAN_FAILED",
+    "STACK_PLAN_CHANGED",
+    "STACK_APPROVAL_MISMATCH",
+    "STACK_PLAN_INVALID",
+  ])(
+    "guides to Set Up Again when an upgraded client cannot re-apply the saved plan (%s)",
+    async (causeCode) => {
+      const root = tempDirectory();
+      const archive = sourceArchive(root);
+      const f = installedBy(archive);
+      const previous = path.join(f.home, "desktop", "source", "previous");
+      writeFileSync(
+        path.join(f.home, "resume-fails"),
+        JSON.stringify({
+          message:
+            "Local model installation or verification did not finish: The saved local model plan no longer fits this computer's current memory or model catalog. Existing resources were preserved.",
+          details: {
+            code: "LOCAL_MODELS_RECOVERY_REQUIRED",
+            causeCode,
+            reasons: ["deployment-unavailable"],
+          },
+        }),
+      );
+      await f.host.start();
+      await vi.waitFor(() => expect(f.module.status().phase).toBe("failed"));
+      expect(f.showStartFailed).toHaveBeenCalledWith(
+        "The local model service isn't running. Local model installation or verification did not finish: The saved local model plan no longer fits this computer's current memory or model catalog. Existing resources were preserved. Set Up Again to review a new plan or choose another AI runtime.",
+      );
+      // The older source record stays in place until the upgrade succeeds.
+      expect(
+        JSON.parse(
+          readFileSync(
+            path.join(f.home, "desktop", "local-server.json"),
+            "utf8",
+          ),
+        ),
+      ).toMatchObject({ repo: previous });
+      await f.host.stop("quit");
+    },
+  );
+
+  it("still offers Try Again when a local model resume failure is transient (STACK_APPLY_LOCKED)", async () => {
+    const f = fixture({}, enrolled, (home) => {
+      record(home);
+      writeFileSync(
+        path.join(home, "resume-fails"),
+        JSON.stringify({
+          message:
+            "Local model installation or verification did not finish: Another local model operation is already running. Existing resources were preserved.",
+          details: {
+            code: "LOCAL_MODELS_RECOVERY_REQUIRED",
+            causeCode: "STACK_APPLY_LOCKED",
+            reasons: ["deployment-unavailable"],
+          },
+        }),
+      );
+    });
+    await f.host.start();
+    await vi.waitFor(() => expect(f.module.status().phase).toBe("failed"));
+    expect(f.showStartFailed).toHaveBeenCalledWith(
+      "The local model service isn't running. Local model installation or verification did not finish: Another local model operation is already running. Existing resources were preserved. Try Again to apply the approved local model plan again, or Set Up Again to review a new plan or choose another AI runtime.",
+    );
+    await f.host.stop("quit");
+  });
+
+  it("recovers from an upgrade replan failure through Set Up Again by replanning automatically", async () => {
+    const root = tempDirectory();
+    const archive = sourceArchive(root);
+    const api = installerApi([], {
+      state: "waiting_user",
+      errorCode: "LOCAL_MODELS_RECOVERY_REQUIRED",
+      message: "The saved local model plan no longer fits.",
+    });
+    api.runtime.setupChoice = "local-models";
+    const f = fixture(
+      {
+        sourceArchive: {
+          url: "https://cdn.example/linger.tar.gz",
+          sha256: archive.sha256,
+        },
+        fetch: (async (url: string | URL | Request) => {
+          if (String(url).startsWith("https://cdn.example/"))
+            return new Response(archive.bytes);
+          return new Response(null, { status: 200 });
+        }) as typeof fetch,
+      },
+      enrolled,
+      (home) => {
+        const sources = path.join(home, "desktop", "source");
+        unpackedSource(path.join(sources, "previous"));
+        writeFileSync(
+          path.join(home, "desktop", "local-server.json"),
+          JSON.stringify({
+            home,
+            repo: path.join(sources, "previous"),
+            origin: "http://localhost:3000",
+            version: "0.1.4",
+          }),
+        );
+        writeFileSync(
+          path.join(home, "resume-fails"),
+          JSON.stringify({
+            message:
+              "Local model installation or verification did not finish: The saved local model plan no longer fits this computer's current memory or model catalog. Existing resources were preserved.",
+            details: {
+              code: "LOCAL_MODELS_RECOVERY_REQUIRED",
+              causeCode: "STACK_REPLAN_FAILED",
+              reasons: ["deployment-unavailable"],
+            },
+          }),
+        );
+      },
+      api,
+    );
+    await f.host.start();
+    await vi.waitFor(() => expect(f.module.status().phase).toBe("failed"));
+    expect(f.showStartFailed).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Set Up Again to review a new plan or choose another AI runtime.",
+      ),
+    );
+    // Set Up Again forgets the stale local-server record and opens setup.
+    const opened = vi.fn();
+    f.bus.on("setup.open", opened);
+    f.bus.emit("local-server.reset");
+    await vi.waitFor(() => expect(opened).toHaveBeenCalledOnce());
+    expect(existsSync(path.join(f.home, "desktop", "local-server.json"))).toBe(
+      false,
+    );
+    // Re-installing with local models replans automatically and finishes on
+    // the upgraded client's source package.
+    await f.module.begin({ runtime: "local" });
+    expect(f.api.retried).toEqual([{ localModelsReplan: true }]);
+    expect(f.module.status().phase).toBe("ready");
+    expect(
+      JSON.parse(
+        readFileSync(path.join(f.home, "desktop", "local-server.json"), "utf8"),
+      ),
+    ).toMatchObject({
+      repo: path.join(f.home, "desktop", "source", archive.sha256.slice(0, 16)),
+      version: APP_VERSION,
+    });
     await f.host.stop("quit");
   });
 
@@ -3986,6 +5213,7 @@ describe("LocalServerModule on Windows", () => {
     const f = fixture(
       {
         platform: "win32",
+        checkPrivateLocation: async () => {},
         sourceArchive: { file, sha256: archive.sha256 },
         rename: async (from, to) => {
           moves.push(path.basename(to));
@@ -4037,6 +5265,7 @@ describe("LocalServerModule on Windows", () => {
     const f = fixture(
       {
         platform: "win32",
+        checkPrivateLocation: async () => {},
         sourceArchive: { file, sha256: archive.sha256 },
         rename: async () => {
           moves++;
@@ -4407,13 +5636,22 @@ it("allows a slow installer runtime lookup and keeps the login deadline", async 
     controller.abort(new Error("Desktop stopped"));
     expect(await cancelled).toBe(controller.signal.reason);
 
-    responseMs = 181_000;
+    // A lookup that keeps running is waited for, well past the 180 s the
+    // desktop once allowed it.
+    responseMs = 9 * 60_000;
+    const slow = api.runtime(new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    await expect(slow).resolves.toEqual(runtime);
+
+    responseMs = RUNTIME_LOOKUP_LIMIT_MS + 1;
     const overdue = api
       .runtime(new AbortController().signal)
       .catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(180_000);
+    await vi.advanceTimersByTimeAsync(RUNTIME_LOOKUP_LIMIT_MS);
     expect(await overdue).toMatchObject({
-      message: "The installer timed out while reading the selected runtime.",
+      code: "runtime_lookup_timed_out",
+      message:
+        "Checking the AI runtime on this computer did not finish in time.",
     });
   } finally {
     timeout.mockRestore();
@@ -4497,6 +5735,51 @@ describe("InstallerApi polling", () => {
     expect(warnings).toEqual([
       { stage: "poll_job", job_id: "job", code: "ECONNRESET", attempt: 1 },
     ]);
+  });
+
+  it("asks for the runtime again after a dropped connection or fetch's own wait", async () => {
+    warnings.length = 0;
+    const runtime = { setupChoice: "pi", environment: {} };
+    const failures = [
+      reset(),
+      new TypeError("fetch failed", {
+        cause: Object.assign(new Error("Headers Timeout Error"), {
+          code: "UND_ERR_HEADERS_TIMEOUT",
+        }),
+      }),
+    ];
+    let asked = 0;
+    const fetcher = (async (input: URL) => {
+      if (input.pathname === "/api/session")
+        return new Response("{}", {
+          headers: { "set-cookie": "linger_installer_session=s1; Path=/api" },
+        });
+      asked++;
+      const failure = failures.shift();
+      if (failure) throw failure;
+      return Response.json(runtime);
+    }) as unknown as typeof fetch;
+    await expect(
+      (await open(fetcher)).runtime(new AbortController().signal),
+    ).resolves.toEqual(runtime);
+    expect(asked).toBe(3);
+    expect(warnings).toEqual([
+      { stage: "runtime", code: "ECONNRESET", attempt: 1 },
+      { stage: "runtime", code: "UND_ERR_HEADERS_TIMEOUT", attempt: 2 },
+    ]);
+  });
+
+  it("names a runtime lookup the installer stopped answering", async () => {
+    const fetcher = (async (input: URL) => {
+      if (input.pathname === "/api/session")
+        return new Response("{}", {
+          headers: { "set-cookie": "linger_installer_session=s1; Path=/api" },
+        });
+      throw reset();
+    }) as unknown as typeof fetch;
+    await expect(
+      (await open(fetcher, 30)).runtime(new AbortController().signal),
+    ).rejects.toMatchObject({ code: "runtime_lookup_unreachable" });
   });
 
   it("gives up once the installer stays unreachable", async () => {

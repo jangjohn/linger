@@ -322,6 +322,10 @@ var teamhubPhrases = map[string]string{
 	"apps auto-reminders list": "Checking reminders",
 	"apps auto-reminders set":  "Setting reminders",
 	"knowledge search":         "Searching knowledge",
+	"web search":               "Searching the web",
+	"web open":                 "Reading a page",
+	"web list":                 "Checking web search",
+	"web connect":              "Asking for a search key",
 	"knowledge read":           "Reading knowledge",
 	"tracking-items list":      "Checking tracking items",
 	"tracking-items add":       "Adding a tracking item",
@@ -347,7 +351,7 @@ var teamhubPhrases = map[string]string{
 
 // connectorApps are the Connectors the TeamHub CLI exposes as commands.
 var connectorApps = map[string]string{
-	"figma": "Figma", "gcal": "Calendar", "gdrive": "Google Drive", "github": "GitHub", "gmail": "Gmail",
+	"feishu-mail": "Feishu Mail", "figma": "Figma", "gcal": "Calendar", "gdrive": "Google Drive", "github": "GitHub", "gmail": "Gmail",
 	"notion": "Notion", "outlook": "Outlook", "slack": "Slack",
 }
 
@@ -380,7 +384,7 @@ func teamhubStep(args []string) step {
 		kind = native.ActivityMessageRead
 	case slices.Contains(path, "search"):
 		kind = native.ActivitySearch
-	case is("knowledge", "wiki", "read"), is("knowledge", "raw", "read"), is("docs", "get"), is("docs", "comment", "get"), is("docs", "image", "get"):
+	case is("knowledge", "wiki", "read"), is("knowledge", "raw", "read"), is("docs", "get"), is("docs", "comment", "get"), is("docs", "image", "get"), is("web", "open"):
 		kind = native.ActivityRead
 	case is("docs", "create"), is("docs", "update"), is("docs", "replace"), is("docs", "comment", "reply"), is("docs", "comment", "replace"), is("docs", "image", "put"):
 		kind = native.ActivityFileChange

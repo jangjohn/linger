@@ -41,11 +41,15 @@ import {
 } from "@/features/rooms/room-surface";
 import { routeLayoutKey } from "@/features/rooms/route-layout-key";
 import { RoomChatLoading } from "@/features/rooms/route-loading-surface";
+import { shellExtrasMessages } from "@/features/rooms/shell-extras.messages";
 import {
   TeamHubError,
   type TeamHubClient,
 } from "@/features/teamhub/teamhub-client";
 import type { TeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
 import {
   tenantWorkItemTargetQueryOptions,
   tenantWorkItemsDashboardQueryOptions,
@@ -55,6 +59,7 @@ import {
   FullPageRouteErrorSurface,
   PanelRouteErrorSurface,
 } from "./route-error-surfaces";
+import { routePagesMessages } from "./route-pages.messages";
 
 export function createAppRoutes(
   queryClient: QueryClient,
@@ -85,7 +90,7 @@ export function createAppRoutes(
           const targetTenant = tenants.items[0];
 
           if (!targetTenant) {
-            throw new Error("This Account has no Space.");
+            throw new Error(translate(shellExtrasMessages.noSpace));
           }
 
           if (!request.signal.aborted) {
@@ -756,6 +761,14 @@ function createSettingsRoute(): RouteObject {
         }),
         path: "models",
       },
+      {
+        lazy: async () => ({
+          Component: (
+            await import("@/features/settings/language-settings-page")
+          ).LanguageSettingsPage,
+        }),
+        path: "language",
+      },
       { loader: openModels, path: "local-models" },
       { loader: openProfile, path: "administration" },
     ],
@@ -771,14 +784,15 @@ function createSettingsRoute(): RouteObject {
 }
 
 export function InitialAppLoading() {
+  const t = useT();
   return (
     <main
       aria-busy="true"
-      aria-label="Loading TeamHub"
+      aria-label={t(commonMessages.loadingApp)}
       className="flex min-h-dvh items-center justify-center gap-2 bg-app-canvas text-sm text-app-muted"
     >
       <Spinner />
-      Loading Room...
+      {t(commonMessages.loadingRoom)}
     </main>
   );
 }
@@ -795,6 +809,7 @@ function redirectAuthenticationError(
 }
 
 function NotFoundRoute({ inShell = false }: { inShell?: boolean }) {
+  const t = useT();
   const navigate = useNavigate();
   const { tenantId } = useParams();
 
@@ -802,13 +817,13 @@ function NotFoundRoute({ inShell = false }: { inShell?: boolean }) {
     <main
       className={`flex flex-col items-center justify-center gap-4 bg-app-canvas px-8 text-center text-app-ink ${inShell ? "h-full min-h-0 flex-1" : "min-h-dvh"}`}
     >
-      <h1 className="text-lg">Page not found</h1>
+      <h1 className="text-lg">{t(routePagesMessages.notFoundTitle)}</h1>
       <Button
         onClick={() => {
           void navigate(tenantId ? `/t/${tenantId}/rooms` : "/");
         }}
       >
-        Open Messages
+        {t(routePagesMessages.openMessages)}
       </Button>
     </main>
   );

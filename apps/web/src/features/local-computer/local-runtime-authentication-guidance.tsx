@@ -1,35 +1,47 @@
 import type { TeamHubLocalRuntimeType } from "@/features/teamhub/teamhub-types";
+import { RichMessage, useT } from "@/i18n/use-translation";
 
 import { appNames } from "./computer-readiness";
-import { loginCommands } from "./local-runtime-commands";
+import { computerSetupMessages } from "./computer-setup.messages";
+import { useDesktopComputer } from "./desktop-computer";
+import { type SignInComputer, signInCommand } from "./local-runtime-commands";
 
 export function LocalRuntimeAuthenticationGuidance({
   runtimeType,
   computerName,
+  computer,
 }: {
   runtimeType: TeamHubLocalRuntimeType;
   computerName: string;
+  computer?: SignInComputer;
 }) {
-  const name = appNames[runtimeType];
-  const command = loginCommands[runtimeType];
+  const t = useT();
+  const desktop = useDesktopComputer();
+  const app = appNames[runtimeType];
   return (
     <>
-      <p className="font-medium">{name} sign-in required</p>
+      <p className="font-medium">
+        {t(computerSetupMessages.signInRequired, { app })}
+      </p>
       <p className="mt-1 text-muted-foreground">
-        Run <code className="font-mono">{command}</code> or update the
-        configured {name} credentials on {computerName}, using the same OS user
-        that runs Local Computer.
+        <RichMessage
+          message={computerSetupMessages.signInGuidance}
+          tags={{ code: (text) => <code className="font-mono">{text}</code> }}
+          values={{
+            app,
+            command: signInCommand(runtimeType, computer, desktop),
+            computer: computerName,
+          }}
+        />
       </p>
       {runtimeType === "pi" && (
         <p className="mt-1 text-muted-foreground">
-          In Pi, enter /login to sign in, or configure an API key in Pi
-          auth.json.
+          {t(computerSetupMessages.piSignIn)}
         </p>
       )}
       {runtimeType === "antigravity" && (
         <p className="mt-1 text-muted-foreground">
-          Antigravity can also use a Gemini API key set as GEMINI_API_KEY for
-          Local Computer.
+          {t(computerSetupMessages.antigravitySignIn)}
         </p>
       )}
     </>

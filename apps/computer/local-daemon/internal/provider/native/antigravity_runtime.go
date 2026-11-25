@@ -23,6 +23,17 @@ const (
 	antigravityEventBuffer  = 256
 )
 
+// antigravityQuietWindow is how long a session with no open tool call must
+// stay silent before a background continuation counts as finished.
+// Antigravity starts the continuation about four seconds after the command
+// finishes. Tests lower it.
+var antigravityQuietWindow = 15 * time.Second
+
+// antigravityBackgroundLimit bounds that wait, since a production Run has no
+// budget and a background command, such as a server, may never finish.
+// Tests lower it.
+var antigravityBackgroundLimit = 30 * time.Minute
+
 // antigravityRuntime runs each Operation in its own `agy acp` process. The
 // conversation lives in Antigravity's own store and is reopened by id with
 // session/load, so no process is parked between turns.
@@ -110,6 +121,8 @@ type antigravityTurn struct {
 	textID          string
 	output          strings.Builder
 	tools           map[string]bool
+	// lastUpdate is when the prompted session last reported anything.
+	lastUpdate time.Time
 }
 
 func (t *antigravityTurn) emit(event Event) {
@@ -163,45 +176,61 @@ func (t *antigravityTurn) exchange(prompt string, servers []any) Outcome {
 	failed := func(code, message string) Outcome {
 		return Outcome{Status: statusFailed, FailureCode: code, Error: message, ElapsedMs: time.Since(started).Milliseconds()}
 	}
+	// A resumed session is known before agy loads it, which takes seconds,
+	// so the Run starts now; a new session reports its id once agy names it.
+	resumed := spec.ResumeID != ""
+	startedEarly := resumed && spec.ExposeTurnStarted
+	if startedEarly {
+		t.started(spec.ResumeID, started)
+	}
 	if err := acpInitialize(t.runCtx, conn); err != nil {
 		return failed("protocol_incompatible", "Antigravity ACP handshake failed: "+err.Error())
 	}
 	params := map[string]any{"cwd": spec.Dir, "mcpServers": servers}
-	if spec.AppendPrompt != "" {
-		params["_meta"] = map[string]any{"antigravity": map[string]any{"systemPrompt": map[string]any{"append": spec.AppendPrompt}}}
+	if spec.SystemPrompt != "" {
+		params["_meta"] = map[string]any{"antigravity": map[string]any{"systemPrompt": map[string]any{"append": spec.SystemPrompt}}}
 	}
 	// Antigravity names a new session itself. session/load reopens a stored
 	// one and replays it as updates, which the turn drops until its own
 	// prompt is sent.
 	method := "session/new"
-	if spec.ResumeID != "" {
+	if resumed {
 		method, params["sessionId"] = "session/load", spec.ResumeID
 	}
-	raw, err := acpOpenSession(t.runCtx, conn, t.profile.Env, func() (json.RawMessage, error) {
-		return conn.call(t.runCtx, method, params)
-	})
+	open := func() (json.RawMessage, error) {
+		return acpOpenSession(t.runCtx, conn, t.profile.Env, func() (json.RawMessage, error) {
+			return conn.call(t.runCtx, method, params)
+		})
+	}
+	raw, err := open()
 	if acpNeedsAuth(err) {
 		return failed("authentication_required", "Antigravity sign-in is required")
 	}
+	refusal := ""
 	var refused *acpError
-	if spec.ResumeID != "" && errors.As(err, &refused) {
-		return t.resumeRefused(failed("session_not_found", "Antigravity could not load session "+spec.ResumeID+": "+err.Error()))
-	}
-	if err != nil {
+	switch {
+	case resumed && errors.As(err, &refused):
+		refusal = "Antigravity could not load session " + spec.ResumeID + ": " + err.Error()
+	case err != nil:
 		return failed("", "Antigravity "+method+" failed: "+err.Error())
+	case resumed:
+		t.mu.Lock()
+		replayed := t.replayedPrompts
+		t.mu.Unlock()
+		// session/load accepts an id Antigravity never stored and only the
+		// prompt fails. A stored session holds at least the prompt of the
+		// turn that made it, so a load that replays no prompt found no
+		// session.
+		if replayed == 0 {
+			refusal = "Antigravity has no stored session " + spec.ResumeID
+		}
 	}
-	t.mu.Lock()
-	replayed := t.replayedPrompts
-	t.mu.Unlock()
-	// session/load accepts an id Antigravity never stored and only the
-	// prompt fails. A stored session holds at least the prompt of the turn
-	// that made it, so a load that replays no prompt found no session.
-	if spec.ResumeID != "" && replayed == 0 {
-		return t.resumeRefused(failed("session_not_found", "Antigravity has no stored session "+spec.ResumeID))
+	if refusal != "" {
+		return t.resumeRefused(failed("session_not_found", refusal))
 	}
 	var session acpSession
 	if json.Unmarshal(raw, &session) != nil || session.SessionID == "" {
-		if spec.ResumeID == "" {
+		if !resumed {
 			return failed("", "Antigravity "+method+" returned no session")
 		}
 		session.SessionID = spec.ResumeID
@@ -224,11 +253,8 @@ func (t *antigravityTurn) exchange(prompt string, servers []any) Outcome {
 	t.mu.Unlock()
 	dispatched := time.Now()
 	t.requests.begin("", dispatched)
-	if spec.ExposeTurnStarted {
-		// The turn-started status carries the session, which is the
-		// checkpoint a first Run reports for its new session.
-		reused := false
-		t.emit(Event{Kind: EventStatus, Status: "running", TurnID: "antigravity-turn-" + piRandomHex(12), SessionID: session.SessionID, ProcessReused: &reused, SentAt: dispatched})
+	if !startedEarly {
+		t.started(session.SessionID, dispatched)
 	}
 	raw, err = conn.call(t.runCtx, "session/prompt", map[string]any{
 		"sessionId": session.SessionID,
@@ -248,9 +274,19 @@ func (t *antigravityTurn) exchange(prompt string, servers []any) Outcome {
 		Usage      *antigravityTokens `json:"usage"`
 	}
 	_ = json.Unmarshal(raw, &result)
+	if result.StopReason == "end_turn" {
+		switch err := t.awaitBackground(); {
+		case errors.Is(err, errACPClosed):
+			return failed("", "Antigravity exited before the turn finished")
+		case err != nil:
+			_, _ = t.cancelPrompt(session.SessionID)
+			result.StopReason = "cancelled"
+		}
+	}
 	outcome := Outcome{ElapsedMs: time.Since(started).Milliseconds()}
 	t.mu.Lock()
-	outcome.Output = strings.TrimSpace(t.output.String())
+	// Untrimmed, as the reply Agent Service reads from the stream.
+	outcome.Output = t.output.String()
 	t.mu.Unlock()
 	if result.Usage != nil {
 		model := spec.Model
@@ -272,6 +308,54 @@ func (t *antigravityTurn) exchange(prompt string, servers []any) Outcome {
 		outcome.Status, outcome.Error = statusFailed, "Antigravity stopped the turn: "+result.StopReason
 	}
 	return outcome
+}
+
+// awaitBackground holds a turn that ended while a tool call still runs.
+// Antigravity moves a long command to the background, ends the turn, and
+// continues on its own once the command finishes; the process stops when the
+// Run ends, so the Run waits for every open tool call and then for the
+// session to go quiet. It returns errACPClosed when Antigravity exits first
+// and the run context's error when the Run is cancelled first. After
+// antigravityBackgroundLimit the turn ends as it is, like a command that
+// never reports a terminal status.
+func (t *antigravityTurn) awaitBackground() error {
+	t.mu.Lock()
+	open := len(t.tools) > 0
+	if open {
+		// The continuation's text is a new message.
+		t.textID = ""
+	}
+	t.mu.Unlock()
+	if !open {
+		return nil
+	}
+	if t.profile.Logger != nil {
+		t.profile.Logger.Info("runtime.turn.background_wait", "provider", "antigravity")
+	}
+	limit := time.NewTimer(antigravityBackgroundLimit)
+	defer limit.Stop()
+	tick := time.NewTicker(antigravityQuietWindow / 30)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.runCtx.Done():
+			return t.runCtx.Err()
+		case <-t.proc.conn.closed:
+			return errACPClosed
+		case <-limit.C:
+			if t.profile.Logger != nil {
+				t.profile.Logger.Warn("runtime.turn.background_limit", "provider", "antigravity")
+			}
+			return nil
+		case <-tick.C:
+		}
+		t.mu.Lock()
+		settled := len(t.tools) == 0 && time.Since(t.lastUpdate) >= antigravityQuietWindow
+		t.mu.Unlock()
+		if settled {
+			return nil
+		}
+	}
 }
 
 // cancelPrompt asks Antigravity to end the running prompt. The process is
@@ -333,6 +417,7 @@ func (t *antigravityTurn) handle(frame acpFrame) {
 type acpUpdate struct {
 	SessionUpdate string          `json:"sessionUpdate"`
 	Content       json.RawMessage `json:"content"`
+	Name          string          `json:"name"`
 	MessageID     string          `json:"messageId"`
 	ToolCallID    string          `json:"toolCallId"`
 	Title         string          `json:"title"`
@@ -346,8 +431,18 @@ type acpUpdate struct {
 	} `json:"entries"`
 }
 
+// started reports the turn-started status, which carries the session: the
+// checkpoint a first Run reports for its new session.
+func (t *antigravityTurn) started(sessionID string, at time.Time) {
+	if !t.spec.ExposeTurnStarted {
+		return
+	}
+	reused := false
+	t.emit(Event{Kind: EventStatus, Status: "running", TurnID: "antigravity-turn-" + piRandomHex(12), SessionID: sessionID, ProcessReused: &reused, SentAt: at})
+}
+
 // resumeRefused marks an outcome whose retained session Antigravity does
-// not hold; nothing was emitted, so the executor may start a fresh session.
+// not hold.
 func (t *antigravityTurn) resumeRefused(outcome Outcome) Outcome {
 	outcome.ResumeRefused = true
 	return outcome
@@ -366,6 +461,9 @@ func (t *antigravityTurn) update(params json.RawMessage, observed time.Time) {
 	if !prompting && update.SessionUpdate == "user_message_chunk" {
 		t.replayedPrompts++
 	}
+	if prompting {
+		t.lastUpdate = observed
+	}
 	t.mu.Unlock()
 	if !prompting {
 		return
@@ -379,7 +477,10 @@ func (t *antigravityTurn) update(params json.RawMessage, observed time.Time) {
 		t.requests.item("", observed)
 		t.mu.Lock()
 		if t.textID == "" {
+			// The reply is the last message, as Agent Service reads the
+			// stream, so a new message replaces the output.
 			t.textID = "antigravity-text-" + piRandomHex(12)
+			t.output.Reset()
 		}
 		id := t.textID
 		t.output.WriteString(text)
@@ -391,10 +492,9 @@ func (t *antigravityTurn) update(params json.RawMessage, observed time.Time) {
 			t.emit(Event{Kind: EventReasoning, ObservedAt: observed, ModelMessageID: update.MessageID, Body: text})
 		}
 	case "tool_call":
-		// Text after a tool call is a new message; the reply is the last one.
+		// Text after a tool call is a new message.
 		t.mu.Lock()
 		t.textID = ""
-		t.output.Reset()
 		t.tools[update.ToolCallID] = true
 		t.mu.Unlock()
 		t.emit(Event{
@@ -504,29 +604,41 @@ func (t *antigravityTurn) permission(frame acpFrame) {
 	_ = t.proc.conn.respond(frame.ID, map[string]any{"outcome": map[string]any{"outcome": "cancelled"}})
 }
 
-// antigravityReview builds the permission review of one tool call. A
-// command is reviewed as a shell command so the shared shell rules apply.
+// antigravityReview builds the permission review of one tool call.
 func antigravityReview(call acpUpdate, workspace string) permission.Request {
-	input := antigravityInput(call.RawInput)
+	return toolReview("antigravity", antigravityToolName(call), call.Kind == "execute", antigravityInput(call.RawInput), workspace)
+}
+
+// toolReview builds the permission review of one call of a Runtime that
+// hands the Daemon its tool calls. A command call is reviewed as a shell
+// command, from its input's "command", so the shared shell rules apply.
+func toolReview(runtime, tool string, isCommand bool, input map[string]any, workspace string) permission.Request {
+	if input == nil {
+		input = map[string]any{}
+	}
 	encoded, _ := json.Marshal(input)
-	tool := antigravityToolName(call)
 	command := ""
-	if call.Kind == "execute" {
+	if isCommand {
 		command, _ = input["command"].(string)
 		tool = "Bash"
 	}
 	request := permission.Request{Action: permission.Action{
-		Runtime: "antigravity", Surface: permission.Surface(tool, command), Tool: tool,
+		Runtime: runtime, Surface: permission.Surface(tool, command), Tool: tool,
 		Command: command, Input: string(encoded),
 	}}
-	if tool == "Bash" {
+	if isCommand {
 		request.Evidence = permission.ScriptEvidence(command, workspace)
 	}
 	return request
 }
 
-// antigravityToolName is the tool's own title, or its kind without one.
+// antigravityToolName is the tool's own name, such as run_command. The
+// title is a fallback only: Antigravity titles a command with its whole,
+// unredacted command line, which the call's input already carries.
 func antigravityToolName(update acpUpdate) string {
+	if update.Name != "" {
+		return update.Name
+	}
 	if update.Title != "" {
 		return update.Title
 	}

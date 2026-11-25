@@ -24,6 +24,9 @@ import type {
   TeamHubMessageFileSegment,
   TeamHubRoom,
 } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
 
 import { AgentAvatarStatusContext } from "../members/agent-avatar-status-context";
 
@@ -38,6 +41,7 @@ import {
   createDirectRoomMessagePresenter,
   withDirectRoomWireBody,
 } from "./direct-room-message";
+import { chatMessages } from "./chat.messages";
 import { isTimelineMessage } from "./message-grouping";
 import {
   MessageRow,
@@ -50,7 +54,6 @@ import {
   createRoomProjection,
   replaceLoadedRoomMessage,
 } from "./room-projection";
-import { SharedStreamingStatus } from "./shared-streaming-status";
 import { useRoomChatNavigation } from "./use-room-chat-navigation";
 import {
   orderRoomMessages,
@@ -106,6 +109,7 @@ function ThreadPanelContent({
   rootMessage,
   tenantId,
 }: ThreadPanelProps) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const composition = roomMessageSender(client);
   const parentRoomId = rootMessage.room_id;
@@ -319,11 +323,11 @@ function ThreadPanelContent({
 
   return (
     <aside
-      aria-label="Message Thread"
+      aria-label={t(chatMessages.messageThread)}
       className="flex h-full min-h-0 w-full min-w-0 flex-1 flex-col app-work-surface"
     >
       <h2 className="sr-only" ref={headingRef} tabIndex={-1}>
-        Thread
+        {t(chatMessages.thread)}
       </h2>
       <ThreadTimeline
         agentWorking={conversation.streamingRunStatuses.some(isRunWorking)}
@@ -340,7 +344,8 @@ function ThreadPanelContent({
         <ThreadPendingReplies
           actorId={currentActorId}
           actorName={
-            rowContext.actorDisplayNames[currentActorId ?? ""] ?? "You"
+            rowContext.actorDisplayNames[currentActorId ?? ""] ??
+            t(commonMessages.you)
           }
           lastAuthorId={replies.at(-1)?.author.id}
           messages={conversation.pendingMessages}
@@ -355,8 +360,9 @@ function ThreadPanelContent({
         parentRoom={parentRoom.data}
       >
         <MessageComposer
-          ariaLabel="Reply in Thread"
+          ariaLabel={t(chatMessages.replyInThread)}
           disabled={!threadRoomId}
+          historyScope={draftScope}
           initialMentions={initialDraft.mentions}
           initialValue={initialDraft.body}
           mentionOptions={mentionOptions}
@@ -365,7 +371,9 @@ function ThreadPanelContent({
           }
           onSend={sendReply}
           placeholder={
-            threadRoomId ? "Reply in this Thread" : "Opening Thread…"
+            threadRoomId
+              ? t(chatMessages.replyInThisThread)
+              : t(chatMessages.openingThread)
           }
           ref={composerRef}
         />
@@ -395,9 +403,7 @@ function ThreadReplyDock({
           {outboxError}
         </p>
       ) : null}
-      <SharedStreamingStatus surface="thread">
-        {dock ? <AgentStreamingStatusDock {...dock} /> : null}
-      </SharedStreamingStatus>
+      {dock ? <AgentStreamingStatusDock {...dock} /> : null}
       {children}
     </div>
   );
@@ -492,7 +498,8 @@ function useThreadCardDecision(
   );
 
   return async (decision: RoomCardDecision) => {
-    if (!controller) throw new Error("Thread is still opening.");
+    if (!controller)
+      throw new Error(translate(chatMessages.threadStillOpening));
     await controller.decide(decision);
   };
 }

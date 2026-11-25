@@ -1,7 +1,11 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 
-import { acceptVoiceWindow, adoptVoiceWindow } from "./voice-window.js";
+import {
+  acceptVoiceWindow,
+  adoptVoiceWindow,
+  voiceWindowPosition,
+} from "./voice-window.js";
 
 // Electron stand-ins: only what the module touches.
 function fakes() {
@@ -154,5 +158,31 @@ describe("acceptVoiceWindow", () => {
     const previous = vi.fn();
     expect(accept(f, previous)).toBeTypeOf("function");
     expect(previous).toHaveBeenCalledOnce();
+  });
+});
+
+describe("voiceWindowPosition", () => {
+  const workArea = { x: 0, y: 25, width: 1470, height: 931 };
+
+  it("opens at the bottom right of the screen", () => {
+    expect(voiceWindowPosition({ width: 320, height: 240 }, workArea)).toEqual({
+      x: 1126,
+      y: 692,
+    });
+  });
+
+  it("keeps a window larger than the screen at its top left", () => {
+    expect(
+      voiceWindowPosition({ width: 2000, height: 1200 }, workArea),
+    ).toEqual({ x: 0, y: 25 });
+  });
+
+  it("follows a screen left of the main one", () => {
+    expect(
+      voiceWindowPosition(
+        { width: 320, height: 240 },
+        { x: -2560, y: -400, width: 2560, height: 1415 },
+      ),
+    ).toEqual({ x: -344, y: 751 });
   });
 });

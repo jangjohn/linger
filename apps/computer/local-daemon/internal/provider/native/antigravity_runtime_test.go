@@ -2,6 +2,7 @@ package native
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -84,7 +85,7 @@ func drainAgy(t *testing.T, run *Run) ([]Event, Outcome) {
 func TestAntigravityRunsOneTurnOverACP(t *testing.T) {
 	h := newAgyHarness(t, "turn", nil)
 	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{
-		Dir: h.dir, Model: "gemini-flash", Effort: "medium", AppendPrompt: "Be brief.",
+		Dir: h.dir, Model: "gemini-flash", Effort: "medium", SystemPrompt: "Be brief.",
 		MCPServers: json.RawMessage(`{"mcpServers":{"teamhub":{"type":"http","url":"http://127.0.0.1:9/mcp","headers":{"Authorization":"Bearer x"}},"local":{"command":"/bin/tool","args":["--stdio"],"env":{"A":"1"}}}}`),
 	})
 	if err != nil {
@@ -112,7 +113,7 @@ func TestAntigravityRunsOneTurnOverACP(t *testing.T) {
 	if !reflect.DeepEqual(kinds, want) {
 		t.Fatalf("kinds=%v", kinds)
 	}
-	if call.ActivityKind != ActivityCommand || call.InvocationID != result.InvocationID || call.Input["command"] != "ls" || result.Output != "a.txt" || result.Status != "completed" {
+	if call.ToolName != "run_command" || call.ActivityKind != ActivityCommand || call.InvocationID != result.InvocationID || call.Input["command"] != "ls" || result.Output != "a.txt" || result.Status != "completed" {
 		t.Fatalf("call=%+v result=%+v", call, result)
 	}
 	if events[1].ID == events[5].ID || events[5].ID != events[6].ID {
@@ -237,8 +238,8 @@ func TestAntigravityReportsAnUnknownRetainedSessionAsNotFound(t *testing.T) {
 			if outcome.Status != statusFailed || outcome.FailureCode != "session_not_found" || !outcome.ResumeRefused || outcome.SessionID != "" {
 				t.Fatalf("outcome=%+v", outcome)
 			}
-			// Nothing reached the Room, so the executor may start afresh.
-			if len(events) != 0 {
+			// The Run started on the retained session before agy refused it.
+			if len(events) != 1 || events[0].Kind != EventStatus || events[0].SessionID != "moved-session" {
 				t.Fatalf("events=%+v", events)
 			}
 			if requests := h.requests(t); len(requests["session/prompt"]) != 0 {
@@ -324,6 +325,120 @@ func TestAntigravityProbeListsModelFamiliesWithTheirLevels(t *testing.T) {
 	}
 }
 
+func TestAntigravityProbeIsolatesStateAndSeedsCredentials(t *testing.T) {
+	metaFile := filepath.Join(t.TempDir(), "probe-meta.json")
+	h := newAgyHarness(t, "token-file", map[string]string{agyFakeMetaEnv: metaFile})
+	userAppData := filepath.Join(h.dir, ".gemini", "antigravity-cli")
+	userConvs := filepath.Join(userAppData, "conversations")
+	if err := os.MkdirAll(userConvs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userAppData, "antigravity-oauth-token"), []byte("oauth-fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userAppData, "settings.json"), []byte(`{"theme":"dark"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userConvs, "real-session.db"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	probe, err := ProbeAntigravity(t.Context(), h.inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.AuthenticationRequired || len(probe.Models.Models) != 2 {
+		t.Fatalf("probe=%+v", probe)
+	}
+
+	rawMeta, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta struct {
+		Args      []string `json:"args"`
+		GeminiDir string   `json:"geminiDir"`
+		LogFile   string   `json:"logFile"`
+		Home      string   `json:"home"`
+		Token     string   `json:"token"`
+		Settings  string   `json:"settings"`
+	}
+	if err := json.Unmarshal(rawMeta, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Home != h.dir {
+		t.Fatalf("HOME was altered: got %q want %q", meta.Home, h.dir)
+	}
+	if !filepath.IsAbs(meta.GeminiDir) || meta.GeminiDir == filepath.Join(h.dir, ".gemini") {
+		t.Fatalf("unexpected geminiDir: %q", meta.GeminiDir)
+	}
+	if !filepath.IsAbs(meta.LogFile) || filepath.Dir(meta.LogFile) != filepath.Dir(meta.GeminiDir) {
+		t.Fatalf("unexpected logFile: %q (geminiDir=%q)", meta.LogFile, meta.GeminiDir)
+	}
+	if meta.Token != "oauth-fixture" || meta.Settings != `{"theme":"dark"}` {
+		t.Fatalf("seeded files mismatch: token=%q settings=%q", meta.Token, meta.Settings)
+	}
+	if _, err := os.Stat(filepath.Dir(meta.GeminiDir)); !os.IsNotExist(err) {
+		t.Fatalf("temporary probe root was not removed: %q (err=%v)", filepath.Dir(meta.GeminiDir), err)
+	}
+
+	entries, err := os.ReadDir(userConvs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "real-session.db" {
+		t.Fatalf("user conversations dir was polluted: %v", entries)
+	}
+	if _, err := os.Stat(filepath.Join(userAppData, "log")); !os.IsNotExist(err) {
+		t.Fatalf("user log dir was created: err=%v", err)
+	}
+	open := h.requests(t)["session/new"][0]["params"].(map[string]any)
+	if open["cwd"] == h.dir {
+		t.Fatalf("probe session/new cwd must be isolated from HOME: %v", open["cwd"])
+	}
+}
+
+func TestAntigravityProbeHandlesMissingUserGeminiDir(t *testing.T) {
+	h := newAgyHarness(t, "token-file", nil)
+	probe, err := ProbeAntigravity(t.Context(), h.inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.AuthenticationRequired {
+		t.Fatalf("expected authentication_required when no token file exists, got %+v", probe)
+	}
+	if _, err := os.Stat(filepath.Join(h.dir, ".gemini")); !os.IsNotExist(err) {
+		t.Fatalf("probe created .gemini under HOME: err=%v", err)
+	}
+}
+
+func TestAntigravityTurnKeepsDefaultGeminiDir(t *testing.T) {
+	metaFile := filepath.Join(t.TempDir(), "turn-meta.json")
+	h := newAgyHarness(t, "turn", map[string]string{agyFakeMetaEnv: metaFile})
+	run, err := h.runtime.Start(t.Context(), "hi", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome := drainAgy(t, run); outcome.Status != statusCompleted {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	rawMeta, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta struct {
+		Args      []string `json:"args"`
+		GeminiDir string   `json:"geminiDir"`
+		LogFile   string   `json:"logFile"`
+	}
+	if err := json.Unmarshal(rawMeta, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(meta.Args, []string{"acp"}) || meta.GeminiDir != "" || meta.LogFile != "" {
+		t.Fatalf("real turns must keep default agy store: %+v", meta)
+	}
+}
+
 func TestAntigravityRefusesWhatItCannotRun(t *testing.T) {
 	h := newAgyHarness(t, "turn", nil)
 	for name, spec := range map[string]RunSpec{
@@ -378,5 +493,91 @@ func TestAntigravityRunCommandMapsToSharedCommandShape(t *testing.T) {
 		if got := antigravityToolStatus(acpUpdate{Status: test.status, RawOutput: json.RawMessage(test.output)}); got != test.want {
 			t.Fatalf("status %s with %s = %s, want %s", test.status, test.output, got, test.want)
 		}
+	}
+}
+
+func TestAntigravityStartsAResumedRunBeforeTheSessionLoads(t *testing.T) {
+	h := newAgyHarness(t, "load-hang", nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	run, err := h.runtime.Start(ctx, "again", RunSpec{Dir: h.dir, ResumeID: "earlier-session", ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case started := <-run.Events:
+		if started.Kind != EventStatus || started.TurnID == "" || started.SessionID != "earlier-session" {
+			t.Fatalf("first event=%+v", started)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Run did not start while its session was loading")
+	}
+	cancel()
+	drainAgy(t, run)
+}
+
+func TestAntigravityReturnsSessionNotFoundWhenResumedSessionIsMissing(t *testing.T) {
+	h := newAgyHarness(t, "unknown-session", nil)
+	run, err := h.runtime.Start(t.Context(), "again", RunSpec{Dir: h.dir, ResumeID: "moved-session", ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, outcome := drainAgy(t, run)
+	if outcome.Status != statusFailed || outcome.FailureCode != "session_not_found" {
+		t.Fatalf("outcome=%+v, want failed session_not_found", outcome)
+	}
+	if requests := h.requests(t); len(requests["session/new"]) != 0 || len(requests["session/prompt"]) != 0 {
+		t.Fatalf("requests=%v, want no silent session/new or session/prompt", requests)
+	}
+}
+
+func TestAntigravityWaitsForACommandItMovedToTheBackground(t *testing.T) {
+	quiet := antigravityQuietWindow
+	antigravityQuietWindow = 300 * time.Millisecond
+	t.Cleanup(func() { antigravityQuietWindow = quiet })
+	h := newAgyHarness(t, "background", nil)
+	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, outcome := drainAgy(t, run)
+	if outcome.Status != statusCompleted || outcome.Output != "\n\nFound a.txt" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	var result Event
+	for _, event := range events {
+		if event.Kind == EventToolOutput && event.InvocationID == antigravityInvocationID("call-1") {
+			result = event
+		}
+	}
+	if result.Output != "a.txt" || result.Status != "completed" {
+		t.Fatalf("the background command's result was lost: %+v", result)
+	}
+}
+
+func TestAntigravityEndsTheBackgroundWaitWhenAgyExits(t *testing.T) {
+	h := newAgyHarness(t, "background-exit", nil)
+	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, outcome := drainAgy(t, run)
+	if outcome.Status != statusFailed || outcome.Error != "Antigravity exited before the turn finished" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+}
+
+func TestAntigravityBoundsTheBackgroundWait(t *testing.T) {
+	limit := antigravityBackgroundLimit
+	antigravityBackgroundLimit = 300 * time.Millisecond
+	t.Cleanup(func() { antigravityBackgroundLimit = limit })
+	h := newAgyHarness(t, "background-stuck", nil)
+	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, outcome := drainAgy(t, run)
+	if outcome.Status != statusCompleted || outcome.Output != "Running in the background." {
+		t.Fatalf("outcome=%+v", outcome)
 	}
 }

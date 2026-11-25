@@ -1,5 +1,8 @@
 import { lazy, Suspense, useRef, useState } from "react";
 import { Icon, type IconSvgElement } from "@/components/ui/icon";
+import { useT } from "@/i18n/use-translation";
+
+import { roomListMessages } from "../room-list.messages";
 
 // The notepad loads on first open so the sidebar's initial bundle only
 // carries this trigger.
@@ -30,6 +33,7 @@ export function PocketNoteLauncher({
   anotherMeRoomId?: string;
   tenantId: string;
 }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<(() => void) | undefined>(undefined);
@@ -38,17 +42,19 @@ export function PocketNoteLauncher({
       <button
         aria-expanded={open}
         aria-haspopup="dialog"
-        aria-label="Pocket Notes"
+        aria-label={t(roomListMessages.pocketNotes)}
         className="xs-nav-btn"
         onClick={() =>
           open ? (closeRef.current ?? (() => setOpen(false)))() : setOpen(true)
         }
         ref={triggerRef}
-        title="Pocket Notes"
+        title={t(roomListMessages.pocketNotes)}
         type="button"
       >
         <Icon icon={noteWriteIcon} size={16} />
-        <span className="xs-nav-btn-label">Pocket Notes</span>
+        <span className="xs-nav-btn-label">
+          {t(roomListMessages.pocketNotes)}
+        </span>
       </button>
       {open ? (
         <Suspense fallback={null}>

@@ -22,9 +22,12 @@ import { documentLogicalTitle } from "@/features/library/document-display-name";
 import { useWikiDocumentLinks } from "@/features/wiki/wiki-document-links";
 import type { TeamHubClient } from "@/features/teamhub/teamhub-client";
 import type { TeamHubDocument } from "@/features/teamhub/teamhub-types";
+import { libraryMessages } from "@/features/library/library.messages";
+import { useT } from "@/i18n/use-translation";
 
 import { DocumentVersionSelectionCommentControl } from "./document-version-selection-comment-control";
 import { DocumentShareDialog } from "./document-share-dialog";
+import { documentPageMessages as m } from "./document-page.messages";
 import { UnifiedDocumentBody } from "./unified-document-body";
 import { UnifiedDocumentPageHeader } from "./unified-document-header";
 import {
@@ -149,6 +152,18 @@ function UnifiedDocumentPageView({
     !isEditing && isWikiPage && document
       ? documentLogicalTitle(document)
       : undefined;
+  // An editable Document's title heads the page, so its actions sit on the
+  // byline under it instead of in a bar that would name it a second time.
+  // Only the body tells a mail canvas, which keeps its bar, from a page, so
+  // the actions wait for the editor to read it rather than show in one place
+  // and then move.
+  const bylineLayout =
+    !isWikiPage &&
+    model.canvasTarget !== "gmail" &&
+    !model.error &&
+    (!document ||
+      (document.format === "blocknote" &&
+        document.representation_format !== "html"));
   const wikiLinks = useWikiDocumentLinks(
     client,
     knowledgeTitle !== undefined ? document : undefined,
@@ -158,11 +173,13 @@ function UnifiedDocumentPageView({
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
       <main className="room-document-main flex min-h-0 min-w-0 flex-1 flex-col bg-app-surface">
-        <UnifiedDocumentPageHeader
-          documentContentRef={documentContentRef}
-          isWikiPage={isWikiPage}
-          model={model}
-        />
+        {bylineLayout ? null : (
+          <UnifiedDocumentPageHeader
+            documentContentRef={documentContentRef}
+            isWikiPage={isWikiPage}
+            model={model}
+          />
+        )}
         <DocumentScrollContainer
           commentLane={Boolean(
             document &&
@@ -180,6 +197,16 @@ function UnifiedDocumentPageView({
           }
         >
           <UnifiedDocumentBody
+            bylineActions={
+              bylineLayout && model.canvasKnown ? (
+                <UnifiedDocumentPageHeader
+                  byline
+                  documentContentRef={documentContentRef}
+                  isWikiPage={isWikiPage}
+                  model={model}
+                />
+              ) : undefined
+            }
             documentContentRef={documentContentRef}
             isWikiPage={isWikiPage}
             knowledgeTitle={knowledgeTitle}
@@ -280,6 +307,7 @@ function UnifiedDocumentPageDialogs({
   trashError: string | null;
   trashPending: boolean;
 }) {
+  const t = useT();
   return (
     <>
       {historyOpen ? (
@@ -290,7 +318,7 @@ function UnifiedDocumentPageDialogs({
               role="status"
             >
               <Spinner size={16} />
-              Loading history…
+              {t(libraryMessages.loadingHistory)}
             </div>
           }
         >
@@ -345,6 +373,7 @@ function UnifiedDocumentCommentsSurface({
   rootRef: MutableRefObject<HTMLDivElement | null>;
   tenantId: string;
 }) {
+  const t = useT();
   const [versionSelection, setVersionSelection] = useState<string | null>(null);
   const [commentsMounted, setCommentsMounted] = useState(false);
   useEffect(() => {
@@ -389,7 +418,7 @@ function UnifiedDocumentCommentsSurface({
         {commentsOpen ? (
           <div
             {...commentsWidth.handleProps}
-            aria-label="Resize Document comments"
+            aria-label={t(m.resizeComments)}
             className={`${commentsWidth.handleProps.className} document-comments-resize-handle`}
           />
         ) : null}

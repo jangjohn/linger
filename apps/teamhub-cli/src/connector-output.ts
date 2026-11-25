@@ -296,7 +296,7 @@ export function connectorOutput(
 export function connectorOutputDescription(command: readonly string[]): string {
   const [app, ...parts] = command;
   const action = parts.join(" ");
-  if (app === "gmail" || app === "outlook")
+  if (app === "gmail" || app === "outlook" || app === "feishu-mail")
     return (
       {
         list: "Message IDs, subjects, senders, unread state, and next-page cursor.",
@@ -310,7 +310,7 @@ export function connectorOutputDescription(command: readonly string[]): string {
         archive: "The actual message ID and archive receipt.",
       } as Record<string, string>
     )[action]!;
-  if (app === "gcal")
+  if (app === "gcal" || app === "outlook-calendar")
     return (
       {
         calendars:

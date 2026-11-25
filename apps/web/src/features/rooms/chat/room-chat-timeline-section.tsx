@@ -1,6 +1,9 @@
 import type { ComponentProps } from "react";
 
 import { isRunWorking } from "@/features/teamhub/run-status";
+import { useT } from "@/i18n/use-translation";
+
+import { chatMessages } from "./chat.messages";
 
 import { JumpToLatestButton } from "./jump-to-latest-button";
 import { MessageTimeline } from "./message-timeline";
@@ -145,10 +148,11 @@ function RoomTimelineViewport({
   viewportRef,
   ...timelineProps
 }: RoomTimelineViewportProps) {
+  const t = useT();
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div
-        aria-label="Room timeline"
+        aria-label={t(chatMessages.roomTimeline)}
         data-voice-scroll="main"
         className={`room-timeline workspace-scrollbar flex flex-1 flex-col overflow-y-scroll [overflow-anchor:none] ${
           initialScrollReady ? "" : "invisible"

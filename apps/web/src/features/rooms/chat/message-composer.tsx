@@ -1,4 +1,12 @@
 import type { TeamHubVoiceLiveTurnMarker } from "@/features/teamhub/teamhub-types";
+import { commonMessages } from "@/i18n/common.messages";
+import {
+  formatLocale,
+  type Translate,
+  type Translation,
+} from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { RichMessage, useT, useTranslation } from "@/i18n/use-translation";
 import { dateTimeFormat } from "@/lib/date-format";
 import {
   AlertCircleIcon,
@@ -54,9 +62,11 @@ import type {
 import type {
   RoomComposerDocumentContext,
   RoomComposerDocumentReference,
+  RoomDraftScope,
   VoiceDocumentSelection,
 } from "../room-drafts";
 import type { ComposerAttachment } from "./composer-attachment-drafts";
+import { composerMessages } from "./composer.messages";
 import { VoiceMaterialsPreview } from "./voice-mode/voice-materials-preview";
 import { useVoiceMediaPolicy } from "@/features/rooms/voice-control/use-voice-media-policy";
 import type {
@@ -93,6 +103,7 @@ import {
   TEAMHUB_MESSAGE_MAX_LENGTH,
   useComposerDraft,
 } from "./use-composer-draft";
+import { useComposerHistory } from "./use-composer-history";
 import { useComposerKeyDown } from "./use-composer-keydown";
 import {
   adjacentMentionTab,
@@ -111,10 +122,16 @@ import {
   useComposerVoiceTurn,
 } from "./use-composer-voice";
 
-const composerDateFormatter = dateTimeFormat({
-  day: "numeric",
-  month: "short",
-});
+const composerDateFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function composerDateFormatter(locale: string) {
+  let formatter = composerDateFormatters.get(locale);
+  if (!formatter) {
+    formatter = dateTimeFormat({ day: "numeric", month: "short" }, locale);
+    composerDateFormatters.set(locale, formatter);
+  }
+  return formatter;
+}
 
 export interface MessageComposition {
   voiceLiveTurn?: TeamHubVoiceLiveTurnMarker;
@@ -158,6 +175,8 @@ export interface MessageComposerProps {
   documentMentionsEnabled?: boolean;
   documentOptions?: MessageDocumentOption[];
   documentOptionsReady?: boolean;
+  /** Where sent messages are kept for ArrowUp and ArrowDown to bring back. */
+  historyScope?: RoomDraftScope;
   initialDocumentReferences?: RoomComposerDocumentReference[];
   initialDocumentContexts?: RoomComposerDocumentContext[];
   initialMentions?: TeamHubActorRef[];
@@ -244,7 +263,7 @@ const MessageComposerContent = forwardRef<
 function useMessageComposer(
   {
     agentOptionsReady,
-    ariaLabel = "Message Room",
+    ariaLabel,
     attachmentDraftKey,
     attachmentEnabled = false,
     autoFocus = false,
@@ -252,6 +271,7 @@ function useMessageComposer(
     documentMentionsEnabled = true,
     documentOptions: catalogDocumentOptions = [],
     documentOptionsReady,
+    historyScope,
     initialDocumentReferences = [],
     initialDocumentContexts = [],
     initialMentions = [],
@@ -269,7 +289,7 @@ function useMessageComposer(
     onRemoveContextMessage,
     onSend,
     onStageAttachment,
-    placeholder = "Message this Room",
+    placeholder,
     resolveDocumentLink,
     selectedContextMessages = [],
     skillOptions = [],
@@ -279,6 +299,7 @@ function useMessageComposer(
   }: MessageComposerProps,
   ref: ForwardedRef<MessageComposerHandle>,
 ) {
+  const t = useT();
   // Sub-hooks run in this order so their effects keep the order the composer
   // relies on: material sync, attachment cleanup, handle and layout, then the
   // Voice Mode session binding.
@@ -327,10 +348,12 @@ function useMessageComposer(
     picker,
     resolveDocumentLink,
   });
+  const history = useComposerHistory({ draft, scope: historyScope });
   const sending = useComposerSend({
     attachments,
     disabled,
     draft,
+    history,
     onSend,
     onStageAttachment,
     picker,
@@ -340,6 +363,7 @@ function useMessageComposer(
   });
   const { handleKeyDown } = useComposerKeyDown({
     draft,
+    history,
     insertion,
     picker,
     sending,
@@ -370,7 +394,10 @@ function useMessageComposer(
     activeMentionIndex: picker.activeMentionIndex,
     activePickerLength: picker.activePickerLength,
     availableMentionTabs: picker.availableMentionTabs,
-    ariaLabel,
+    ariaLabel: ariaLabel ?? t(composerMessages.messageRoom),
+    // Voice Mode finds the chat composer by this marker, not by its label,
+    // which follows the language.
+    chatComposer: ariaLabel === undefined,
     attachmentEnabled,
     attachmentError: attachments.attachmentError,
     documentContexts: draft.documentContexts,
@@ -386,6 +413,7 @@ function useMessageComposer(
     handleKeyDown,
     handlePaste,
     highlightContentRef: draft.highlightContentRef,
+    historyPosition: history.position,
     insertAtPickerItem: insertion.insertAtPickerItem,
     insertSkill: insertion.insertSkill,
     isComposing: draft.isComposing,
@@ -401,7 +429,7 @@ function useMessageComposer(
     onCancel,
     onOpenProfile,
     onRemoveContextMessage,
-    placeholder,
+    placeholder: placeholder ?? t(composerMessages.messageThisRoom),
     resolvingDocumentLinks: draft.resolvingDocumentLinks,
     removeAttachment: attachments.removeAttachment,
     retryAttachment: attachments.retryAttachment,
@@ -444,6 +472,7 @@ function MessageComposerView({
     attachmentError,
     documentContexts,
     body,
+    historyPosition,
     lengthStatusId,
     mentions,
     messageError,
@@ -461,6 +490,7 @@ function MessageComposerView({
     voiceModeTarget,
     voiceMaterialRows,
   } = controller;
+  const t = useT();
   const peek = useComposerPeek();
   const { submitted: peekSubmitted } = peek;
   useEffect(() => {
@@ -521,13 +551,18 @@ function MessageComposerView({
           onRemove={onRemoveContextMessage}
         />
         <AttachmentError
-          message={attachmentError ?? failedUploadMessage(selectedFiles)}
+          message={attachmentError ?? failedUploadMessage(selectedFiles, t)}
         />
         <AttachmentPreviews
           attachments={selectedFiles}
           onRemove={removeAttachment}
           onRetry={retryAttachment}
         />
+        {historyPosition ? (
+          <p className="message-composer-history px-2 text-[12px] leading-4 text-app-placeholder">
+            {t(composerMessages.historyPosition, historyPosition)}
+          </p>
+        ) : null}
         <ComposerEditor controller={controller} peek={peek} />
         <MessageLengthStatus
           bodyLength={body.length}
@@ -603,6 +638,7 @@ function ComposerEditor({
     ariaLabel,
     autoFocus,
     body,
+    chatComposer,
     closePicker,
     disabled,
     documentOptions,
@@ -661,6 +697,7 @@ function ComposerEditor({
         }
         aria-autocomplete="list"
         aria-controls={mentionQuery || skillQuery ? mentionListId : undefined}
+        data-chat-composer={chatComposer ? "" : undefined}
         className="message-composer-input relative z-[1] block w-full resize-none bg-transparent outline-none"
         maxLength={TEAMHUB_MESSAGE_MAX_LENGTH}
         onChange={(event) => {
@@ -829,16 +866,23 @@ function DocumentContextChips({
   onOpen?: (context: RoomComposerDocumentContext) => void;
   onRemove: (context: RoomComposerDocumentContext) => void;
 }) {
+  const t = useT();
   if (contexts.length === 0) return null;
   return (
-    <div aria-label="Artifact contexts" className="mb-2 flex flex-wrap gap-2">
+    <div
+      aria-label={t(composerMessages.artifactContexts)}
+      className="mb-2 flex flex-wrap gap-2"
+    >
       {contexts.map((context) => (
         <div
           className="flex min-w-0 max-w-full items-center gap-1 rounded-md border border-app-border-strong bg-app-surface-soft p-1"
           key={context.documentVersionId}
         >
           <button
-            aria-label={`Open ${context.filename} Version ${context.versionNumber}`}
+            aria-label={t(composerMessages.openContextVersion, {
+              filename: context.filename,
+              version: String(context.versionNumber),
+            })}
             className="flex min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-app-focus"
             disabled={!onOpen}
             onClick={() => onOpen?.(context)}
@@ -854,7 +898,10 @@ function DocumentContextChips({
                 {context.filename}
               </span>
               <span className="block truncate text-[12px] text-app-subtle">
-                Version {context.versionNumber} · {context.sourceRoomName}
+                {t(composerMessages.contextVersion, {
+                  room: context.sourceRoomName,
+                  version: String(context.versionNumber),
+                })}
               </span>
             </span>
             {onOpen ? (
@@ -866,10 +913,14 @@ function DocumentContextChips({
             ) : null}
           </button>
           <Button
-            aria-label={`Remove ${context.filename} Version ${context.versionNumber}`}
+            data-voice-risk="never"
+            aria-label={t(composerMessages.removeContextVersion, {
+              filename: context.filename,
+              version: String(context.versionNumber),
+            })}
             onClick={() => onRemove(context)}
             size="compactIcon"
-            title="Remove context"
+            title={t(composerMessages.removeContext)}
             tone="ghost"
           >
             <Icon icon={Cancel01Icon} size={14} />
@@ -931,6 +982,7 @@ function ComposerHighlight({
   skillOptions: MessageSkillOption[];
   skillReferences: TeamHubMessageSkillReference[];
 }) {
+  const t = useT();
   const references = findComposerReferenceMatches(
     body,
     mentions,
@@ -1003,8 +1055,10 @@ function ComposerHighlight({
         : Boolean(onOpenDocument);
     const label =
       reference.kind === "actor"
-        ? `Open ${reference.actor.display_name} profile`
-        : `Open ${reference.document.name}`;
+        ? t(composerMessages.openProfile, {
+            name: reference.actor.display_name,
+          })
+        : t(composerMessages.openDocument, { name: reference.document.name });
     const token = actionable ? (
       <span
         aria-label={label}
@@ -1050,7 +1104,7 @@ function ComposerHighlight({
 
   return (
     <div
-      aria-label="Composer references"
+      aria-label={t(composerMessages.composerReferences)}
       className="message-composer-highlight-layer absolute inset-0 overflow-hidden"
       role="group"
     >
@@ -1151,7 +1205,9 @@ function SkillReferenceToken({
   skill: MessageSkillOption;
   token: string;
 }) {
-  const description = skill.description?.trim() || "No description available.";
+  const t = useT();
+  const description =
+    skill.description?.trim() || t(composerMessages.noDescription);
   const tooltipId = useId();
   const [tooltipPosition, setTooltipPosition] = useState<{
     left: number;
@@ -1170,7 +1226,7 @@ function SkillReferenceToken({
     <>
       <span
         aria-describedby={tooltipPosition ? tooltipId : undefined}
-        aria-label={`Skill ${token}`}
+        aria-label={t(composerMessages.skillToken, { token })}
         className="message-composer-reference"
         data-reference-kind="skill"
         onBlur={() => setTooltipPosition(undefined)}
@@ -1196,7 +1252,7 @@ function SkillReferenceToken({
             >
               <p className="line-clamp-6">{description}</p>
               <p className="mt-1 text-[12px] font-medium text-app-subtle">
-                Skill
+                {t(composerMessages.skill)}
               </p>
             </div>,
             document.body,
@@ -1213,10 +1269,11 @@ function ReplyContextPreview({
   messages: TeamHubMessage[];
   onRemove?: (messageId: string) => void;
 }) {
+  const t = useT();
   if (!messages.length) return null;
   return (
     <div
-      aria-label="Selected reply context"
+      aria-label={t(composerMessages.replyContext)}
       className="mb-2 max-h-36 space-y-1 overflow-y-auto border-b border-app-border pb-2 pr-1"
     >
       {messages.map((message) => (
@@ -1231,10 +1288,13 @@ function ReplyContextPreview({
             {markdownPlainText(message.raw_message)}
           </span>
           <Button
-            aria-label={`Remove ${message.author.display_name} from reply context`}
+            data-voice-risk="never"
+            aria-label={t(composerMessages.removeFromReplyContext, {
+              name: message.author.display_name,
+            })}
             onClick={() => onRemove?.(message.id)}
             size="compactIcon"
-            title="Remove reply context"
+            title={t(composerMessages.removeReplyContext)}
             tone="ghost"
           >
             <Icon icon={Cancel01Icon} size={14} />
@@ -1246,12 +1306,18 @@ function ReplyContextPreview({
 }
 
 // A failed chip only shows an icon, so name the failure where it can be read.
-function failedUploadMessage(attachments: readonly ComposerAttachment[]) {
+function failedUploadMessage(
+  attachments: readonly ComposerAttachment[],
+  t: Translate,
+) {
   const failed = attachments.find(
     (attachment) => attachment.status === "failed",
   );
   if (!failed) return null;
-  return `${failed.file.name}: ${failed.error ?? "Upload failed."}`;
+  return t(composerMessages.fileError, {
+    error: failed.error ?? t(composerMessages.uploadFailed),
+    name: failed.file.name,
+  });
 }
 
 function AttachmentError({ message }: { message: string | null }) {
@@ -1275,6 +1341,7 @@ function MessageLengthStatus({
   error: string | null;
   id: string;
 }) {
+  const t = useT();
   if (!error && bodyLength < TEAMHUB_MESSAGE_MAX_LENGTH * 0.9) return null;
   return (
     <p
@@ -1285,7 +1352,10 @@ function MessageLengthStatus({
       role={error ? "alert" : "status"}
     >
       {error ??
-        `${bodyLength.toLocaleString()} / ${TEAMHUB_MESSAGE_MAX_LENGTH.toLocaleString()}`}
+        t(composerMessages.lengthCount, {
+          count: bodyLength,
+          limit: TEAMHUB_MESSAGE_MAX_LENGTH,
+        })}
     </p>
   );
 }
@@ -1317,6 +1387,7 @@ function ComposerToolbar({
   voiceModeEntered?: boolean;
   keepSendWithVoice?: boolean;
 }) {
+  const t = useT();
   const showAttach = attachmentEnabled && !voiceModeEntered;
   const showTools = !submitLabel && !voiceModeEntered && Boolean(modelSwitch);
   const hasLeftTools = showAttach || showTools;
@@ -1327,18 +1398,18 @@ function ComposerToolbar({
           {showAttach ? (
             <>
               <Button
-                aria-label="Attach file"
+                aria-label={t(composerMessages.attachFile)}
                 className="composer-attach-button"
                 disabled={disabled}
                 onClick={() => fileInputRef.current?.click()}
                 size="compactIcon"
-                title="Attach file"
+                title={t(composerMessages.attachFile)}
                 tone="ghost"
               >
                 <Icon icon={PlusSignIcon} size={16} />
               </Button>
               <input
-                aria-label="Choose message attachments"
+                aria-label={t(composerMessages.chooseAttachments)}
                 className="sr-only"
                 disabled={disabled}
                 multiple
@@ -1358,7 +1429,7 @@ function ComposerToolbar({
           <>
             {onCancel ? (
               <Button onClick={onCancel} size="compact" tone="ghost">
-                Cancel
+                {t(commonMessages.cancel)}
               </Button>
             ) : null}
             <Button
@@ -1376,7 +1447,8 @@ function ComposerToolbar({
             {voiceModeControls}
             {!voiceModeControls || keepSendWithVoice ? (
               <Button
-                aria-label="Send message"
+                data-voice-risk="never"
+                aria-label={t(composerMessages.sendMessage)}
                 className="message-composer-send disabled:!opacity-100"
                 disabled={sendDisabled}
                 onClick={onSend}
@@ -1402,13 +1474,14 @@ function AttachmentPreviews({
   onRemove: (attachment: ComposerAttachment) => void;
   onRetry: (attachment: ComposerAttachment) => void;
 }) {
+  const t = useT();
   if (!attachments.length) {
     return null;
   }
 
   return (
     <div
-      aria-label="Pending attachments"
+      aria-label={t(composerMessages.pendingAttachments)}
       className="workspace-scrollbar mb-2 flex min-w-0 items-center gap-2 overflow-x-auto px-1"
       role="region"
     >
@@ -1433,6 +1506,7 @@ function AttachmentPreview({
   onRemove: () => void;
   onRetry: () => void;
 }) {
+  const t = useT();
   const { file } = attachment;
   const [previewOpen, setPreviewOpen] = useState(false);
   const [objectUrl, setObjectUrl] = useState<string>();
@@ -1466,7 +1540,7 @@ function AttachmentPreview({
     return (
       <div className="group relative h-8 shrink-0">
         <button
-          aria-label={`Preview ${file.name}`}
+          aria-label={t(composerMessages.previewFile, { name: file.name })}
           className="block h-8 overflow-hidden rounded-md border border-border focus-visible:outline-2 focus-visible:outline-app-focus"
           onClick={() => setPreviewOpen(true)}
           type="button"
@@ -1478,7 +1552,8 @@ function AttachmentPreview({
           />
         </button>
         <button
-          aria-label={`Remove ${file.name}`}
+          data-voice-risk="never"
+          aria-label={t(composerMessages.removeFile, { name: file.name })}
           className="pointer-events-none absolute right-0 top-0 flex size-4 items-center justify-center rounded-bl bg-foreground/60 text-background opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 focus-visible:outline-2 focus-visible:outline-app-focus [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
           onClick={onRemove}
           type="button"
@@ -1502,7 +1577,7 @@ function AttachmentPreview({
     >
       {attachment.status === "uploading" ? (
         <span
-          aria-label={`Uploading ${file.name}`}
+          aria-label={t(composerMessages.uploadingFile, { name: file.name })}
           className="inline-flex size-4 shrink-0 animate-spin motion-reduce:animate-none"
           role="status"
         >
@@ -1522,7 +1597,9 @@ function AttachmentPreview({
       {attachment.status === "uploading" ? (
         <div className={`flex min-w-0 flex-1 items-center px-1 ${token.text}`}>
           <span className="sr-only">
-            Uploading {Math.round(attachment.progress * 100)}%
+            {t(composerMessages.uploadingPercent, {
+              percent: Math.round(attachment.progress * 100),
+            })}
           </span>
           <span className="min-w-0 flex-1 truncate">{file.name}</span>
           <span className="shrink-0">
@@ -1531,7 +1608,7 @@ function AttachmentPreview({
         </div>
       ) : attachment.status === "failed" ? (
         <button
-          aria-label={`Retry upload ${file.name}`}
+          aria-label={t(composerMessages.retryUpload, { name: file.name })}
           className="min-w-0 flex-1 truncate px-1 text-left text-app-danger focus-visible:outline-2 focus-visible:outline-app-focus"
           onClick={onRetry}
           title={attachment.error}
@@ -1541,7 +1618,7 @@ function AttachmentPreview({
         </button>
       ) : (
         <button
-          aria-label={`Download ${file.name}`}
+          aria-label={t(composerMessages.downloadFile, { name: file.name })}
           className={`min-w-0 flex-1 truncate px-1 text-left focus-visible:outline-2 focus-visible:outline-app-focus ${token.text}`}
           onClick={download}
           type="button"
@@ -1550,7 +1627,8 @@ function AttachmentPreview({
         </button>
       )}
       <button
-        aria-label={`Remove ${file.name}`}
+        data-voice-risk="never"
+        aria-label={t(composerMessages.removeFile, { name: file.name })}
         className="flex size-3 shrink-0 items-center justify-center text-muted-foreground/60 hover:text-muted-foreground focus-visible:outline-2 focus-visible:outline-app-focus"
         onClick={onRemove}
         type="button"
@@ -1570,9 +1648,10 @@ function ImageAttachmentDialog({
   objectUrl: string;
   onClose: () => void;
 }) {
+  const t = useT();
   return (
     <ModalDialog
-      ariaLabel={`Preview ${file.name}`}
+      ariaLabel={t(composerMessages.previewFile, { name: file.name })}
       className="overflow-hidden"
       closeOnBackdrop
       onClose={onClose}
@@ -1583,7 +1662,8 @@ function ImageAttachmentDialog({
           {file.name}
         </p>
         <Button
-          aria-label="Close image preview"
+          data-voice-close
+          aria-label={t(composerMessages.closeImagePreview)}
           onClick={onClose}
           size="compactIcon"
           tone="ghost"
@@ -1659,6 +1739,12 @@ function attachmentTokenPresentation(file: File) {
   };
 }
 
+const mentionTabMessages = {
+  all: composerMessages.mentionTabAll,
+  docs: composerMessages.mentionTabDocs,
+  people: composerMessages.mentionTabPeople,
+} satisfies Record<MentionTab, Message>;
+
 function MentionMenu({
   activeIndex,
   items,
@@ -1678,6 +1764,7 @@ function MentionMenu({
   tab: MentionTab;
   tabs: readonly MentionTab[];
 }) {
+  const t = useT();
   const listRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef<Partial<Record<MentionTab, HTMLButtonElement>>>({});
@@ -1752,7 +1839,7 @@ function MentionMenu({
 
   return (
     <div
-      aria-label="Mention people or documents"
+      aria-label={t(composerMessages.mentionPicker)}
       className="app-floating-enter message-mention-menu absolute bottom-[calc(100%+8px)] left-0 z-30 flex max-h-[min(26rem,calc(100dvh-7rem))] w-[min(24rem,calc(100vw-1.5rem))] flex-col overflow-hidden bg-popover shadow-md [border-radius:var(--app-panel-radius)]"
       ref={menuRef}
     >
@@ -1798,7 +1885,7 @@ function MentionMenu({
             tabIndex={tab === value ? 0 : -1}
             type="button"
           >
-            {value}
+            {t(mentionTabMessages[value])}
           </button>
         ))}
       </div>
@@ -1809,7 +1896,7 @@ function MentionMenu({
         role="tabpanel"
       >
         <div
-          aria-label="Mention people or documents"
+          aria-label={t(composerMessages.mentionPicker)}
           className="workspace-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5"
           id={listId}
           ref={listRef}
@@ -1832,12 +1919,13 @@ function MentionMenu({
             ))
           ) : (
             <p className="px-3 py-5 text-center text-xs text-app-muted">
-              No matching{" "}
-              {tab === "docs"
-                ? "documents"
-                : tab === "people"
-                  ? "people"
-                  : "results"}
+              {t(
+                tab === "docs"
+                  ? composerMessages.noMatchingDocuments
+                  : tab === "people"
+                    ? composerMessages.noMatchingPeople
+                    : composerMessages.noMatchingResults,
+              )}
             </p>
           )}
         </div>
@@ -1859,6 +1947,8 @@ function MentionOption({
   onSelect: () => void;
   onSelectionChange: () => void;
 }) {
+  const translation = useTranslation();
+  const { t } = translation;
   const disabled = false;
   return (
     <button
@@ -1895,17 +1985,19 @@ function MentionOption({
         <span className="block truncate text-[12px] text-app-subtle">
           {item.kind === "actor"
             ? item.actor.kind === "agent"
-              ? "Agent"
+              ? t(composerMessages.agent)
               : formatMentionToken(item.actor)
-            : `Updated ${formatRelativeDate(item.document.updatedAt)}`}
+            : documentUpdatedLabel(item.document.updatedAt, translation)}
         </span>
       </span>
       <span className="shrink-0 text-[10px] font-medium text-app-muted">
-        {item.kind === "document"
-          ? "Doc"
-          : item.actor.kind === "agent"
-            ? "Agent"
-            : "Person"}
+        {t(
+          item.kind === "document"
+            ? composerMessages.doc
+            : item.actor.kind === "agent"
+              ? composerMessages.agent
+              : composerMessages.person,
+        )}
       </span>
     </button>
   );
@@ -1928,6 +2020,7 @@ function SkillMenu({
   onSelect: (skill: MessageSkillOption) => void;
   onSelectionChange: (index: number) => void;
 }) {
+  const t = useT();
   const listRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     listRef.current
@@ -1945,12 +2038,20 @@ function SkillMenu({
           size="xs"
         />
         <span className="min-w-0 truncate text-xs font-medium text-app-muted">
-          Skills for <span className="text-app-ink">{agent.display_name}</span>
+          <RichMessage
+            message={composerMessages.skillsForAgent}
+            tags={{
+              agent: (name) => <span className="text-app-ink">{name}</span>,
+            }}
+            values={{ name: agent.display_name }}
+          />
         </span>
       </div>
       <div className="grid min-h-0 flex-1 sm:grid-cols-[minmax(0,15rem)_minmax(0,1fr)]">
         <div
-          aria-label={`Skills for ${agent.display_name}`}
+          aria-label={t(composerMessages.skillsFor, {
+            name: agent.display_name,
+          })}
           className="workspace-scrollbar min-h-14 overflow-y-auto p-1.5 sm:border-r sm:border-app-border"
           id={listId}
           ref={listRef}
@@ -1981,19 +2082,21 @@ function SkillMenu({
                     {skill.name}
                   </span>
                   <span className="mt-0.5 line-clamp-2 text-[12px] leading-4 text-app-subtle sm:hidden">
-                    {skill.description || "No description available."}
+                    {skill.description || t(composerMessages.noDescription)}
                   </span>
                 </span>
               </button>
             ))
           ) : (
             <p className="px-3 py-5 text-center text-xs text-app-muted">
-              No matching skills for {agent.display_name}
+              {t(composerMessages.noMatchingSkills, {
+                name: agent.display_name,
+              })}
             </p>
           )}
         </div>
         <div
-          aria-label="Selected Skill description"
+          aria-label={t(composerMessages.selectedSkillDescription)}
           className="workspace-scrollbar hidden min-h-0 overflow-y-auto bg-app-surface-soft p-4 sm:block"
           role="region"
         >
@@ -2003,14 +2106,16 @@ function SkillMenu({
                 {formatSkillToken(selectedSkill, options)}
               </p>
               <p className="mt-2 whitespace-pre-wrap text-sm leading-5 text-app-body">
-                {selectedSkill.description || "No description available."}
+                {selectedSkill.description || t(composerMessages.noDescription)}
               </p>
               <p className="mt-3 text-[12px] font-medium text-app-subtle">
-                Skill
+                {t(composerMessages.skill)}
               </p>
             </>
           ) : (
-            <p className="text-sm text-app-muted">Select a Skill.</p>
+            <p className="text-sm text-app-muted">
+              {t(composerMessages.selectSkill)}
+            </p>
           )}
         </div>
       </div>
@@ -2018,23 +2123,22 @@ function SkillMenu({
   );
 }
 
-function formatRelativeDate(value: string) {
+/** When a Document in the picker last changed, as one sentence. */
+function documentUpdatedLabel(value: string, { language, t }: Translation) {
   const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "recently";
+  if (!Number.isFinite(timestamp)) return t(composerMessages.updatedRecently);
   const date = new Date(timestamp);
   const time = [date.getHours(), date.getMinutes(), date.getSeconds()]
     .map((value) => String(value).padStart(2, "0"))
     .join(":");
   const days = Math.round((Date.now() - timestamp) / 86_400_000);
-  const day =
-    days <= 0
-      ? "today"
-      : days === 1
-        ? "yesterday"
-        : days < 30
-          ? `${days}d ago`
-          : composerDateFormatter.format(timestamp);
-  return `${day} ${time}`;
+  if (days <= 0) return t(composerMessages.updatedToday, { time });
+  if (days === 1) return t(composerMessages.updatedYesterday, { time });
+  if (days < 30) return t(composerMessages.updatedDaysAgo, { days, time });
+  return t(composerMessages.updatedOn, {
+    date: composerDateFormatter(formatLocale(language)).format(timestamp),
+    time,
+  });
 }
 
 /** The composer's Agent mention: avatar over the "@", name in its colour. */

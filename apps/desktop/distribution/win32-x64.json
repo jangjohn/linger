@@ -2,15 +2,25 @@
   "platform": "win32",
   "arch": "x64",
   "localmodelsTool": {
-    "url": "https://d2ikbbcl3j6jz9.cloudfront.net/cli/localmodels/0.1.0.dev44/win32-x64.tgz",
+    "url": "https://d2ikbbcl3j6jz9.cloudfront.net/cli/localmodels/0.1.0.dev57/win32-x64.tgz",
     "mirrors": [
-      "https://registry.npmjs.org/@simplexai/localmodels-win32-x64/-/localmodels-win32-x64-0.1.0-dev.44.tgz",
-      "https://cdn.npmmirror.com/packages/@simplexai/localmodels-win32-x64/0.1.0-dev.44/localmodels-win32-x64-0.1.0-dev.44.tgz"
+      "https://registry.npmjs.org/@simplexai/localmodels-win32-x64/-/localmodels-win32-x64-0.1.0-dev.57.tgz",
+      "https://cdn.npmmirror.com/packages/@simplexai/localmodels-win32-x64/0.1.0-dev.57/localmodels-win32-x64-0.1.0-dev.57.tgz"
     ],
-    "sha256": "f99f6cc30a8a3d0a486ef13070b81e49eadc97de25402897134aea0f25e26e58",
-    "bytes": 23204073,
-    "sourceCommit": "416f7b2938cf5f00333192a1015fb55c737c7a45",
-    "manifestSha256": "4beb7edf264095c74f3d6379a0343bf22b3fe4aad6e59491a4739de3b09640fd"
+    "sha256": "25287ac23fa0ac6224f6fab44bdca4b54313220c51269867996cf7d86ad419a0",
+    "bytes": 23298638,
+    "sourceCommit": "0aafada9017943d22a4b3cecb879ddc59f805a68",
+    "manifestSha256": "79e52cb5d036e3913ad3c54ea381fd734ec5132cc1c273ea49534bd18fdb58aa",
+    "runtimeVersions": {
+      "claude": "2.1.325",
+      "codex": "0.171.0",
+      "pi": "1.5.2"
+    },
+    "runtimeBaselines": {
+      "claude": "2.1.282",
+      "codex": "0.166.0",
+      "pi": "1.2.0"
+    }
   },
   "nativeSources": [
     {

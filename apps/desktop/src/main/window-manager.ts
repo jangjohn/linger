@@ -5,6 +5,7 @@ import {
   nativeImage,
   net,
   protocol,
+  screen,
   session,
   shell,
   type BaseWindowConstructorOptions,
@@ -13,8 +14,12 @@ import {
 } from "electron";
 
 import iconPng from "../../resources/icon.png";
+import { localizePage } from "../i18n/page.js";
+import messagesHtml from "../shell/messages.html";
 import offlineHtml from "../shell/offline.html";
+import { offlineMessages } from "../shell/offline.messages.js";
 import titlebarHtml from "../shell/titlebar.html";
+import { titlebarMessages } from "../shell/titlebar.messages.js";
 import {
   SHELL_IPC,
   type ShellCommand,
@@ -25,7 +30,9 @@ import { IPC } from "../shared/api.js";
 import type { DiagnosticsModule } from "./diagnostics.js";
 import { diagnosticsDialogs } from "./diagnostics-dialogs.js";
 import { sendWithPrompts } from "./diagnostics-upload.js";
+import type { LanguageModule } from "./language.js";
 import type { Module, ModuleContext } from "./modules.js";
+import { PreviewViews } from "./preview-views.js";
 import {
   OFFLINE_ORIGIN,
   PREVIEW_FRAME_PREFIX,
@@ -42,7 +49,11 @@ import {
   windowLoadDecision,
   voiceWindowRequest,
 } from "./navigation.js";
-import { acceptVoiceWindow } from "./voice-window.js";
+import {
+  VOICE_WINDOW_MIN,
+  acceptVoiceWindow,
+  voiceWindowPosition,
+} from "./voice-window.js";
 
 // Must run before app "ready".
 export const registerAppScheme = (): void => {
@@ -88,8 +99,8 @@ const chrome = (platform: NodeJS.Platform): BaseWindowConstructorOptions => {
   return { frame: false };
 };
 
-export const INVALID_SERVER =
-  "Enter a server address that starts with http:// or https://";
+// The offline page's code for an address it shows its own message for.
+const INVALID_SERVER = "invalid-server";
 
 const html = (body: string): Response =>
   new Response(body, {
@@ -136,7 +147,7 @@ const extractAssetPaths = (documentHtml: string): string[] => {
 // Closing hides the window; the tray keeps the app running.
 export class WindowManagerModule implements Module {
   readonly name = "WindowManager";
-  readonly dependsOn = ["Config"];
+  readonly dependsOn = ["Config", "Language"];
   readonly #options: WindowManagerOptions;
   #ctx: ModuleContext | undefined;
   #window: BaseWindow | undefined;
@@ -147,12 +158,19 @@ export class WindowManagerModule implements Module {
   #pendingTargetOrigin: string | undefined;
   #showingShellPage: WindowLoadState["showingShellPage"] = "none";
   #loadFailed = false;
+  #loadFailureSeq = 0;
   #loadStartedAt: number | undefined;
   #lastLoadReason: WindowLoadReason | undefined;
   #pendingShow = false;
   #revealTimer: NodeJS.Timeout | undefined;
   // Closes the floating voice window, when there is one.
   #closeVoiceWindow: (() => void) | undefined;
+  readonly #previews = new PreviewViews({
+    window: () => this.#window,
+    content: () => this.#content,
+    serverUrl: () => this.#serverUrl(),
+    warn: (event, fields) => this.#ctx?.log.warn(event, fields),
+  });
   readonly #unsubscribe: (() => void)[] = [];
 
   constructor(options: WindowManagerOptions) {
@@ -174,8 +192,13 @@ export class WindowManagerModule implements Module {
       this.#command(name as ShellCommand);
     });
     this.#unsubscribe.push(
+      this.#previews.register(),
       () => ipcMain.removeHandler(SHELL_IPC.state),
       () => ipcMain.removeAllListeners(SHELL_IPC.command),
+      // The title bar's button labels are filled in when it loads.
+      ctx.bus.on("language.changed", () =>
+        this.#titlebar?.webContents.reload(),
+      ),
     );
     if (!this.#options.background) this.show();
   }
@@ -355,6 +378,7 @@ export class WindowManagerModule implements Module {
     });
     window.on("closed", () => {
       this.#closeVoiceWindow?.();
+      this.#previews.closeAll();
       titlebar?.webContents.close();
       content.webContents.close();
       if (this.#window === window) {
@@ -430,7 +454,10 @@ export class WindowManagerModule implements Module {
     ) {
       return true;
     }
-    if (serverUrl !== previous) ctx.config.update({ serverUrl });
+    if (serverUrl !== previous) {
+      ctx.config.update({ serverUrl });
+      this.#pushState();
+    }
     if (moved) ctx.bus.emit("server.moved", movedFrom!, serverUrl);
     if (changed) ctx.bus.emit("server.changed", serverUrl);
     setImmediate(() => {
@@ -485,6 +512,7 @@ export class WindowManagerModule implements Module {
       options,
     );
     if (decision.action === "noop" || !decision.targetUrl) return;
+    this.#loadFailureSeq += 1;
     this.#pendingTargetOrigin = new URL(decision.targetUrl).origin;
     this.#showingShellPage = "none";
     this.#loadFailed = false;
@@ -511,6 +539,7 @@ export class WindowManagerModule implements Module {
   }
 
   #loadLocal(mode: "updating" | "starting" | "failed", value: string): void {
+    this.#loadFailureSeq += 1;
     this.#pendingTargetOrigin = undefined;
     this.#showingShellPage = mode === "failed" ? "start-failed" : "starting";
     this.#loadFailed = mode === "failed";
@@ -532,6 +561,7 @@ export class WindowManagerModule implements Module {
   }
 
   #loadOffline(error?: string): void {
+    this.#loadFailureSeq += 1;
     this.#pendingTargetOrigin = undefined;
     this.#showingShellPage = "offline";
     this.#loadFailed = Boolean(error);
@@ -606,6 +636,7 @@ export class WindowManagerModule implements Module {
     contents.on("will-navigate", (event) => event.preventDefault());
     contents.setWindowOpenHandler(() => ({ action: "deny" }));
     contents.on("will-attach-webview", (event) => event.preventDefault());
+    contents.on("did-finish-load", () => this.#pushState());
   }
 
   #guardContent(contents: WebContents): void {
@@ -627,6 +658,8 @@ export class WindowManagerModule implements Module {
             title: "Linger",
             // The page asks for the size of its content, as in a browser.
             useContentSize: true,
+            minWidth: VOICE_WINDOW_MIN.width,
+            minHeight: VOICE_WINDOW_MIN.height,
             minimizable: false,
             maximizable: false,
             fullscreenable: false,
@@ -647,6 +680,12 @@ export class WindowManagerModule implements Module {
       );
       if (!close) return;
       this.#closeVoiceWindow = close;
+      const main = this.#window;
+      if (main && !main.isDestroyed()) {
+        const { workArea } = screen.getDisplayMatching(main.getBounds());
+        const { x, y } = voiceWindowPosition(child.getBounds(), workArea);
+        child.setPosition(x, y);
+      }
       child.on("closed", () => {
         if (this.#closeVoiceWindow === close)
           this.#closeVoiceWindow = undefined;
@@ -656,6 +695,10 @@ export class WindowManagerModule implements Module {
     contents.on("did-fail-load", (_event, code, description, url, isMain) => {
       // -3 is an aborted load, usually a navigation replacing another.
       if (!isMain || code === -3 || url.startsWith(OFFLINE_ORIGIN)) return;
+      const serverUrl = this.#serverUrl();
+      // Ignore late failures from an older origin after the server moved or
+      // changed, so they never clobber the active navigation with Starting.
+      if (serverUrl && !sameOrigin(url, serverUrl)) return;
       this.#revealIfPending();
       this.#loadFailed = true;
       this.#pendingTargetOrigin = undefined;
@@ -664,15 +707,25 @@ export class WindowManagerModule implements Module {
         description,
         ...(this.#lastLoadReason ? { reason: this.#lastLoadReason } : {}),
       });
-      const serverUrl = this.#serverUrl();
+      const seq = ++this.#loadFailureSeq;
       const check =
         serverUrl && this.#options.localServerResumable
           ? this.#options.localServerResumable(serverUrl).catch(() => false)
           : Promise.resolve(false);
       void check.then((resumable) => {
-        if (this.#showingShellPage !== "none" || !this.#loadFailed) return;
+        if (
+          seq !== this.#loadFailureSeq ||
+          this.#showingShellPage !== "none" ||
+          !this.#loadFailed ||
+          this.#serverUrl() !== serverUrl
+        )
+          return;
         if (resumable) this.showStarting();
-        else this.#loadOffline(description);
+        else {
+          this.#loadOffline(description);
+          // A local server that stopped is started again from there.
+          this.#ctx!.bus.emit("local-server.unreachable");
+        }
       });
     });
     contents.on("did-finish-load", () => {
@@ -715,6 +768,9 @@ export class WindowManagerModule implements Module {
       "did-stop-loading",
     ] as const)
       contents.on(event as "did-start-loading", () => this.#pushState());
+    // A new page in the window no longer knows the previews of the last one.
+    contents.on("did-navigate", () => this.#previews.closeAll());
+    contents.on("render-process-gone", () => this.#previews.closeAll());
   }
 
   #guard(
@@ -800,7 +856,7 @@ export class WindowManagerModule implements Module {
   #serveApp(request: Request): Response {
     const url = new URL(request.url);
     if (url.host === "shell" && url.pathname === "/titlebar")
-      return html(titlebarHtml);
+      return html(this.#localize(titlebarHtml, titlebarMessages));
     if (url.host !== "offline") return new Response(null, { status: 404 });
     if (url.pathname === "/logo.png")
       return new Response(Buffer.from(iconPng), {
@@ -821,7 +877,7 @@ export class WindowManagerModule implements Module {
     if (url.pathname === "/send") {
       void sendWithPrompts(
         this.#ctx!.get<DiagnosticsModule>("Diagnostics").sender,
-        diagnosticsDialogs(() => this.#window),
+        diagnosticsDialogs(() => this.#window, this.#language().t),
       );
       return new Response(null, { status: 204 });
     }
@@ -842,6 +898,19 @@ export class WindowManagerModule implements Module {
         this.#loadOffline(INVALID_SERVER);
       return new Response(null, { status: 204 });
     }
-    return html(offlineHtml);
+    return html(this.#localize(offlineHtml, offlineMessages));
+  }
+
+  #language(): LanguageModule {
+    return this.#ctx!.get<LanguageModule>("Language");
+  }
+
+  #localize(page: string, messages: Parameters<typeof localizePage>[2]) {
+    return localizePage(
+      page,
+      messagesHtml,
+      messages,
+      this.#language().current(),
+    );
   }
 }

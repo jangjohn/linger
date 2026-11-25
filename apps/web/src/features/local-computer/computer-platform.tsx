@@ -1,3 +1,7 @@
+import { useT } from "@/i18n/use-translation";
+
+import { computerSetupMessages } from "./computer-setup.messages";
+
 export type ComputerPlatform = "darwin" | "linux" | "win32";
 
 export function browserComputerPlatform(): ComputerPlatform {
@@ -54,16 +58,17 @@ export function ComputerPlatformSelector({
   value: ComputerPlatform | "";
   onChange: (platform: ComputerPlatform) => void;
 }) {
+  const t = useT();
   return (
     <label className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-      Computer operating system
+      {t(computerSetupMessages.operatingSystem)}
       <select
         className="h-8 rounded-md border border-border bg-card px-2 text-sm text-foreground transition-colors duration-150 hover:border-border-hover focus-visible:border-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         value={value}
         onChange={(event) => onChange(event.target.value as ComputerPlatform)}
       >
         <option value="" disabled>
-          Choose operating system
+          {t(computerSetupMessages.chooseOperatingSystem)}
         </option>
         <option value="darwin">macOS</option>
         <option value="win32">Windows</option>

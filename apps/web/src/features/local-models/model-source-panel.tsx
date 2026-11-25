@@ -1,10 +1,11 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { type KeyboardEvent, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { FormFeedback } from "@/components/ui/form-feedback";
 import { ModalDialog } from "@/components/ui/modal-dialog";
 import { Select, SelectItem } from "@/components/ui/select";
+import { useTabIndicator } from "@/components/ui/tab-indicator";
 import { Hint } from "@/features/local-computer/computer-hint";
 import { localComputersQueryKey } from "@/features/local-computer/local-computer-queries";
 import {
@@ -13,18 +14,22 @@ import {
 } from "@/features/rooms/room-queries";
 import { TeamHubError } from "@/features/teamhub/teamhub-error";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
-import { cn } from "@/lib/cn";
+import { commonMessages } from "@/i18n/common.messages";
+import type { Translate } from "@/i18n/language";
+import { RichMessage, useT } from "@/i18n/use-translation";
 
 import {
-  modelSourceErrorCopy,
+  modelSourceFailureCopy,
   modelSourceModeLabels,
   modelSourceRuntimeLabels,
 } from "./local-models-copy";
+import { localModelsMessages as m } from "./local-models.messages";
 import {
+  invalidateOfflineComputer,
   type LocalModel,
   tenantLocalModelsQueryKey,
 } from "./local-models-queries";
-import { formatGigabytes } from "./local-models-rules";
+import { formatGigabytes, joinList } from "./local-models-rules";
 import {
   type ModelSourceMode,
   type ModelSourceStatus,
@@ -39,16 +44,14 @@ import {
 // unloads local models.
 const modes: readonly ModelSourceMode[] = ["local", "byok"];
 
-const byokExplanation =
-  "Bring your own key: use your own OpenAI-compatible or Anthropic API endpoint. A gateway on this computer serves it to your Agents.";
-
 /** What the page says the Computer's Agents run on now. */
-export function activeSourceLabel(status: ModelSourceStatus) {
+export function activeSourceLabel(status: ModelSourceStatus, t: Translate) {
   const runtime = modelSourceRuntimeLabels[status.runtime];
   if (status.mode === "byok")
-    return `BYOK · ${status.byok.model_id ?? runtime}`;
-  if (status.mode === "subscription") return `Subscription · ${runtime}`;
-  return "Local model";
+    return t(m.sourceByok, { model: status.byok.model_id ?? runtime });
+  if (status.mode === "subscription")
+    return t(m.sourceSubscription, { runtime });
+  return t(m.modeLocal);
 }
 
 export interface ModelSourceSwitcher {
@@ -74,23 +77,32 @@ export function useModelSourceSwitch({
   computerName: string;
   tenantId: string;
 }) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState<{
     agents: string[];
     body: ModelSourceSwitchRequest;
   } | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  // The answer to the last switch, kept so its notice follows the language.
+  const [switched, setSwitched] = useState<ModelSourceView | null>(null);
   const [saveRevision, setSaveRevision] = useState(0);
   const mutation = useMutation({
     mutationFn: (body: ModelSourceSwitchRequest) =>
       switchModelSource(client, tenantId, computerId, body),
     onError: (error, body) => {
-      // A switch can fail after the Computer changed (work started meanwhile,
-      // or no answer in time), so show what it serves now.
-      void queryClient.invalidateQueries({
-        queryKey: modelSourceQueryKey(tenantId, computerId),
-      });
+      if (
+        error instanceof TeamHubError &&
+        error.code === "LOCAL_COMPUTER_OFFLINE"
+      ) {
+        void invalidateOfflineComputer(queryClient, tenantId, computerId);
+      } else {
+        // A switch can fail after the Computer changed (work started meanwhile,
+        // or no answer in time), so show what it serves now.
+        void queryClient.invalidateQueries({
+          queryKey: modelSourceQueryKey(tenantId, computerId),
+        });
+      }
       if (
         error instanceof TeamHubError &&
         error.code === "AGENT_HAS_ACTIVE_RUNS"
@@ -100,10 +112,10 @@ export function useModelSourceSwitch({
           body,
         });
     },
-    onMutate: () => setNotice(null),
+    onMutate: () => setSwitched(null),
     onSuccess: (view) => {
       queryClient.setQueryData(modelSourceQueryKey(tenantId, computerId), view);
-      setNotice(switchedNotice(view));
+      setSwitched(view);
       setSaveRevision((current) => current + 1);
       void Promise.all([
         queryClient.invalidateQueries({
@@ -121,16 +133,16 @@ export function useModelSourceSwitch({
       ]);
     },
   });
-  const failureCode =
-    mutation.error instanceof TeamHubError ? mutation.error.code : undefined;
+  const failureError =
+    mutation.error instanceof TeamHubError ? mutation.error : undefined;
   const switcher: ModelSourceSwitcher = {
     clearFeedback: () => {
-      setNotice(null);
+      setSwitched(null);
       if (mutation.isError) mutation.reset();
     },
     failure:
-      mutation.isError && failureCode !== "AGENT_HAS_ACTIVE_RUNS"
-        ? modelSourceErrorCopy(failureCode)
+      mutation.isError && failureError?.code !== "AGENT_HAS_ACTIVE_RUNS"
+        ? modelSourceFailureCopy(failureError, t)
         : undefined,
     pending: mutation.isPending ? mutation.variables : undefined,
     request: (body) => mutation.mutate(body),
@@ -138,9 +150,11 @@ export function useModelSourceSwitch({
   };
   const feedback = (
     <>
-      {notice ? (
+      {switched ? (
         <div className="mt-4">
-          <FormFeedback tone="success">{notice}</FormFeedback>
+          <FormFeedback tone="success">
+            {switchedNotice(switched, t)}
+          </FormFeedback>
         </div>
       ) : null}
       {busy ? (
@@ -159,18 +173,16 @@ export function useModelSourceSwitch({
   return { feedback, switcher };
 }
 
-function switchedNotice(view: ModelSourceView) {
-  if (!view.status) return "Switched.";
+function switchedNotice(view: ModelSourceView, t: Translate) {
+  if (!view.status) return t(m.switched);
   const updated = view.updated_agent_count ?? 0;
   const ended = view.terminated_run_count ?? 0;
-  const parts = [`Agents now use ${activeSourceLabel(view.status)}.`];
-  if (updated)
-    parts.push(
-      `${updated} ${updated === 1 ? "Agent was" : "Agents were"} moved.`,
-    );
-  if (ended)
-    parts.push(`${ended} ${ended === 1 ? "task was" : "tasks were"} ended.`);
-  return parts.join(" ");
+  const parts = [
+    t(m.agentsNowUse, { source: activeSourceLabel(view.status, t) }),
+  ];
+  if (updated) parts.push(t(m.agentsMoved, { count: updated }));
+  if (ended) parts.push(t(m.tasksEnded, { count: ended }));
+  return parts.reduce((first, second) => t(m.sentences, { first, second }));
 }
 
 function TerminateTasksDialog({
@@ -184,30 +196,38 @@ function TerminateTasksDialog({
   onClose: () => void;
   onConfirm: () => void;
 }) {
-  const names = agents.length ? agents.join(", ") : "Some Agents";
+  const t = useT();
   return (
     <ModalDialog
-      description={`${names} ${agents.length === 1 ? "is" : "are"} working on tasks on ${computerName}. Switching now ends those tasks; they can't be resumed.`}
+      description={
+        agents.length
+          ? t(m.terminateDescription, {
+              computer: computerName,
+              count: agents.length,
+              names: joinList(agents, t),
+            })
+          : t(m.terminateDescriptionSome, { computer: computerName })
+      }
       footer={
         <>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={onClose}>{t(commonMessages.cancel)}</Button>
           <Button onClick={onConfirm} tone="danger">
-            Terminate tasks & Switch
+            {t(m.terminateConfirm)}
           </Button>
         </>
       }
       onClose={onClose}
       size="md"
-      title="End running tasks?"
+      title={t(m.terminateTitle)}
     >
       <p className="px-5 py-4 text-sm text-muted-foreground">
-        To keep them, wait until they finish and switch then.
+        {t(m.terminateBody)}
       </p>
     </ModalDialog>
   );
 }
 
-/** The offered model sources as tabs; a dot marks the one in use. */
+/** The offered model sources as underline tabs; a dot marks the one in use. */
 export function ModelSourceTabs({
   active,
   onChange,
@@ -217,45 +237,72 @@ export function ModelSourceTabs({
   onChange: (mode: ModelSourceMode) => void;
   value: ModelSourceMode;
 }) {
+  const t = useT();
+  const indicatorKey = `${value}:${active}`;
+  const { indicator, tabRef } = useTabIndicator(indicatorKey);
+
+  function handleKeyDown(
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const step = event.key === "ArrowRight" ? 1 : -1;
+    const nextIndex = (index + step + modes.length) % modes.length;
+    const nextMode = modes[nextIndex];
+    if (!nextMode) return;
+    onChange(nextMode);
+    const tabs = event.currentTarget
+      .closest('[role="tablist"]')
+      ?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    tabs?.[nextIndex]?.focus();
+  }
+
   return (
-    <div
-      aria-label="Model source"
-      className="mt-6 inline-flex self-start rounded-lg bg-muted p-0.5"
-      role="tablist"
-    >
-      {modes.map((mode) => {
-        const tab = (
-          <button
-            aria-selected={mode === value}
-            className={cn(
-              "inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none",
-              mode === value
-                ? "bg-background text-foreground shadow-xs"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-            key={mode}
-            onClick={() => onChange(mode)}
-            role="tab"
-            type="button"
-          >
-            {mode === active ? (
-              <span
-                aria-label="In use"
-                className="size-1.5 rounded-full bg-app-success"
-                role="img"
-              />
-            ) : null}
-            {modelSourceModeLabels[mode]}
-          </button>
-        );
-        return mode === "byok" ? (
-          <Hint key={mode} placement="top" text={byokExplanation}>
-            {tab}
-          </Hint>
-        ) : (
-          tab
-        );
-      })}
+    <div className="mt-5 border-b border-border">
+      <div
+        aria-label={t(m.modelSource)}
+        className="relative -ml-3 inline-flex max-w-full self-start gap-1"
+        role="tablist"
+      >
+        {modes.map((mode, index) => {
+          const tab = (
+            <button
+              aria-selected={mode === value}
+              className="workspace-view-tab inline-flex h-9 shrink-0 items-center gap-1.5 rounded-t-md px-3 text-sm font-medium text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+              onClick={() => onChange(mode)}
+              onKeyDown={(event) => handleKeyDown(event, index)}
+              role="tab"
+              type="button"
+            >
+              {mode === active ? (
+                <span
+                  aria-label={t(m.inUse)}
+                  className="size-1.5 rounded-full bg-app-success"
+                  role="img"
+                />
+              ) : null}
+              {t(modelSourceModeLabels[mode])}
+            </button>
+          );
+          return (
+            <span
+              className="inline-flex shrink-0"
+              key={mode}
+              ref={tabRef(`${mode}:${active}`)}
+            >
+              {mode === "byok" ? (
+                <Hint placement="top" text={t(m.byokExplanation)}>
+                  {tab}
+                </Hint>
+              ) : (
+                tab
+              )}
+            </span>
+          );
+        })}
+        {indicator}
+      </div>
     </div>
   );
 }
@@ -270,6 +317,7 @@ export function SwitchToLocalNotice({
   models: readonly LocalModel[];
   switcher: ModelSourceSwitcher;
 }) {
+  const t = useT();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
   const chosen =
     (selectedId
@@ -278,32 +326,41 @@ export function SwitchToLocalNotice({
   const single = models.length === 1 ? models[0] : undefined;
 
   return (
-    <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted px-4 py-3">
+    <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3.5">
       <p className="min-w-0 flex-1 text-sm text-muted-foreground">
         {single ? (
-          <>
-            <span className="text-foreground">{single.name}</span> is on this
-            computer and can run your Agents locally.
-          </>
-        ) : models.length > 1 ? (
-          "Choose a model on this computer to run your Agents locally."
+          <RichMessage
+            message={m.switchLocalSingle}
+            tags={{
+              model: (text) => (
+                <span className="font-medium text-foreground">{text}</span>
+              ),
+            }}
+            values={{ name: single.name }}
+          />
         ) : (
-          "Download a model below to run your Agents locally."
+          t(models.length > 1 ? m.switchLocalChoose : m.switchLocalDownload)
         )}
       </p>
       <div className="flex shrink-0 flex-wrap items-center gap-2">
         {models.length > 1 && chosen ? (
           <Select
-            aria-label="Local model"
+            aria-label={t(m.modeLocal)}
             onValueChange={setSelectedId}
             value={chosen.id}
             variant="pill"
           >
             {models.map((model) => (
               <SelectItem key={model.id} value={model.id}>
-                {model.name} ·{" "}
-                {model.state === "loaded" ? "Loaded" : "Downloaded"} ·{" "}
-                {formatGigabytes(model.memory_bytes)}
+                {t(
+                  model.state === "loaded"
+                    ? m.localOptionLoaded
+                    : m.localOptionDownloaded,
+                  {
+                    name: model.name,
+                    size: formatGigabytes(model.memory_bytes, t),
+                  },
+                )}
               </SelectItem>
             ))}
           </Select>
@@ -318,7 +375,7 @@ export function SwitchToLocalNotice({
           size="compact"
           tone="primary"
         >
-          Switch to Local model
+          {t(m.switchToLocal)}
         </Button>
       </div>
     </div>

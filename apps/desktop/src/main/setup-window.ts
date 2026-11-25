@@ -20,16 +20,25 @@ import logoPng from "../../resources/logo-horizontal.png";
 import scenePng from "../../../linger-installer/public/onboarding/welcome-scene.png";
 // The SPA's typeface, so the setup page reads like the app it opens.
 import geistWoff2 from "@fontsource-variable/geist/files/geist-latin-wght-normal.woff2";
+import { localizePage } from "../i18n/page.js";
+import messagesHtml from "../shell/messages.html";
+import { offlineMessages } from "../shell/offline.messages.js";
 import setupHtml from "../shell/setup.html";
+import { setupMessages } from "../shell/setup.messages.js";
 import {
+  NVIDIA_DRIVER_DOWNLOAD_URL,
+  NVIDIA_DRIVER_GUIDE_URL,
   SETUP_IPC,
   type SetupCommand,
   type SetupLocalAccount,
   type SetupState,
 } from "../shared/setup.js";
 import { appWindow } from "./app-window.js";
+import { dialogMessages } from "./dialogs.messages.js";
 import type { DiagnosticsModule } from "./diagnostics.js";
+import type { DriverUpdaterHost } from "./driver-updater.js";
 import type { EnrollmentModule } from "./enrollment.js";
+import type { LanguageModule } from "./language.js";
 import type { LocalServerModule } from "./local-server.js";
 import {
   SETTINGS_URL,
@@ -40,7 +49,7 @@ import type { Module, ModuleContext } from "./modules.js";
 import type { PowerGuardModule } from "./power-guard.js";
 import { SetupAccount } from "./setup-account.js";
 import { parseSetupCommand } from "./setup-command.js";
-import { INVALID_SERVER, type WindowManagerModule } from "./window-manager.js";
+import type { WindowManagerModule } from "./window-manager.js";
 import type { WorkspaceGrantsModule } from "./workspace-grants.js";
 
 export interface SetupWindowOptions {
@@ -55,6 +64,7 @@ export interface SetupWindowOptions {
   };
   // macOS only.
   readonly permissions?: MacPermissions;
+  readonly driverUpdater?: DriverUpdaterHost;
 }
 
 const SETUP_URL = "app://setup/";
@@ -68,6 +78,7 @@ export class SetupWindowModule implements Module {
   readonly dependsOn = [
     "Diagnostics",
     "Enrollment",
+    "Language",
     "LocalServer",
     "PowerGuard",
     "WindowManager",
@@ -77,6 +88,11 @@ export class SetupWindowModule implements Module {
   #ctx: ModuleContext | undefined;
   #window: BrowserWindow | undefined;
   #signedIn = false;
+  // The runtime's sign-in was waiting on the browser.
+  #runtimeSigningIn = false;
+  // Re-check local models when returning from NVIDIA App or a driver download.
+  #driverUpdatePendingRecheck = false;
+  #lastDriverAutoRecheckAt = 0;
   #permissions: PermissionStatuses | undefined;
   #diagnostics: SetupState["diagnostics"];
   #account: SetupAccount | undefined;
@@ -122,6 +138,13 @@ export class SetupWindowModule implements Module {
     const onCookie = (): void => void this.#refreshSignedIn().then(push);
     // The account file exists once the installation is ready.
     const onLocal = (): void => {
+      // Back from signing in to the runtime in the browser: setup comes to
+      // the front again and goes on by itself.
+      const signIn = local.status().signIn?.state;
+      if (signIn === "signed_in" && this.#runtimeSigningIn && this.visible())
+        this.show();
+      this.#runtimeSigningIn =
+        signIn === "starting" || signIn === "waiting_user";
       push();
       if (local.status().phase === "ready")
         void this.#refreshAccount().then(push);
@@ -134,6 +157,12 @@ export class SetupWindowModule implements Module {
       () => pages.protocol.unhandle("app"),
       ctx.bus.on("computer.changed", push),
       ctx.bus.on("diagnostics.changed", push),
+      ctx.bus.on("driver-update.changed", () => {
+        push();
+        if (this.#options.driverUpdater?.installState().phase === "completed") {
+          ctx.get<LocalServerModule>("LocalServer").recheck();
+        }
+      }),
       ctx.bus.on("power.changed", push),
       ctx.bus.on("grants.changed", push),
       ctx.bus.on("local-server.changed", onLocal),
@@ -176,7 +205,7 @@ export class SetupWindowModule implements Module {
       maximizable: false,
       fullscreenable: false,
       show: false,
-      title: "Set Up Linger",
+      title: this.#t(dialogMessages.setupTitle),
       backgroundColor: "#ffffff",
       icon: nativeImage.createFromBuffer(Buffer.from(iconPng)),
       ...(process.platform === "darwin"
@@ -199,11 +228,11 @@ export class SetupWindowModule implements Module {
     contents.setWindowOpenHandler(() => ({ action: "deny" }));
     contents.on("will-attach-webview", (event) => event.preventDefault());
     window.once("ready-to-show", () => window.show());
-    // Back from System Settings: show what changed there.
-    window.on(
-      "focus",
-      () => void this.#refreshPermissions().then(() => this.#push()),
-    );
+    // Back from System Settings or a driver updater: show what changed there.
+    window.on("focus", () => {
+      void this.#refreshPermissions().then(() => this.#push());
+      this.#maybeRecheckDriverOnFocus();
+    });
     window.on("closed", () => {
       if (this.#window === window) this.#window = undefined;
       this.#account?.hide();
@@ -218,14 +247,51 @@ export class SetupWindowModule implements Module {
     this.#ctx?.get<LocalServerModule>("LocalServer").inspect();
   }
 
+  get #t() {
+    return this.#ctx!.get<LanguageModule>("Language").t;
+  }
+
   async #run(command: SetupCommand): Promise<void> {
     const ctx = this.#ctx!;
     const windows = ctx.get<WindowManagerModule>("WindowManager");
     switch (command.op) {
       case "server.set":
         if (!windows.setServer(command.serverUrl))
-          throw new Error(INVALID_SERVER);
+          throw new Error(this.#t(offlineMessages.invalidServer));
         await this.#refreshSignedIn();
+        return;
+      case "external.open":
+        if (
+          command.url === NVIDIA_DRIVER_DOWNLOAD_URL ||
+          command.url === NVIDIA_DRIVER_GUIDE_URL
+        ) {
+          this.#driverUpdatePendingRecheck = true;
+        }
+        await shell.openExternal(command.url);
+        return;
+      case "driver.open-nvidia-app": {
+        this.#driverUpdatePendingRecheck = true;
+        const result = await this.#options.driverUpdater?.openNvidiaApp();
+        if (!result?.ok) {
+          await shell.openExternal(NVIDIA_DRIVER_DOWNLOAD_URL);
+        }
+        return;
+      }
+      case "driver.start-install": {
+        this.#driverUpdatePendingRecheck = true;
+        const local = ctx.get<LocalServerModule>("LocalServer");
+        const models = local.status().localModels;
+        const gpuName = models.state === "checked" ? models.gpu : undefined;
+        await this.#options.driverUpdater?.startInstall({
+          ...(gpuName ? { gpuName } : {}),
+          ...(command.requiredCuda
+            ? { requiredCuda: command.requiredCuda }
+            : {}),
+        });
+        return;
+      }
+      case "driver.clear-state":
+        this.#options.driverUpdater?.clearInstallState();
         return;
       case "local.start": {
         const local = ctx.get<LocalServerModule>("LocalServer");
@@ -253,8 +319,8 @@ export class SetupWindowModule implements Module {
         return;
       case "local.location.pick": {
         const picked = await dialog.showOpenDialog(this.#window!, {
-          title: "Choose Where to Install Linger",
-          buttonLabel: "Choose",
+          title: this.#t(dialogMessages.chooseInstallFolder),
+          buttonLabel: this.#t(dialogMessages.choose),
           properties: ["openDirectory", "createDirectory"],
         });
         if (picked.canceled || !picked.filePaths[0]) return;
@@ -269,8 +335,18 @@ export class SetupWindowModule implements Module {
       case "local.signin.start":
         await ctx
           .get<LocalServerModule>("LocalServer")
-          .startSignIn(command.code);
+          .startSignIn(command.code, command.device);
         return;
+      case "local.signin.copy": {
+        // Copied from what the step shows, never from the page.
+        const signIn = ctx
+          .get<LocalServerModule>("LocalServer")
+          .status().signIn;
+        const text = command.what === "code" ? signIn?.deviceCode : signIn?.url;
+        if (!text) throw new Error("Nothing to copy");
+        clipboard.writeText(text);
+        return;
+      }
       case "local.signin.open":
         await ctx.get<LocalServerModule>("LocalServer").openSignInPage();
         return;
@@ -305,8 +381,8 @@ export class SetupWindowModule implements Module {
       case "notifications.test":
         if (Notification.isSupported())
           new Notification({
-            title: "Notifications are on",
-            body: "Linger will tell you here when a task needs you.",
+            title: this.#t(dialogMessages.notificationsOnTitle),
+            body: this.#t(dialogMessages.notificationsOn),
           }).show();
         return;
       case "prevent-sleep.set":
@@ -383,6 +459,17 @@ export class SetupWindowModule implements Module {
         this.#account?.view(),
       ),
       ...(this.#diagnostics ? { diagnostics: this.#diagnostics } : {}),
+      ...(this.#options.driverUpdater
+        ? {
+            driverUpdate: {
+              nvidiaApp: this.#options.driverUpdater.capabilities().nvidiaApp,
+              directInstallSupported:
+                this.#options.driverUpdater.capabilities()
+                  .directInstallSupported,
+              installState: this.#options.driverUpdater.installState(),
+            },
+          }
+        : {}),
       ...(diagnostics.uploadUrl()
         ? { diagnosticsSend: diagnostics.sender.state() }
         : {}),
@@ -413,6 +500,31 @@ export class SetupWindowModule implements Module {
     }
   }
 
+  #maybeRecheckDriverOnFocus(): void {
+    if (!this.#driverUpdatePendingRecheck) return;
+    const local = this.#ctx?.get<LocalServerModule>("LocalServer");
+    if (!local) return;
+    const models = local.status().localModels;
+    const driverBlocked =
+      models.state === "checked" &&
+      Boolean(models.blockedNow) &&
+      Boolean(
+        models.reasons?.some(
+          (reason) =>
+            reason.code === "cuda-driver-update-required" ||
+            reason.code === "cuda-driver-version-unknown",
+        ),
+      );
+    if (!driverBlocked) {
+      this.#driverUpdatePendingRecheck = false;
+      return;
+    }
+    const now = Date.now();
+    if (now - this.#lastDriverAutoRecheckAt < 3000) return;
+    this.#lastDriverAutoRecheckAt = now;
+    local.recheck();
+  }
+
   #push(): void {
     const contents = this.#window?.webContents;
     if (contents && !contents.isDestroyed())
@@ -438,7 +550,15 @@ export class SetupWindowModule implements Module {
       return new Response(Buffer.from(geistWoff2), {
         headers: { "content-type": "font/woff2" },
       });
-    return new Response(setupHtml, {
+    // In the language of the moment it opens; the Web client, where the
+    // language is chosen, is not on screen while setup is.
+    const page = localizePage(
+      setupHtml,
+      messagesHtml,
+      setupMessages,
+      this.#ctx!.get<LanguageModule>("Language").current(),
+    );
+    return new Response(page, {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
@@ -452,10 +572,12 @@ const localServerState = (
     available,
     phase,
     message,
+    preparing,
     steps,
     step,
     progress,
     transfer,
+    waiting,
     attempt,
     localModels,
     location,
@@ -464,6 +586,8 @@ const localServerState = (
     byokCheck,
     byokModels,
     legacyBackup,
+    refusal,
+    failure,
   } = local.status();
   const home = os.homedir();
   const shown = (folder: string) =>
@@ -474,10 +598,12 @@ const localServerState = (
     available,
     phase,
     message,
+    ...(preparing ? { preparing } : {}),
     steps,
     step,
     progress,
     ...(transfer ? { transfer } : {}),
+    ...(waiting ? { waiting } : {}),
     attempt,
     localModels,
     location: {
@@ -489,6 +615,8 @@ const localServerState = (
     ...(byokCheck ? { byokCheck } : {}),
     ...(byokModels ? { byokModels } : {}),
     ...(legacyBackup ? { legacyBackup: shown(legacyBackup) } : {}),
+    ...(refusal ? { refusal } : {}),
+    ...(failure ? { failure } : {}),
     ...(account ? { account } : {}),
   };
 };

@@ -6,6 +6,7 @@ import {
 import { useState } from "react";
 
 import { Icon } from "@/components/ui/icon";
+import { useT } from "@/i18n/use-translation";
 
 import type {
   TeamHubActorRef,
@@ -16,7 +17,12 @@ import { ActorAvatar } from "../members/actor-avatar";
 import { RoomAvatar } from "../members/room-avatar";
 import { cn } from "@/lib/cn";
 
+import { sidePanelMessages as m } from "./side-panel.messages";
+
 type InfoView = "agents" | "files";
+
+const viewLabels = { agents: m.sectionAgents, files: m.sectionFiles };
+const kindLabels = { agent: m.kindAgent, human: m.kindHuman };
 
 export function RoomInfoPanel({
   documents,
@@ -33,6 +39,7 @@ export function RoomInfoPanel({
   onOpenRoomSettings?: () => void;
   roomName: string;
 }) {
+  const t = useT();
   const [view, setView] = useState<InfoView>("agents");
 
   return (
@@ -53,10 +60,10 @@ export function RoomInfoPanel({
             <h1 className="truncate text-xl text-foreground">{roomName}</h1>
             {onOpenRoomSettings ? (
               <button
-                aria-label="Edit Room"
+                aria-label={t(m.editRoom)}
                 className="flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                 onClick={onOpenRoomSettings}
-                title="Edit Room"
+                title={t(m.editRoom)}
                 type="button"
               >
                 <Icon icon={PencilEdit01Icon} size={14} />
@@ -64,7 +71,7 @@ export function RoomInfoPanel({
             ) : null}
           </div>
           <div
-            aria-label={`${members.length} ${members.length === 1 ? "member" : "members"}`}
+            aria-label={t(m.memberCount, { count: members.length })}
             className="mt-5 flex h-7 items-center justify-center rounded-full bg-muted px-2.5"
           >
             <div className="flex items-center pl-1">
@@ -92,7 +99,7 @@ export function RoomInfoPanel({
         </header>
 
         <div
-          aria-label="Room info sections"
+          aria-label={t(m.roomInfoSections)}
           className="mt-6 flex items-center gap-1"
           role="tablist"
         >
@@ -112,7 +119,7 @@ export function RoomInfoPanel({
                 role="tab"
                 type="button"
               >
-                {item}
+                {t(viewLabels[item])}
               </button>
             );
           })}
@@ -137,13 +144,13 @@ export function RoomInfoPanel({
                       {member.display_name}
                     </span>
                     <span className="text-xs capitalize text-muted-foreground">
-                      {member.kind}
+                      {t(kindLabels[member.kind])}
                     </span>
                   </div>
                 ))}
               </div>
             ) : (
-              <EmptyInfo label="No members" />
+              <EmptyInfo label={t(m.noMembers)} />
             )
           ) : documents.length ? (
             <div className="space-y-1">
@@ -166,7 +173,7 @@ export function RoomInfoPanel({
               ))}
             </div>
           ) : (
-            <EmptyInfo label="No Room files" />
+            <EmptyInfo label={t(m.noRoomFiles)} />
           )}
         </div>
       </div>

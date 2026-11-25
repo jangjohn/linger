@@ -14,6 +14,7 @@ import {
 } from "@/features/rooms/room-queries";
 import { teamHubData } from "@/features/teamhub/teamhub-api";
 import type { TeamHubClient } from "@/features/teamhub/teamhub-client";
+import { useT } from "@/i18n/use-translation";
 
 import {
   clearGlobalSearchQueries,
@@ -36,6 +37,7 @@ import {
   type SearchResult,
   type TargetContext,
 } from "./global-search-model";
+import { searchMessages as m } from "./global-search.messages";
 import { matchesSearchQuery, normalizeSearchQuery } from "./search-text";
 
 /** The typed text, its debounced form, the type scope and Recent searches. */
@@ -284,6 +286,7 @@ export function useResultSections({
   tab: GlobalSearchTab;
   tenantId: string;
 }) {
+  const t = useT();
   const showingStart = debouncedQuery === "" && tab === "all";
   const sections = useMemo<ResultSection[]>(() => {
     if (showingStart) {
@@ -297,14 +300,15 @@ export function useResultSections({
             }),
           ),
           key: "search-in",
-          label: "Search in",
+          label: t(m.searchIn),
           layout: "scopes",
         },
       ];
       if (store.queries.length > 0) {
         startSections.push({
           action: {
-            label: "Clear",
+            ariaLabel: t(m.clearRecent),
+            label: t(m.clear),
             onSelect: () => setStore(clearGlobalSearchQueries(tenantId)),
           },
           items: store.queries.map(
@@ -315,7 +319,7 @@ export function useResultSections({
             }),
           ),
           key: "recent-searches",
-          label: "Recent",
+          label: t(m.recent),
           layout: "rows",
         });
       }
@@ -324,7 +328,7 @@ export function useResultSections({
     const visible =
       tab === "all" ? groups : groups.filter((g) => g.tab === tab);
     return visible.flatMap((group): ResultSection[] => {
-      const label = SCOPES[group.tab].label;
+      const label = t(SCOPES[group.tab].label);
       const loading =
         (group.tab === "messages" && messagesLoading) ||
         (group.tab === "docs" && docsLoading);
@@ -356,6 +360,7 @@ export function useResultSections({
     setStore,
     showingStart,
     store,
+    t,
     tab,
     tenantId,
   ]);

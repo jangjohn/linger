@@ -1,10 +1,12 @@
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
 import path from "node:path";
 import {
   isByokProtocol,
   validByokPath,
   type ByokProtocol,
 } from "@linger/service-kit/byok-endpoint";
-import { readPrivate } from "./instance.js";
+import { atomicPrivate, readPrivate } from "./instance.js";
 import {
   localmodelsBaseDirectory,
   localmodelsStateDirectory,
@@ -50,6 +52,8 @@ export interface ByokModelListing {
   models: { id: string; name?: string; contextWindow?: number }[];
 }
 
+const NATIVE_RUNTIMES: readonly NativeRuntime[] = ["claude", "codex", "pi"];
+
 interface StoredModelSource {
   schema: "localmodels.model-source/v1";
   mode: "local" | "subscription" | "byok";
@@ -58,6 +62,7 @@ interface StoredModelSource {
   model_label: string | null;
   gateway_url: string | null;
   environment: Record<string, string>;
+  runtime_paths?: Partial<Record<NativeRuntime, string>>;
 }
 
 const PRIVATE_HOST_IPV4 =
@@ -224,12 +229,69 @@ function endpointFailure(
   return Object.assign(new Error(message), { code });
 }
 
-function parseToolJson(stdout: string): Record<string, unknown> | undefined {
-  try {
-    return JSON.parse(stdout) as Record<string, unknown>;
-  } catch {
-    return undefined;
+/**
+ * Extracts the final top-level JSON object from stdout, handling sequential
+ * mixes of JSONL progress lines and pretty-printed multi-line JSON objects.
+ */
+export function lastJsonObject(
+  stdout: string,
+): Record<string, unknown> | undefined {
+  let last: Record<string, unknown> | undefined;
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  let retries = 0;
+  for (let i = 0; i < stdout.length; i += 1) {
+    const ch = stdout[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      if (depth > 0) inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        try {
+          const parsed = JSON.parse(stdout.slice(start, i + 1)) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            last = parsed as Record<string, unknown>;
+          }
+        } catch {
+          if (retries < 64) {
+            retries += 1;
+            i = start;
+          }
+        }
+        start = -1;
+      }
+    }
+    if (i === stdout.length - 1 && depth > 0 && start >= 0 && retries < 64) {
+      retries += 1;
+      i = start;
+      depth = 0;
+      start = -1;
+      inString = false;
+      escaped = false;
+    }
   }
+  return last;
+}
+
+function parseToolJson(stdout: string): Record<string, unknown> | undefined {
+  return lastJsonObject(stdout);
 }
 
 /** Sends one request to the endpoint's address from this computer. */
@@ -320,22 +382,172 @@ export async function listByokModels(
 // cut off.
 const SOURCE_APPLY_IDLE_TIMEOUT_MS = 240_000;
 
+function modelSourceStateFile(home: string): string {
+  return path.join(localmodelsStateDirectory(home), "model-source.json");
+}
+
+function harnessRootDirectory(home: string): string {
+  return path.join(path.resolve(home), "runtime", "harness");
+}
+
+async function isExecutableFile(
+  candidate: unknown,
+): Promise<string | undefined> {
+  if (typeof candidate !== "string") return undefined;
+  const trimmed = candidate.trim();
+  if (!trimmed || !path.isAbsolute(trimmed)) return undefined;
+  try {
+    const info = await stat(trimmed);
+    if (!info.isFile()) return undefined;
+    if (process.platform !== "win32") {
+      if ((info.mode & 0o111) === 0) return undefined;
+      await access(trimmed, constants.X_OK);
+    }
+    return path.normalize(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+async function extractValidRuntimePaths(
+  source: unknown,
+): Promise<Partial<Record<NativeRuntime, string>>> {
+  const paths: Partial<Record<NativeRuntime, string>> = {};
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return paths;
+  }
+  const record = source as Record<string, unknown>;
+  for (const rt of NATIVE_RUNTIMES) {
+    const valid = await isExecutableFile(record[rt]);
+    if (valid) paths[rt] = valid;
+  }
+  return paths;
+}
+
+function isPathWithin(prefix: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(prefix), path.resolve(candidate));
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
+function sameRuntimePaths(
+  existing: unknown,
+  next: Partial<Record<NativeRuntime, string>>,
+): boolean {
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+    return Object.keys(next).length === 0;
+  }
+  const existingRecord = existing as Record<string, unknown>;
+  const existingKeys = Object.keys(existingRecord);
+  const nextKeys = Object.keys(next) as NativeRuntime[];
+  return (
+    existingKeys.length === nextKeys.length &&
+    nextKeys.every((key) => existingRecord[key] === next[key])
+  );
+}
+
+async function readPreviousRuntimePaths(
+  stateFile: string,
+): Promise<Partial<Record<NativeRuntime, string>>> {
+  try {
+    const raw = await readPrivate(stateFile);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return await extractValidRuntimePaths(
+      (parsed as Record<string, unknown>).runtime_paths,
+    );
+  } catch {
+    return {};
+  }
+}
+
+async function persistAppliedRuntimePaths(
+  home: string,
+  stateFile: string,
+  stdout: string,
+  previousPaths: Partial<Record<NativeRuntime, string>>,
+  descriptor?: RuntimeDescriptor,
+): Promise<void> {
+  let raw: string | undefined;
+  try {
+    raw = await readPrivate(stateFile);
+  } catch {
+    return;
+  }
+  if (!raw) return;
+  let doc: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    doc = parsed as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  const harnessRoot = harnessRootDirectory(home);
+  const outsideHarness = (exe: string | undefined): string | undefined =>
+    exe && !isPathWithin(harnessRoot, exe) ? exe : undefined;
+  const existingPaths = await extractValidRuntimePaths(doc.runtime_paths);
+  const stdoutDoc = lastJsonObject(stdout);
+  const stdoutPaths = await extractValidRuntimePaths(stdoutDoc?.runtime_paths);
+  const descriptorPaths =
+    descriptor?.installed &&
+    descriptor.executable &&
+    descriptor.argvPrefix.length === 0
+      ? await extractValidRuntimePaths({
+          [descriptor.runtime]: descriptor.executable,
+        })
+      : {};
+  const merged: Partial<Record<NativeRuntime, string>> = {};
+  for (const rt of NATIVE_RUNTIMES) {
+    if (stdoutPaths[rt]) {
+      merged[rt] = stdoutPaths[rt];
+    } else if (descriptorPaths[rt]) {
+      const nonHarnessDescriptor = outsideHarness(descriptorPaths[rt]);
+      if (nonHarnessDescriptor) merged[rt] = nonHarnessDescriptor;
+    } else {
+      const chosen =
+        outsideHarness(existingPaths[rt]) ?? outsideHarness(previousPaths[rt]);
+      if (chosen) merged[rt] = chosen;
+    }
+  }
+  if (Object.keys(merged).length === 0) {
+    if (!("runtime_paths" in doc)) return;
+    delete doc.runtime_paths;
+  } else {
+    if (sameRuntimePaths(doc.runtime_paths, merged)) return;
+    doc.runtime_paths = merged;
+  }
+  await atomicPrivate(stateFile, `${JSON.stringify(doc, null, 2)}\n`);
+}
+
 // The installer switches the source through localmodels, as the Computer
-// does from Settings, so model-source.json has one writer.
-function applySource(
+// does from Settings, so model-source.json has one primary writer. Because
+// localmodels omits runtime_paths when rewriting model-source.json, merge back
+// valid non-harness executables alongside any stdout or non-harness descriptor
+// paths and leave harness scanning to the Daemon's OverlayRuntimePaths.
+async function applySource(
   home: string,
   mode: "local" | "subscription" | "byok",
   runtime: NativeRuntime,
   options: {
     signal: AbortSignal;
+    model?: string;
     timeoutMs?: number;
     idleTimeoutMs?: number;
     input?: string;
     onEvent?: (event: InstallerEvent) => void;
+    descriptor?: RuntimeDescriptor;
   },
   localmodels: typeof runLocalmodels,
 ) {
-  return localmodels(
+  const stateFile = modelSourceStateFile(home);
+  const previousPaths = await readPreviousRuntimePaths(stateFile);
+  const result = await localmodels(
     home,
     [
       "source",
@@ -344,10 +556,11 @@ function applySource(
       mode,
       "--runtime",
       runtime,
+      ...(options.model ? ["--model", options.model] : []),
       "--base-dir",
       localmodelsBaseDirectory(home),
       "--harness-root",
-      path.join(path.resolve(home), "runtime", "harness"),
+      harnessRootDirectory(home),
       "--node",
       process.execPath,
       ...(options.input === undefined ? [] : ["--config-stdin"]),
@@ -365,7 +578,20 @@ function applySource(
       ...(options.input === undefined ? {} : { input: options.input }),
     },
   );
+  if (result.code === 0) {
+    options.signal.throwIfAborted();
+    await persistAppliedRuntimePaths(
+      home,
+      stateFile,
+      result.stdout,
+      previousPaths,
+      options.descriptor,
+    );
+  }
+  return result;
 }
+
+const SOURCE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 function sourceApplyFailure(
   stdout: string,
@@ -374,15 +600,14 @@ function sourceApplyFailure(
 ): InstallOutcome {
   let detail = message;
   let detailCode = code;
-  try {
-    const errDoc = JSON.parse(stdout) as { message?: unknown; code?: unknown };
-    if (typeof errDoc.message === "string" && errDoc.message)
-      detail = errDoc.message;
-    if (typeof errDoc.code === "string" && errDoc.code)
-      detailCode = errDoc.code;
-  } catch {
-    /* Non-JSON tool output stays private. */
-  }
+  const errDoc = lastJsonObject(stdout);
+  if (typeof errDoc?.message === "string" && errDoc.message)
+    detail = errDoc.message;
+  if (
+    typeof errDoc?.code === "string" &&
+    SOURCE_ERROR_CODE_PATTERN.test(errDoc.code)
+  )
+    detailCode = errDoc.code;
   return {
     code: 1,
     state: "failed",
@@ -436,6 +661,7 @@ export async function prepareByokRuntime(
     signal: AbortSignal;
     onEvent: (event: InstallerEvent) => void;
     env?: NodeJS.ProcessEnv;
+    onDescriptor?: (descriptor: RuntimeDescriptor) => void;
   },
   dependencies: {
     localmodels?: typeof runLocalmodels;
@@ -444,9 +670,16 @@ export async function prepareByokRuntime(
 ): Promise<InstallOutcome> {
   const validated = validateByokConfiguration(config);
   const runtime = validated.runtime ?? "claude";
+  let preparedDescriptor: RuntimeDescriptor | undefined;
   const nativeFailure = await prepareByokNativeRuntime(
     runtime,
-    options,
+    {
+      ...options,
+      onDescriptor: (descriptor) => {
+        preparedDescriptor = descriptor;
+        options.onDescriptor?.(descriptor);
+      },
+    },
     dependencies,
   );
   if (nativeFailure) return nativeFailure;
@@ -479,6 +712,7 @@ export async function prepareByokRuntime(
         idleTimeoutMs: SOURCE_APPLY_IDLE_TIMEOUT_MS,
         input: byokStdin(validated),
         onEvent: options.onEvent,
+        ...(preparedDescriptor ? { descriptor: preparedDescriptor } : {}),
       },
       dependencies.localmodels ?? runLocalmodels,
     );
@@ -513,7 +747,11 @@ export async function applyNativeSource(
   home: string,
   mode: "local" | "subscription",
   runtime: NativeRuntime,
-  options: { signal: AbortSignal; onEvent?: (event: InstallerEvent) => void },
+  options: {
+    signal: AbortSignal;
+    model?: string;
+    onEvent?: (event: InstallerEvent) => void;
+  },
   dependencies: { localmodels?: typeof runLocalmodels } = {},
 ): Promise<InstallOutcome | undefined> {
   const result = await applySource(
@@ -523,6 +761,7 @@ export async function applyNativeSource(
     {
       signal: options.signal,
       idleTimeoutMs: SOURCE_APPLY_IDLE_TIMEOUT_MS,
+      ...(options.model ? { model: options.model } : {}),
       ...(options.onEvent ? { onEvent: options.onEvent } : {}),
     },
     dependencies.localmodels ?? runLocalmodels,

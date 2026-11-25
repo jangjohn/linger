@@ -1,4 +1,8 @@
-import { runPriorities, type CapacityPriority } from "../../model-tasks.js";
+import {
+  runPriorities,
+  RunPriority,
+  type CapacityPriority,
+} from "../../model-tasks.js";
 import { displayText } from "@linger/service-kit";
 import {
   OPERATION_OUTCOME_UNKNOWN,
@@ -111,6 +115,8 @@ export interface RemoteRuntimeProviderOptions {
   readonly runtime: RuntimeConfig;
   /** Codex wraps the compact developer instructions in its compact rules. */
   readonly compactInstructions?: true;
+  /** Enables Runtime stop-hook checks on this Context's Runs and prepares. */
+  readonly stopHook?: true;
   readonly contextRunResources: RemoteContextRunResourceResolver;
   readonly debugInspector?: RunnerContextDebugInspector;
   readonly debugRunnerRevision?: number | (() => number);
@@ -143,6 +149,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
   readonly #target: RemoteRuntimeTarget;
   readonly #runtime: RuntimeConfig;
   readonly #compactInstructions: boolean;
+  readonly #stopHook: boolean;
   readonly #contextRunResources: RemoteContextRunResourceResolver;
   readonly #debugInspector?: RunnerContextDebugInspector;
   readonly #debugRunnerRevision?: number | (() => number);
@@ -199,6 +206,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
     this.#target = options.target;
     this.#runtime = options.runtime;
     this.#compactInstructions = options.compactInstructions === true;
+    this.#stopHook = options.stopHook === true;
     this.#contextRunResources = options.contextRunResources;
     this.#debugInspector = options.debugInspector;
     this.#debugRunnerRevision = options.debugRunnerRevision;
@@ -471,6 +479,8 @@ export class RemoteRuntimeProvider implements AgentProvider {
     let busyRetries = 0;
     for (;;) {
       signal.throwIfAborted();
+      // Nothing reached the Runtime yet, a busy rejection included.
+      spec.preemptSignal?.throwIfAborted();
       if (!spec.runContext)
         throw new TypeError("Local Run requires a Context run context");
       const runStartContext = await this.#contextRunStart(spec.runContext, {
@@ -483,14 +493,21 @@ export class RemoteRuntimeProvider implements AgentProvider {
           runtime: this.#runtime,
           session_options: this.#requireSessionOptions(),
           session: mutableSession,
+          ...(spec.previousSession
+            ? {
+                previous_session: {
+                  provider_type: spec.previousSession.providerType,
+                  session_id: spec.previousSession.sessionId,
+                },
+              }
+            : {}),
           input,
           ...runStartContext,
           ...(cliRunContext ? { cli_run_context: cliRunContext } : {}),
         },
         signal,
         spec.runContext.executionEpoch,
-        spec.runKind,
-        spec.beforeYieldResume,
+        spec,
       );
       if (spec.runContext.cancellationRequested) {
         await this.#cancel(operation, "Durable user cancellation");
@@ -522,7 +539,11 @@ export class RemoteRuntimeProvider implements AgentProvider {
             ) *
             (0.5 + Math.random() / 2);
           busyRetries += 1;
-          await waitForAdmission(delay, undefined, { signal });
+          await waitForAdmission(delay, undefined, {
+            signal: spec.preemptSignal
+              ? AbortSignal.any([signal, spec.preemptSignal])
+              : signal,
+          });
           continue;
         }
         throw localRunFailure(error, false, this.#runtime.type);
@@ -547,8 +568,64 @@ export class RemoteRuntimeProvider implements AgentProvider {
       replaceOpaqueObject(mutableSession, checkpoint);
     }
     const reviewPermission = this.#onPermissionReview;
+    const stopHook = spec.onStopHook;
     const executionRunRef = spec.runContext?.executionRunRef;
     const run: RemoteAgentRun = new RemoteAgentRun({
+      onStopHook: stopHook
+        ? (request) => {
+            const requestId = displayText(request.request_id);
+            const attempt =
+              typeof request.attempt === "number" &&
+              Number.isInteger(request.attempt) &&
+              request.attempt >= 0
+                ? request.attempt
+                : 0;
+            const stopHookActive = request.stop_hook_active === true;
+            const runtime =
+              typeof request.runtime === "string" ? request.runtime : undefined;
+            void stopHook(
+              {
+                ...(runtime !== undefined ? { runtime } : {}),
+                attempt,
+                stopHookActive,
+              },
+              signal ?? this.#closed.signal,
+            )
+              .catch((error: unknown): { readonly action: "allow" } => {
+                this.#logger?.log("warn", "runtime_hook.stop_failed", {
+                  ...(executionRunRef
+                    ? { execution_run_ref: executionRunRef }
+                    : {}),
+                  operation_id: operation.operationId,
+                  request_id: requestId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                return { action: "allow" };
+              })
+              .then((decision) =>
+                run.respond(
+                  operation.operationId,
+                  requestId,
+                  decision.action === "block"
+                    ? { action: "block", reason: decision.reason }
+                    : { action: "allow" },
+                ),
+              )
+              .catch((error: unknown) => {
+                this.#logger?.log("warn", "runtime_hook.stop_response_failed", {
+                  ...(executionRunRef
+                    ? { execution_run_ref: executionRunRef }
+                    : {}),
+                  operation_id: operation.operationId,
+                  request_id: requestId,
+                  error: error instanceof Error ? error.message : String(error),
+                  ...(error instanceof RunnerOperationInputError
+                    ? { effect: error.effect, reason: error.reason }
+                    : {}),
+                });
+              });
+          }
+        : undefined,
       onPermissionReview:
         reviewPermission && executionRunRef
           ? (request) => {
@@ -694,8 +771,15 @@ export class RemoteRuntimeProvider implements AgentProvider {
     request: RunnerOperationTarget["request"],
     signal: AbortSignal = this.#closed.signal,
     executionEpoch?: string,
-    runKind?: RunnerOperationTarget["runKind"],
-    beforeYieldResume?: () => Promise<void>,
+    {
+      runKind,
+      priority = new RunPriority(runPriorities[runKind ?? "chat"]),
+      beforeYieldResume,
+      preemptSignal,
+    }: Pick<
+      ExecutionSpec,
+      "runKind" | "priority" | "beforeYieldResume" | "preemptSignal"
+    > = {},
   ): Promise<RunnerOperation> {
     if (this.#closePromise) {
       throw new Error("Remote Codex provider is closed");
@@ -703,16 +787,18 @@ export class RemoteRuntimeProvider implements AgentProvider {
     const permit =
       this.#capacityPermit ??
       (await this.#dispatcher.acquireOperationCapacity?.(
-        { ...this.#target, priority: runPriorities[runKind ?? "chat"] },
-        signal,
+        { ...this.#target, priority },
+        preemptSignal ? AbortSignal.any([signal, preemptSignal]) : signal,
       ));
     try {
       const operation = await this.#dispatcher.startOperation({
         ...this.#target,
         executionEpoch,
         ...(runKind ? { runKind } : {}),
+        priority,
         ...(beforeYieldResume ? { beforeYieldResume } : {}),
         signal,
+        ...(preemptSignal ? { preemptSignal } : {}),
         contextViewRef: this.#contextRunResources.currentContextViewRef(),
         request,
         ...(permit ? { capacityPermit: permit } : {}),
@@ -739,7 +825,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
 
   /**
    * Advisory and never throws: after a Room-presence activation without input,
-   * start the Codex process or Claude CLI early so the first Run adopts it.
+   * start the Codex, Claude, or Pi Runtime early so the first Run adopts it.
    * Every call sends a fresh prepare; the Daemon answers already_ready while a
    * compatible process stays parked, and keeps a prepared process parked like
    * a Run's, so nothing is ever renewed or canceled. When a pre-prepare hook is
@@ -780,7 +866,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
   ): void {
     let prepared: SentProviderPrepare | string;
     try {
-      // Claude is prepared only for Room presence, where no input is waiting.
+      // Claude and Pi are prepared only for Room presence, where no input is waiting.
       prepared =
         source === "accepted_input" && this.#runtime.type !== "codex"
           ? "runtime_unsupported"
@@ -811,23 +897,23 @@ export class RemoteRuntimeProvider implements AgentProvider {
   }
 
   /**
-   * Sends one provider prepare for the session's Codex thread or Claude
-   * conversation, or returns why it was not sent. For a Context that has no
-   * Codex thread yet the Daemon starts one, and the Context's first Run adopts
-   * it. A Claude conversation id always exists, so the Daemon creates the
-   * conversation it names when it is not materialized.
+   * Sends one provider prepare for the session's Codex thread, Claude
+   * conversation, or Pi session, or returns why it was not sent. For a Context
+   * that has no Codex thread yet the Daemon starts one, and the Context's first
+   * Run adopts it. A Claude or Pi session id always exists, so the Daemon
+   * creates the session it names when it is not materialized.
    */
   #sendProviderPrepare(session: RuntimeSession): SentProviderPrepare | string {
     const target = this.#target;
     const executionContextKey = target.executionContextKey;
     const runtime = this.#runtime.type;
-    if (runtime !== "codex" && runtime !== "claude")
+    if (runtime !== "codex" && runtime !== "claude" && runtime !== "pi")
       return "runtime_unsupported";
     if (this.#closePromise !== undefined) return "closed";
     if (!this.#sessionOptions) return "session_unavailable";
     const retained = requireOpaqueObject(session, "session");
     if (
-      runtime === "claude" &&
+      (runtime === "claude" || runtime === "pi") &&
       (typeof retained.sessionId !== "string" || retained.sessionId === "")
     ) {
       return "session_not_started";
@@ -901,6 +987,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
         ...toContextRunContext(context),
         ...(spec.beforeYieldResume ? { resume_after_yield: true } : {}),
         ...this.#runAuthorization(),
+        ...(spec.onStopHook ? { stop_hook: true } : {}),
       },
       run_resources: runResources,
     };
@@ -911,6 +998,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
     return {
       ...(this.#onHumanInteraction ? { human_interactions: true } : {}),
       ...(this.#onPermissionReview ? { permission_review: true } : {}),
+      ...(this.#stopHook ? { stop_hook: true } : {}),
     };
   }
 }
@@ -942,6 +1030,7 @@ class RemoteAgentRun implements AgentRun {
     operation: RunnerOperation;
     onHumanInteraction?: (request: OpaqueObject) => Promise<void>;
     onPermissionReview?: (request: OpaqueObject) => void;
+    onStopHook?: (request: OpaqueObject) => void;
     iterator: AsyncIterator<WireRunEvent>;
     turnId: string;
     processReused?: boolean;
@@ -978,6 +1067,7 @@ class RemoteAgentRun implements AgentRun {
         options.iterator,
         options.onHumanInteraction,
         options.onPermissionReview,
+        options.onStopHook,
       ),
       this.#streamAbortController,
       this.steerTarget,
@@ -1114,12 +1204,23 @@ const mapRunEvents = async function* (
   iterator: AsyncIterator<WireRunEvent>,
   onHumanInteraction?: (request: OpaqueObject) => Promise<void>,
   onPermissionReview?: (request: OpaqueObject) => void,
+  onStopHook?: (request: OpaqueObject) => void,
 ): AsyncIterable<RunEvent> {
   yield { type: "run.started" };
   for (;;) {
     const next = await iterator.next();
     if (next.done) {
       return;
+    }
+    if (
+      next.value.type === "human_interaction.requested" &&
+      next.value.request.kind === "runtime_hook" &&
+      next.value.request.hook === "stop"
+    ) {
+      if (onStopHook) {
+        onStopHook(next.value.request);
+      }
+      continue;
     }
     if (
       next.value.type === "human_interaction.requested" &&

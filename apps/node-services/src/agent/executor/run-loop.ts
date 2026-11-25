@@ -1,5 +1,6 @@
 import type { AgentLogger } from "../observability/agent-log.js";
 import {
+  type PreviousRuntimeSession,
   type RunEvent,
   RuntimeExecutionError,
   type AgentInput,
@@ -19,11 +20,14 @@ import {
   runtimeSessionStartsFresh,
 } from "./provider.js";
 import type { ExecutionContextRef } from "./context-ref.js";
-import { ReplyDelivery } from "./reply-delivery.js";
+import type { RunStopHookEvaluation } from "../agent-features/compose.js";
+import type { RunStopHookInput } from "../agent-features/contracts.js";
+import { awaitsReply, ReplyDelivery } from "./reply-delivery.js";
 import type {
   ProfileUpdate,
   ContextRuntimeStatePort,
   LocalRunTerminal,
+  SessionRecoveryReason,
 } from "./context-runtime-state.js";
 import type {
   Message,
@@ -39,10 +43,15 @@ import type {
   RuntimeStatusUpdate,
 } from "./runtime-status.js";
 import {
+  type RecentContextMessages,
   renderInterruptedRunReminder,
   renderRuntimeContinuationReminder,
 } from "../prompt/inbox-notification.js";
-import { runPriorities, COMPACTION_PRIORITY } from "../../model-tasks.js";
+import {
+  runPriorities,
+  COMPACTION_PRIORITY,
+  RunPriority,
+} from "../../model-tasks.js";
 import { runKind } from "./run-kind.js";
 
 /** The Run's own agent in `agent.model_request`; a sub-agent logs its id. */
@@ -240,6 +249,8 @@ interface ActiveExecution {
   readonly sourceInboxIds: Set<string>;
   readonly steerOperations: Set<Promise<void>>;
   readonly replyDelivery: ReplyDelivery;
+  readonly observedMessages: Message[];
+  readonly stopHook: { replyConfirmed: boolean; blocked: boolean };
   acceptingSteers: boolean;
 }
 
@@ -252,6 +263,17 @@ interface ActiveRunIntent {
   readonly resolveProviderReady: (execution: ActiveExecution | null) => void;
   readonly runId: string;
   readonly sourceInboxIds: ReadonlySet<string>;
+  /** Rises to the most urgent input steered into this Run. */
+  readonly priority: RunPriority;
+  /** Aborted when a chat takes the place of this Run before it reaches its
+   * Runtime; the Provider then gives the place back. Replaced once a segment
+   * activates so a later yield does not inherit a lost preemption race. */
+  preemption: AbortController;
+  /** The chat steers that preempted this Run, settled before it requeues. */
+  readonly preemptingSteers: Set<Promise<void>>;
+  /** The next activation of this Run, null once it can no longer start. */
+  readonly nextActivation: () => Promise<ActiveExecution | null>;
+  readonly resolveActivation: (execution: ActiveExecution | null) => void;
 }
 
 /** One claimed Local Run while the Run loop executes it. */
@@ -274,7 +296,11 @@ interface LocalRunExecution {
   readonly claimMs: number | undefined;
   readonly cancellationLookupMs: number | undefined;
   readonly continuesContext: boolean | undefined;
+  readonly recentMessages: RecentContextMessages | undefined;
   readonly profileUpdate: ProfileUpdate | undefined;
+  readonly startedFreshSession: boolean;
+  readonly priorAttemptInterrupted: boolean;
+  hadPriorProgress: boolean;
   run: AgentRun | null;
   runtimeStatus: RuntimeStatusSession | null;
   runtimeStatusEvents: Promise<void> | null;
@@ -282,6 +308,8 @@ interface LocalRunExecution {
   upstreamCanceled: boolean;
   providerSucceeded: boolean;
   hasYielded: boolean;
+  readonly observedMessages: Message[];
+  readonly stopHook: { replyConfirmed: boolean; blocked: boolean };
 }
 
 export class RunLoop {
@@ -304,11 +332,31 @@ export class RunLoop {
   readonly #state: ContextRuntimeStatePort;
   readonly #prepareInput: (message: Message) => Message;
   readonly #onRunEvent: (event: RunEvent) => readonly RuntimeStatusUpdate[];
+  readonly #onRunBeforeStop:
+    | ((
+        input: RunStopHookInput,
+        signal: AbortSignal,
+      ) => Promise<RunStopHookEvaluation>)
+    | undefined;
   readonly #onRunClaimed:
     | ((runId: string, messages: NonEmptyReadonlyArray<Message>) => void)
     | undefined;
   readonly #onWorkStateRefreshed: (() => void) | undefined;
+  readonly #canRecoverSession: ((runId: string) => boolean) | undefined;
+  readonly #consumePartialWorkRecovery:
+    | ((runId: string) => boolean)
+    | undefined;
+  readonly #onSessionRecoveryFailed: ((runId: string) => void) | undefined;
+  readonly #onSessionRecoveryRequested:
+    | ((
+        runId: string,
+        reason: SessionRecoveryReason,
+        hadPriorProgress: boolean,
+      ) => void)
+    | undefined;
+  readonly #recoveryAbortErrors = new Map<string, unknown>();
   #firstSessionRun: boolean;
+  #previousSession: PreviousRuntimeSession | undefined;
   #activeExecution: ActiveExecution | null = null;
   #activeRunIntent: ActiveRunIntent | null = null;
   #activeOperations = 0;
@@ -342,6 +390,7 @@ export class RunLoop {
     readonly runtimeName?: string;
     readonly runtimeSession: RuntimeSession;
     readonly newSession?: boolean;
+    readonly previousSession?: PreviousRuntimeSession;
     readonly prepareNextRun?: (signal: AbortSignal) => Promise<boolean>;
     readonly beforeStartRun?: (runId: string) => Promise<void>;
     readonly runtimeStatusPublisher?: RuntimeStatusPublisher;
@@ -360,6 +409,11 @@ export class RunLoop {
     readonly prepareInput: (message: Message) => Message;
     /** Composed per-event status projections. Required. */
     readonly onRunEvent: (event: RunEvent) => readonly RuntimeStatusUpdate[];
+    /** Composed Runtime stop hooks evaluated before a turn finishes. */
+    readonly onRunBeforeStop?: (
+      input: RunStopHookInput,
+      signal: AbortSignal,
+    ) => Promise<RunStopHookEvaluation>;
     /** Observes the inputs of each claimed Run, before it executes. */
     readonly onRunClaimed?: (
       runId: string,
@@ -367,6 +421,18 @@ export class RunLoop {
     ) => void;
     /** Runs after each work-state read, for example to take up steers. */
     readonly onWorkStateRefreshed?: () => void;
+    /** Reports whether this Run may trigger an automatic session restart. */
+    readonly canRecoverSession?: (runId: string) => boolean;
+    /** Reports and clears whether an earlier recovered attempt of this Run already ran steps. */
+    readonly consumePartialWorkRecovery?: (runId: string) => boolean;
+    /** Marks a Run whose session clear failed so the next claim terminates cleanly. */
+    readonly onSessionRecoveryFailed?: (runId: string) => void;
+    /** Requests runtime reactivation in a fresh native session after requeue and session clear. */
+    readonly onSessionRecoveryRequested?: (
+      runId: string,
+      reason: SessionRecoveryReason,
+      hadPriorProgress: boolean,
+    ) => void;
   }) {
     this.#logger = options.logger;
     this.#executionContextRef = options.executionContextRef;
@@ -386,14 +452,20 @@ export class RunLoop {
     this.#firstSessionRun = Boolean(
       options.newSession || runtimeSessionStartsFresh(options.runtimeSession),
     );
+    this.#previousSession = options.previousSession;
     this.#prepareNextRun = options.prepareNextRun;
     this.#beforeStartRun = options.beforeStartRun;
     this.#runtimeStatusPublisher = options.runtimeStatusPublisher;
     this.#state = options.state;
     this.#prepareInput = options.prepareInput;
     this.#onRunEvent = options.onRunEvent;
+    this.#onRunBeforeStop = options.onRunBeforeStop;
     this.#onRunClaimed = options.onRunClaimed;
     this.#onWorkStateRefreshed = options.onWorkStateRefreshed;
+    this.#canRecoverSession = options.canRecoverSession;
+    this.#consumePartialWorkRecovery = options.consumePartialWorkRecovery;
+    this.#onSessionRecoveryFailed = options.onSessionRecoveryFailed;
+    this.#onSessionRecoveryRequested = options.onSessionRecoveryRequested;
   }
 
   get activeOperations(): number {
@@ -564,8 +636,37 @@ export class RunLoop {
     stopSignal: AbortSignal,
     expectedSourceInboxId?: string,
   ): Promise<void> {
+    const intent = this.#activeRunIntent;
+    // A chat does not wait for a Meta Run that has not reached its Runtime,
+    // first or after a yield: the Run goes back to the queue and the chat is
+    // claimed first. A Run the Provider already started is steered instead.
+    // Capture nextActivation synchronously before queuing on #trustedSteerTail
+    // so an activation completing before apply() still resolves to it.
+    const preempt =
+      intent !== null &&
+      this.#isMetaChat(messages) &&
+      expectedSourceInboxId !== undefined &&
+      intent.priority.value > runPriorities.chat &&
+      !this.#activeExecution?.acceptingSteers
+        ? { intent, nextActivation: intent.nextActivation() }
+        : undefined;
+    if (preempt) {
+      preempt.intent.preemption.abort(new LocalRunPreemptedError());
+    } else {
+      // Raised before the steer waits for the Provider, so a Run still
+      // waiting for its place waits as what the steer needs.
+      intent?.priority.raise(
+        runPriorities[runKind(this.#executionContextRef, messages)],
+      );
+    }
     const apply = () =>
-      this.#applySteer(groupId, messages, stopSignal, expectedSourceInboxId);
+      this.#applySteer(
+        groupId,
+        messages,
+        stopSignal,
+        expectedSourceInboxId,
+        preempt,
+      );
     const operation =
       expectedSourceInboxId === undefined
         ? apply()
@@ -573,6 +674,7 @@ export class RunLoop {
     if (expectedSourceInboxId !== undefined) {
       this.#trustedSteerTail = operation;
     }
+    if (preempt) preempt.intent.preemptingSteers.add(operation);
     this.#steerOperations.add(operation);
     this.#activeOperations += 1;
     this.#notifyActivityChanged();
@@ -583,6 +685,14 @@ export class RunLoop {
       this.#steerOperations.delete(operation);
       this.#notifyActivityChanged();
     }
+  }
+
+  /** Messages a Human waits on in a Meta Context. */
+  #isMetaChat(messages: readonly Message[]): boolean {
+    return (
+      this.#executionContextRef?.kind === "meta" &&
+      runKind(this.#executionContextRef, messages) === "chat"
+    );
   }
 
   /** resumable: an active Run goes back to the queue and resumes in the
@@ -805,6 +915,11 @@ export class RunLoop {
               intent = this.#createRunIntent(
                 next.runId,
                 provenanceOf(next.messages).sourceInboxIds,
+                new RunPriority(
+                  runPriorities[
+                    runKind(this.#executionContextRef, next.messages)
+                  ],
+                ),
               );
               this.#activeRunIntent = intent;
             }
@@ -830,6 +945,11 @@ export class RunLoop {
         }
         this.#activeOperations += 1;
         this.#notifyActivityChanged();
+        const recoveryAbortError = this.#recoveryAbortErrors.get(claimed.runId);
+        if (recoveryAbortError !== undefined) {
+          this.#recoveryAbortErrors.delete(claimed.runId);
+          preparationFailure = { error: recoveryAbortError };
+        }
         try {
           await this.#execute(
             claimed.runId,
@@ -842,6 +962,7 @@ export class RunLoop {
             claimed.inputReceivedAtMs,
             claimMs,
             claimed.continuesContext,
+            claimed.recentMessages,
             claimed.profileUpdate,
           );
         } catch (error) {
@@ -869,6 +990,7 @@ export class RunLoop {
     inputReceivedAtMs?: number,
     claimMs?: number,
     continuesContext?: boolean,
+    recentMessages?: RecentContextMessages,
     profileUpdate?: ProfileUpdate,
   ): Promise<void> {
     const { controller } = intent;
@@ -923,7 +1045,13 @@ export class RunLoop {
       claimMs,
       cancellationLookupMs,
       continuesContext,
+      recentMessages,
       profileUpdate,
+      startedFreshSession: this.#firstSessionRun,
+      priorAttemptInterrupted:
+        this.#firstSessionRun &&
+        Boolean(this.#consumePartialWorkRecovery?.(runId)),
+      hadPriorProgress: false,
       run: null,
       runtimeStatus: null,
       runtimeStatusEvents: null,
@@ -931,6 +1059,8 @@ export class RunLoop {
       upstreamCanceled: false,
       providerSucceeded: false,
       hasYielded: false,
+      observedMessages: [...messages],
+      stopHook: { replyConfirmed: false, blocked: false },
     };
     try {
       await this.#runExecution(execution);
@@ -938,6 +1068,7 @@ export class RunLoop {
       await this.#failExecution(execution, error);
     } finally {
       intent.resolveProviderReady(null);
+      intent.resolveActivation(null);
       execution.removeAbortListener?.();
       this.#pendingCancellationRunIds.delete(runId);
       if (this.#activeExecution?.runId === runId) {
@@ -1061,6 +1192,8 @@ export class RunLoop {
       input,
       replyDelivery,
     );
+    this.#firstSessionRun = false;
+    this.#previousSession = undefined;
 
     execution.runtimeStatus ??= await this.#openRuntimeStatus(
       runId,
@@ -1076,6 +1209,9 @@ export class RunLoop {
       (error) => this.#reconcileRevocation(execution, error),
       new RunTimeline(this.#logger, runId, attemptCount),
       replyDelivery,
+      () => {
+        execution.hadPriorProgress = true;
+      },
     );
     const result = await run.wait();
     const providerCompletedAt = performance.now();
@@ -1115,7 +1251,13 @@ export class RunLoop {
         [
           this.#firstSessionRun
             ? execution.continuesContext || resumesAttempt
-              ? renderRuntimeContinuationReminder(provenance.sourceInboxIds)
+              ? renderRuntimeContinuationReminder(
+                  provenance.sourceInboxIds,
+                  execution.recentMessages,
+                  execution.priorAttemptInterrupted
+                    ? { priorAttemptInterrupted: true }
+                    : undefined,
+                )
               : ""
             : resumesAttempt
               ? renderInterruptedRunReminder()
@@ -1169,12 +1311,48 @@ export class RunLoop {
     const { controller } = execution;
     const admissionWaitStartedAt = Date.now();
     for (;;) {
+      execution.intent.preemption.signal.throwIfAborted();
       try {
         const run = await this.#provider.startRun(this.#runtimeSession, input, {
           signal: controller.signal,
           runContext: execution.runContext,
           acceptedAtMonotonicMs: execution.acceptedAtMonotonicMs,
+          ...(this.#firstSessionRun && this.#previousSession
+            ? { previousSession: this.#previousSession }
+            : {}),
           runKind: execution.kind,
+          priority: execution.intent.priority,
+          preemptSignal: execution.intent.preemption.signal,
+          ...(this.#onRunBeforeStop
+            ? {
+                onStopHook: async (event, signal) => {
+                  const evaluation = await this.#onRunBeforeStop!(
+                    {
+                      runId: execution.runId,
+                      attempt: event.attempt,
+                      stopHookActive: event.stopHookActive,
+                      inputs: execution.observedMessages,
+                    },
+                    signal,
+                  );
+                  if (evaluation.decision.action === "block") {
+                    execution.stopHook.replyConfirmed = false;
+                    execution.stopHook.blocked = true;
+                    this.#logger.log("info", "local_run.stop_hook_blocked", {
+                      runId: execution.runId,
+                      ...(evaluation.blockedBy
+                        ? { feature: evaluation.blockedBy }
+                        : {}),
+                      ...(event.runtime ? { runtime: event.runtime } : {}),
+                      attempt: event.attempt,
+                    });
+                  } else if (evaluation.replyConfirmed) {
+                    execution.stopHook.replyConfirmed = true;
+                  }
+                  return evaluation.decision;
+                },
+              }
+            : {}),
           ...(execution.hasYielded
             ? {
                 beforeYieldResume: async () => {
@@ -1190,7 +1368,6 @@ export class RunLoop {
               }
             : {}),
         });
-        this.#firstSessionRun = false;
         return run;
       } catch (error) {
         const remaining =
@@ -1204,11 +1381,15 @@ export class RunLoop {
         this.#logger.log("warn", "local_run.admission_wait", {
           runId: execution.runId,
         });
+        execution.intent.preemption.signal.throwIfAborted();
         await delay(
           Math.min(RUNTIME_ADMISSION_RETRY_MS, remaining),
           undefined,
           {
-            signal: controller.signal,
+            signal: AbortSignal.any([
+              controller.signal,
+              execution.intent.preemption.signal,
+            ]),
           },
         );
       }
@@ -1332,9 +1513,13 @@ export class RunLoop {
         new Set(execution.provenance.sourceInboxIds),
       steerOperations: new Set(),
       replyDelivery,
+      observedMessages: execution.observedMessages,
+      stopHook: execution.stopHook,
     };
     this.#activeExecution = active;
+    execution.intent.preemption = new AbortController();
     execution.intent.resolveProviderReady(active);
+    execution.intent.resolveActivation(active);
     const cancel = () => {
       try {
         execution.run?.cancel();
@@ -1372,6 +1557,7 @@ export class RunLoop {
       runId,
       finalResponse,
       replyDelivery,
+      execution.stopHook,
     );
     this.#logger.log("info", "local_run.finish_started", {
       runId,
@@ -1423,6 +1609,7 @@ export class RunLoop {
     } else {
       intent.resolveProviderReady(null);
     }
+    intent.resolveActivation(null);
     // A durable cancellation cannot confirm native resource cleanup.
     const providerCleanupFailed = error instanceof ProviderRunCleanupError;
     if (
@@ -1437,6 +1624,52 @@ export class RunLoop {
       throw new Error(`Local Run "${runId}" terminal persistence failed`, {
         cause: error,
       });
+    }
+    if (
+      isRecoverableSessionFailure(error) &&
+      !providerCleanupFailed &&
+      !controller.signal.aborted &&
+      !execution.hasYielded &&
+      !execution.startedFreshSession &&
+      this.#onSessionRecoveryRequested &&
+      (this.#canRecoverSession ? this.#canRecoverSession(runId) : true)
+    ) {
+      const reason = error.failure.code;
+      await this.#settleRuntimeStatusEvents(execution);
+      await this.#commitDurably(() => this.#state.requeueLocalRun(runId));
+      try {
+        await this.#commitDurably(() =>
+          this.#state.clearRuntimeSession({ recoveryReason: reason }),
+        );
+      } catch (clearError) {
+        // Older TeamHub releases reject recovery_reason (400) and concurrent
+        // state changes may return 409. Keep the RunLoop alive so the next
+        // claim fails visibly with the original error instead of leaving the
+        // Run stuck queued.
+        this.#logger.log("warn", "local_run.session_recovery_clear_failed", {
+          runId,
+          reason,
+          error: clearError,
+        });
+        this.#recoveryAbortErrors.set(runId, error);
+        this.#onSessionRecoveryFailed?.(runId);
+        intent.resolveFinished();
+        return;
+      }
+      this.requestDrain({ cancelActive: false });
+      intent.resolveFinished();
+      this.#logger.log("warn", "local_run.session_recovery_requested", {
+        runId,
+        attemptCount,
+        reason,
+        hadPriorProgress: execution.hadPriorProgress,
+      });
+      this.#onSessionRecoveryRequested(
+        runId,
+        reason,
+        execution.hadPriorProgress,
+      );
+      return;
     }
     if (
       error instanceof ProviderRunStartError &&
@@ -1455,6 +1688,26 @@ export class RunLoop {
         attemptCount,
         maxAttempts: MAX_LOCAL_RUN_START_ATTEMPTS,
         error,
+      });
+      return;
+    }
+    // A chat took this Run's place before its Runtime started it. The Run
+    // waits again; the chat, queued by its steer, is claimed first, so the
+    // claim must not run before that steer settles.
+    if (
+      error instanceof LocalRunPreemptedError &&
+      !providerCleanupFailed &&
+      !controller.signal.aborted
+    ) {
+      await this.#settleRuntimeStatusEvents(execution);
+      await this.#commitDurably(() => this.#state.requeueLocalRun(runId));
+      if (!execution.hasYielded) this.#unstartedRequeues.add(runId);
+      await Promise.allSettled(intent.preemptingSteers);
+      intent.resolveFinished();
+      this.#logger.log("info", "local_run.preempted", {
+        runId,
+        attemptCount,
+        yielded: execution.hasYielded,
       });
       return;
     }
@@ -1605,6 +1858,7 @@ export class RunLoop {
     reconcileRevocation: (error: unknown) => Promise<boolean>,
     timeline: RunTimeline,
     replyDelivery: ReplyDelivery,
+    onFirstOutput?: () => void,
   ): Promise<void> {
     const statusSession = session;
     const pending: RuntimeStatusUpdate[] = [];
@@ -1673,6 +1927,7 @@ export class RunLoop {
             event.type === "tool.called")
         ) {
           firstOutputObserved = true;
+          onFirstOutput?.();
           const receivedAtUnixMs = Date.now();
           this.#logger.log("info", "local_run.first_output", {
             runId,
@@ -1728,22 +1983,26 @@ export class RunLoop {
 
   /**
    * A Room Agent speaks only through TeamHub message writes, so a finished
-   * Provider turn is not a succeeded Run when the Room has nothing to show:
-   * the Agent tried to post and none landed, or a Human who mentioned it is
-   * waiting and it never tried. Its final text is private scratch and is not
-   * posted for it. Because activity classification inspects shell text for
-   * display and can miss compound scripts or decision cards, TeamHub confirms
-   * whether a visible reply landed before failing the Run. Task Runs report
-   * through their final response and keep it.
+   * Provider turn is not a succeeded Run when a Human who mentioned it is
+   * waiting and the Room has nothing to show: every write attempt failed
+   * (`reply_undelivered`), or no write reached the Room without a failed write
+   * (`reply_not_sent`). Its final text is private scratch and is not posted for
+   * it. Because activity classification inspects shell text for display and can
+   * miss compound scripts or decision cards, TeamHub confirms whether a visible
+   * reply landed before failing the Run unless the Stop hook already confirmed
+   * delivery. Task Runs report through their final response and keep it.
    */
   async #completedTerminal(
     runId: string,
     finalResponse: string,
     replyDelivery: ReplyDelivery,
+    stopHook: { readonly replyConfirmed: boolean; readonly blocked: boolean },
   ): Promise<LocalRunTerminal> {
     const roomRun = this.#executionContextRef?.kind === "meta";
-    const suspectedUndelivered = roomRun && replyDelivery.replyUndelivered;
-    const suspectedNotSent = roomRun && replyDelivery.replyNotSent;
+    const suspectedUndelivered =
+      roomRun && !stopHook.replyConfirmed && replyDelivery.replyUndelivered;
+    const suspectedNotSent =
+      roomRun && !stopHook.replyConfirmed && replyDelivery.replyNotSent;
     let confirmedReplied = false;
     if (suspectedUndelivered || suspectedNotSent) {
       try {
@@ -1757,6 +2016,14 @@ export class RunLoop {
           error,
         });
       }
+    }
+    if (
+      stopHook.blocked &&
+      (stopHook.replyConfirmed ||
+        confirmedReplied ||
+        replyDelivery.counts().deliveredMessageWrites > 0)
+    ) {
+      this.#logger.log("info", "local_run.stop_hook_recovered", { runId });
     }
     const undelivered = suspectedUndelivered && !confirmedReplied;
     if (replyDelivery.hasFailures) {
@@ -1778,6 +2045,7 @@ export class RunLoop {
       this.#logger.log("warn", "local_run.reply_not_sent", {
         runId,
         ...replyDelivery.counts(),
+        stopHookBlocked: stopHook.blocked,
         finalResponseLength: finalResponse.length,
       });
       return {
@@ -1805,25 +2073,34 @@ export class RunLoop {
     messages: NonEmptyReadonlyArray<Message>,
     stopSignal: AbortSignal,
     expectedSourceInboxId?: string,
+    preempt?: {
+      readonly intent: ActiveRunIntent;
+      readonly nextActivation: Promise<ActiveExecution | null>;
+    },
   ): Promise<void> {
-    const intent = this.#activeRunIntent;
+    const intent = preempt?.intent ?? this.#activeRunIntent;
     if (!intent) {
       await this.#enqueueSteer(groupId, messages);
       return;
     }
 
-    const target = this.#activeExecution ?? (await intent.providerReady);
+    const target = preempt
+      ? await preempt.nextActivation
+      : (this.#activeExecution ?? (await intent.providerReady));
     if (
       !target ||
       !target.acceptingSteers ||
       stopSignal.aborted ||
+      // A Meta chat steers the Run whichever Inbox it reads.
       (expectedSourceInboxId !== undefined &&
-        !target.sourceInboxIds.has(expectedSourceInboxId))
+        !target.sourceInboxIds.has(expectedSourceInboxId) &&
+        !this.#isMetaChat(messages))
     ) {
       if (expectedSourceInboxId === undefined) await intent.finished;
       await this.#enqueueSteer(groupId, messages);
       return;
     }
+    if (preempt) intent.priority.raise(runPriorities.chat);
 
     const operation = this.#applyProviderSteer(
       target,
@@ -1880,7 +2157,11 @@ export class RunLoop {
         target.sourceInboxIds.add(inboxId);
       }
       target.inputs.push(input);
+      target.observedMessages.push(...messages);
       target.replyDelivery.observeInputs(messages);
+      if (messages.some(awaitsReply)) {
+        target.stopHook.replyConfirmed = false;
+      }
       this.#reportActiveRunContext({
         runId: target.runId,
         sourceInboxIds: Object.freeze([...target.sourceInboxIds]),
@@ -1971,10 +2252,13 @@ export class RunLoop {
   #createRunIntent(
     runId: string,
     sourceInboxIds: readonly string[],
+    priority: RunPriority,
   ): ActiveRunIntent {
     const controller = new AbortController();
     const providerReady = deferred<ActiveExecution | null>();
     const finished = deferred<void>();
+    let activation = deferred<ActiveExecution | null>();
+    let ended = false;
     // A failed durable terminal transition is observed only by a concurrent steer.
     void finished.promise.catch(() => undefined);
     const intent: ActiveRunIntent = {
@@ -1986,6 +2270,17 @@ export class RunLoop {
       resolveProviderReady: providerReady.resolve,
       runId,
       sourceInboxIds: new Set(sourceInboxIds),
+      priority,
+      preemption: new AbortController(),
+      preemptingSteers: new Set(),
+      nextActivation: () =>
+        ended ? Promise.resolve(null) : activation.promise,
+      resolveActivation: (execution) => {
+        if (ended) return;
+        activation.resolve(execution);
+        if (execution) activation = deferred();
+        else ended = true;
+      },
     };
     if (this.#stopRequested || this.#pendingCancellationRunIds.has(runId)) {
       controller.abort(
@@ -2106,6 +2401,14 @@ class LocalRunStoppedError extends Error {
   }
 }
 
+/** A chat took the place of a Run that had not reached its Runtime. */
+class LocalRunPreemptedError extends Error {
+  constructor() {
+    super("Local Run gave its place to a chat");
+    this.name = "LocalRunPreemptedError";
+  }
+}
+
 class LocalRunLoopRetryableError extends Error {
   constructor(cause: unknown) {
     super("Local Run loop encountered a retryable infrastructure error", {
@@ -2114,6 +2417,15 @@ class LocalRunLoopRetryableError extends Error {
     this.name = "LocalRunLoopRetryableError";
   }
 }
+
+const isRecoverableSessionFailure = (
+  error: unknown,
+): error is RuntimeExecutionError & {
+  readonly failure: { readonly code: SessionRecoveryReason };
+} =>
+  error instanceof RuntimeExecutionError &&
+  (error.failure.code === "session_not_found" ||
+    error.failure.code === "context_too_long");
 
 const isRetryableLoopFailure = (error: unknown): boolean =>
   typeof error === "object" &&

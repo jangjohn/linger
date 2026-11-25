@@ -8,6 +8,7 @@ import type { KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 
 import { Icon } from "@/components/ui/icon";
 import { Spinner } from "@/components/ui/spinner";
+import { useT } from "@/i18n/use-translation";
 
 import {
   emptyDetail,
@@ -18,6 +19,7 @@ import {
   type SearchResult,
   type TargetContext,
 } from "./global-search-model";
+import { searchMessages as m } from "./global-search.messages";
 import {
   EmptyState,
   ResultRow,
@@ -54,9 +56,8 @@ export function GlobalSearchField({
   scope: Scope | undefined;
   tab: GlobalSearchTab;
 }) {
-  const placeholder = scope
-    ? scope.placeholder
-    : "Search messages, docs, members and rooms";
+  const t = useT();
+  const placeholder = scope ? t(scope.placeholder) : t(m.placeholderAll);
   return (
     <>
       <div className="flex h-12 shrink-0 items-center gap-2 pl-4 pr-3">
@@ -75,9 +76,10 @@ export function GlobalSearchField({
         {scope && tab !== "all" ? (
           <span className="ml-1 inline-flex h-8 shrink-0 items-center gap-2 rounded-full bg-(--app-field-surface) pl-2.5 pr-1 text-xs font-medium text-foreground shadow-outline">
             <Icon className="text-app-subtle" icon={scope.icon} size={16} />
-            {scope.label}
+            {t(scope.label)}
             <button
-              aria-label={`Remove ${scope.label} scope`}
+              data-voice-risk="never"
+              aria-label={t(m.removeScope, { scope: t(scope.label) })}
               className="grid size-6 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
               onClick={() => enterScope("all")}
               type="button"
@@ -92,7 +94,7 @@ export function GlobalSearchField({
           }
           aria-controls="global-search-results"
           aria-expanded={rowCount > 0}
-          aria-label="Search messages, docs, people, agents and rooms"
+          aria-label={t(m.inputLabel)}
           className="ml-1 h-full min-w-0 flex-1 bg-transparent text-sm text-app-ink outline-none placeholder:text-app-placeholder"
           onChange={(event) => onQueryChange(event.target.value)}
           onKeyDown={onInputKeyDown}
@@ -156,6 +158,7 @@ export function GlobalSearchResultList({
   tab: GlobalSearchTab;
   targetContext: TargetContext;
 }) {
+  const t = useT();
   let rowIndex = 0;
   return (
     <div
@@ -176,8 +179,8 @@ export function GlobalSearchResultList({
         />
         {error ? (
           <EmptyState
-            detail={error.message || "Search is unavailable."}
-            title="Search failed"
+            detail={error.message || t(m.unavailable)}
+            title={t(m.failed)}
             tone="danger"
           />
         ) : sections.length === 0 ? (
@@ -185,16 +188,18 @@ export function GlobalSearchResultList({
             action={
               tab !== "all" && debouncedQuery !== ""
                 ? {
-                    label: "Search everywhere",
+                    label: t(m.searchEverywhere),
                     onSelect: () => enterScope("all"),
                   }
                 : undefined
             }
-            detail={emptyDetail(tab, debouncedQuery)}
+            detail={emptyDetail(tab, debouncedQuery, t)}
             title={
               debouncedQuery === ""
-                ? `Search ${scope?.label.toLocaleLowerCase() ?? ""}`.trim()
-                : `No results for “${debouncedRaw}”`
+                ? scope
+                  ? t(scope.placeholder)
+                  : t(m.dialogLabel)
+                : t(m.noResults, { query: debouncedRaw })
             }
           />
         ) : (
@@ -261,6 +266,7 @@ function SectionHeader({
   inputRef: RefObject<HTMLInputElement | null>;
   section: ResultSection;
 }) {
+  const t = useT();
   return (
     <div className="flex h-7 items-center px-3 text-xs text-app-subtle">
       {section.label}
@@ -270,12 +276,12 @@ function SectionHeader({
           onClick={() => enterScope(section.seeAll!)}
           type="button"
         >
-          See all in {SCOPES[section.seeAll].label}
+          {t(m.seeAllIn, { scope: t(SCOPES[section.seeAll].label) })}
           <Icon icon={ArrowRight01Icon} size={14} />
         </button>
       ) : section.action ? (
         <button
-          aria-label={`${section.action.label} ${section.label.toLocaleLowerCase()} searches`}
+          aria-label={section.action.ariaLabel}
           className="-mr-1.5 ml-auto inline-flex h-6 items-center rounded-md px-1.5 text-xs text-app-subtle transition-colors hover:bg-app-hover hover:text-app-ink"
           onClick={() => {
             section.action!.onSelect();
@@ -296,6 +302,7 @@ export function GlobalSearchFooter({
 }: {
   openError: string | null;
 }) {
+  const t = useT();
   return (
     <>
       {openError ? (
@@ -312,17 +319,17 @@ export function GlobalSearchFooter({
             <ShortcutKey>↑</ShortcutKey>
             <ShortcutKey>↓</ShortcutKey>
           </span>
-          Navigate
+          {t(m.legendNavigate)}
         </span>
         <span className="flex items-center gap-2">
           <ShortcutKey>
             <Icon icon={ArrowTurnBackwardIcon} size={12} />
           </ShortcutKey>
-          Open
+          {t(m.legendOpen)}
         </span>
         <span className="flex items-center gap-2">
           <ShortcutKey>Tab</ShortcutKey>
-          Search in type
+          {t(m.legendScope)}
         </span>
       </div>
     </>

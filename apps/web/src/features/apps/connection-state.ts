@@ -1,5 +1,8 @@
 import type { TeamHubClient } from "@/features/teamhub/teamhub-client";
 import type { TeamHubExternalConnection } from "@/features/teamhub/teamhub-types";
+import { type Translate, translate } from "@/i18n/language";
+
+import { connectorMessages as m } from "./connectors.messages";
 
 const NEEDS_ATTENTION = new Set<TeamHubExternalConnection["status"]>([
   "expired",
@@ -129,7 +132,8 @@ export function reauthorizationConnectUrl(connection?: {
 export function accountIdentityText(
   provider: string,
   label: string | null | undefined,
+  t: Translate = translate,
 ): string | undefined {
   if (!label) return undefined;
-  return provider === "outlook" ? `Signed in as ${label}` : label;
+  return provider === "outlook" ? t(m.signedInAs, { account: label }) : label;
 }

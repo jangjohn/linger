@@ -3,20 +3,33 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isInkling2MiniModelId } from "@linger/service-kit/featured-models";
+import { minNvidiaDriverForCuda } from "@linger/service-kit/nvidia-driver";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type {
-  SetupCommand,
-  SetupLocalAccount,
-  SetupLocalModelsCheck,
-  SetupReason,
-  SetupState,
+import type { Language } from "../i18n/language.js";
+import zhCN from "../i18n/locales/zh-CN.json" with { type: "json" };
+import { localizePage } from "../i18n/page.js";
+import {
+  INKLING_2_MINI_ANNOUNCEMENT_URL,
+  NVIDIA_DRIVER_DOWNLOAD_URL,
+  NVIDIA_DRIVER_GUIDE_URL,
+  type SetupCommand,
+  type SetupLocalAccount,
+  type SetupLocalModelsCheck,
+  type SetupReason,
+  type SetupState,
 } from "../shared/setup.js";
 
-const page = readFileSync(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), "setup.html"),
-  "utf8",
-);
+import { setupMessages } from "./setup.messages.js";
+
+const shellFile = (name: string) =>
+  readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), name),
+    "utf8",
+  );
+const rawPage = shellFile("setup.html");
+const messagesRuntime = shellFile("messages.html");
 const PASSWORD = "a-private-password";
 
 const state = (
@@ -56,6 +69,7 @@ let stopPage = () => {};
 const openPage = async (
   initial: SetupState = state("installing"),
   step = "installing",
+  language: Language = "en",
 ) => {
   stopPage();
   const intervals: ReturnType<typeof setInterval>[] = [];
@@ -64,6 +78,8 @@ const openPage = async (
     intervals.forEach(clearInterval);
     timeouts.forEach(clearTimeout);
   };
+  // The page as setup-window.ts serves it.
+  const page = localizePage(rawPage, messagesRuntime, setupMessages, language);
   const [, body] = /<body[^>]*>([\s\S]*)<\/body>/.exec(page)!;
   const [, script] = /<script>([\s\S]*)<\/script>/.exec(body!)!;
   document.body.innerHTML = body!.replace(/<script>[\s\S]*<\/script>/, "");
@@ -80,6 +96,10 @@ const openPage = async (
   Object.assign(window, {
     matchMedia: () => ({ matches: true }),
     lingerSetup: {
+      featuredAnnouncementUrl: INKLING_2_MINI_ANNOUNCEMENT_URL,
+      nvidiaDriverDownloadUrl: NVIDIA_DRIVER_DOWNLOAD_URL,
+      nvidiaDriverGuideUrl: NVIDIA_DRIVER_GUIDE_URL,
+      minDriverForCuda: minNvidiaDriverForCuda,
       getState: async () => current,
       onState: (callback: (next: SetupState) => void) => {
         listener = callback;
@@ -372,6 +392,117 @@ describe("setup page Quick Install recommendation", () => {
     );
   });
 
+  it("holds local models without a plan for gateway-port-in-use and harness-unavailable and offers Check again", async () => {
+    for (const [code, expectWhy, expectSub] of [
+      [
+        "gateway-port-in-use",
+        "Another program is using the port Linger's local model gateway needs. Close the program using that port.",
+        "On hold: free the gateway port, then Check again.",
+      ],
+      [
+        "harness-unavailable",
+        "The Pi runtime required for local models isn't ready right now. Check your connection or permissions.",
+        "On hold: prepare the Pi runtime, then Check again.",
+      ],
+    ] as const) {
+      const blockedWithoutPlan: SetupLocalModelsCheck = {
+        state: "checked",
+        eligible: false,
+        blockedNow: true,
+        memoryBytes: 64 * GB,
+        diskFreeBytes: 400 * GB,
+        reasons: [reason({ code })],
+        recommendation: "codex",
+      };
+      const { run } = await openPage(welcome(blockedWithoutPlan), "welcome");
+      expect($("plan-why").textContent).toBe(
+        `Local model on hold. ${expectWhy} Quick Install sets up Codex now, or choose Check again once the issue is resolved.`,
+      );
+      expect($("plan-why").textContent).not.toContain("memory is free");
+      expect($("local-recheck").hidden).toBe(false);
+      $("local-customize").click();
+      document
+        .querySelector<HTMLButtonElement>(
+          '[data-plan="source"] [data-value="local"]',
+        )!
+        .click();
+      expect($("local-model").hidden).toBe(false);
+      expect($("local-model-name").textContent).toBe("Local model on hold");
+      expect($("local-model-needs").textContent).toBe(expectWhy);
+      expect($("local-sub").textContent).toBe(expectSub);
+      expect(($("local-model") as HTMLButtonElement).disabled).toBe(true);
+      $("local-recheck").click();
+      await vi.waitFor(() =>
+        expect(run).toHaveBeenCalledWith({ op: "local.recheck" }),
+      );
+      expect(document.body.textContent).not.toContain(TOOL_WORDS);
+    }
+  });
+
+  it("holds local models without a plan for blocked-now CUDA driver blockers without duplicating Check again", async () => {
+    const blockedCuda: SetupLocalModelsCheck = {
+      state: "checked",
+      eligible: false,
+      blockedNow: true,
+      memoryBytes: 64 * GB,
+      diskFreeBytes: 400 * GB,
+      reasons: [
+        reason({
+          code: "cuda-driver-update-required",
+          detectedCudaVersion: "12.1",
+          requiredCudaVersion: "12.4",
+          driverVersion: "535.98",
+        }),
+      ],
+      recommendation: "codex",
+    };
+    const { run } = await openPage(welcome(blockedCuda), "welcome");
+    expect($("plan-why").textContent).toBe(
+      "Local model on hold. Your NVIDIA driver supports CUDA 12.1, but local models require NVIDIA driver 550+ (CUDA 12.4). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again. Quick Install sets up Codex now.",
+    );
+    expect(
+      $("plan-why").textContent?.match(/choose Check again/g),
+    ).toHaveLength(1);
+    expect($("local-recheck").hidden).toBe(false);
+    expect($("local-driver-action").hidden).toBe(false);
+    expect($("local-driver-action").textContent).toBe("Download NVIDIA driver");
+    expect($("local-driver-guide").hidden).toBe(false);
+    $("local-driver-action").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({
+        op: "external.open",
+        url: NVIDIA_DRIVER_DOWNLOAD_URL,
+      }),
+    );
+    $("local-driver-guide").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({
+        op: "external.open",
+        url: NVIDIA_DRIVER_GUIDE_URL,
+      }),
+    );
+    $("local-customize").click();
+    document
+      .querySelector<HTMLButtonElement>(
+        '[data-plan="source"] [data-value="local"]',
+      )!
+      .click();
+    expect($("local-model").hidden).toBe(false);
+    expect($("local-model-name").textContent).toBe("Local model on hold");
+    expect($("local-sub").textContent).toBe(
+      "On hold: update your NVIDIA driver, then Check again.",
+    );
+    expect($("local-model-needs").textContent).toBe(
+      "Your NVIDIA driver supports CUDA 12.1, but local models require NVIDIA driver 550+ (CUDA 12.4). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+    );
+    expect(($("local-model") as HTMLButtonElement).disabled).toBe(true);
+    $("local-recheck").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({ op: "local.recheck" }),
+    );
+    expect(document.body.textContent).not.toContain(TOOL_WORDS);
+  });
+
   it("words every localmodels reason by its code, never the tool's message", async () => {
     const cases: [SetupLocalModelsCheck, string][] = [
       [
@@ -389,6 +520,76 @@ describe("setup page Quick Install recommendation", () => {
       [
         { ...small, reasons: [reason({ code: "facts-unavailable" })] },
         "Linger couldn't read this computer's memory, disk or GPU.",
+      ],
+      [
+        {
+          ...small,
+          reasons: [
+            reason({
+              code: "cuda-driver-update-required",
+              detectedCudaVersion: "12.1",
+              requiredCudaVersion: "12.4",
+              driverVersion: "535.98",
+            }),
+          ],
+        },
+        "Your NVIDIA driver supports CUDA 12.1, but local models require NVIDIA driver 550+ (CUDA 12.4). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+      ],
+      [
+        {
+          ...small,
+          reasons: [
+            reason({
+              code: "cuda-driver-update-required",
+              detectedCudaVersion: "11.4",
+              requiredCudaVersion: "11.8",
+            }),
+          ],
+        },
+        "Your NVIDIA driver supports CUDA 11.4, but local models require CUDA 11.8 or newer. Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+      ],
+      [
+        {
+          ...small,
+          reasons: [
+            reason({
+              code: "cuda-driver-update-required",
+              requiredCudaVersion: "12.4",
+            }),
+          ],
+        },
+        "Your NVIDIA driver is too old for local models (requires NVIDIA driver 550+ / CUDA 12.4). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+      ],
+      [
+        {
+          ...small,
+          reasons: [
+            reason({
+              code: "cuda-driver-update-required",
+              requiredCudaVersion: "11.8",
+            }),
+          ],
+        },
+        "Your NVIDIA driver is too old for local models (requires CUDA 11.8 or newer). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+      ],
+      [
+        {
+          ...small,
+          reasons: [
+            reason({
+              code: "cuda-driver-version-unknown",
+              requiredCudaVersion: "12.4",
+            }),
+          ],
+        },
+        "Linger couldn't read the CUDA version from your NVIDIA driver (requires CUDA 12.4 or newer). Update or reinstall your NVIDIA driver, then choose Check again.",
+      ],
+      [
+        {
+          ...small,
+          reasons: [reason({ code: "cuda-driver-version-unknown" })],
+        },
+        "Linger couldn't read the CUDA version from your NVIDIA driver. Update or reinstall your NVIDIA driver, then choose Check again.",
       ],
       [
         { ...small, reasons: [reason({ code: "unsupported-platform" })] },
@@ -432,6 +633,75 @@ describe("setup page Quick Install recommendation", () => {
     );
     expect(($("local-install") as HTMLButtonElement).disabled).toBe(true);
     expect(document.body.textContent).not.toContain(TOOL_WORDS);
+  });
+
+  it("explains an outdated NVIDIA driver and lets the user check again", async () => {
+    const { run } = await openPage(
+      welcome({
+        ...small,
+        reasons: [
+          reason({
+            code: "cuda-driver-update-required",
+            detectedCudaVersion: "12.1",
+            requiredCudaVersion: "12.4",
+            driverVersion: "535.98",
+          }),
+        ],
+      }),
+      "welcome",
+    );
+    expect($("plan-why").textContent).toBe(
+      "Your NVIDIA driver supports CUDA 12.1, but local models require NVIDIA driver 550+ (CUDA 12.4). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+    );
+    expect($("local-recheck").hidden).toBe(false);
+    $("local-customize").click();
+    document
+      .querySelector<HTMLButtonElement>(
+        '[data-plan="source"] [data-value="local"]',
+      )!
+      .click();
+    expect($("local-model-name").textContent).toBe(
+      "Not available on this computer",
+    );
+    expect($("local-model-needs").textContent).toBe(
+      "Your NVIDIA driver supports CUDA 12.1, but local models require NVIDIA driver 550+ (CUDA 12.4). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+    );
+    expect(($("local-install") as HTMLButtonElement).disabled).toBe(true);
+    $("local-recheck").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({ op: "local.recheck" }),
+    );
+    expect(document.body.textContent).not.toContain(TOOL_WORDS);
+  });
+
+  it("offers Open NVIDIA App on Windows when detected and names the required driver branch", async () => {
+    const winState: SetupState = {
+      ...welcome({
+        ...small,
+        blockedNow: true,
+        reasons: [
+          reason({
+            code: "cuda-driver-update-required",
+            detectedCudaVersion: "12.8",
+            requiredCudaVersion: "13.0",
+            driverVersion: "572.83",
+          }),
+        ],
+        recommendation: "codex",
+      }),
+      platform: "win32",
+      driverUpdate: { nvidiaApp: "nvidia_app" },
+    };
+    const { run } = await openPage(winState, "welcome");
+    expect($("plan-why").textContent).toContain(
+      "NVIDIA driver 580+ (CUDA 13.0)",
+    );
+    expect($("local-driver-action").hidden).toBe(false);
+    expect($("local-driver-action").textContent).toBe("Open NVIDIA App");
+    $("local-driver-action").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({ op: "driver.open-nvidia-app" }),
+    );
   });
 
   it("says the stack's memory covers the model and its services", async () => {
@@ -851,6 +1121,65 @@ describe("setup page download progress", () => {
   });
 });
 
+describe("setup page slow runtime lookup", () => {
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = () => {};
+  });
+  const withLocal = (
+    phase: SetupState["localServer"]["phase"],
+    fields: Partial<SetupState["localServer"]>,
+  ): SetupState => {
+    const base = state(phase);
+    return { ...base, localServer: { ...base.localServer, ...fields } };
+  };
+
+  it("says what the bar waits on while the installer checks the runtime", async () => {
+    const { push } = await openPage(withLocal("installing", {}));
+    expect($("installing-waiting").hidden).toBe(true);
+    push(withLocal("installing", { waiting: "runtime" }));
+    expect($("installing-waiting").hidden).toBe(false);
+    expect($("installing-waiting").textContent).toBe(
+      "Checking the AI runtime on this computer. On some computers this takes a few minutes; the bar moves on once it finishes.",
+    );
+    push(withLocal("installing", {}));
+    expect($("installing-waiting").hidden).toBe(true);
+  });
+
+  it("words a runtime lookup that did not finish, with Try Again", async () => {
+    await openPage(
+      withLocal("failed", {
+        message:
+          "Checking the AI runtime on this computer did not finish in time.",
+        failure: "runtime_lookup_timed_out",
+      }),
+    );
+    expect($("installing-waiting").hidden).toBe(true);
+    expect($("installing-error").textContent).toBe(
+      "Checking the AI runtime did not finish in 10 minutes. Try Again picks up the same check; if it stops again, save diagnostics and send them to Linger support.",
+    );
+    expect($("installing-actions").hidden).toBe(false);
+    expect($("local-retry").hidden).toBe(false);
+  });
+
+  it("words both in Chinese", async () => {
+    const { push } = await openPage(
+      withLocal("installing", { waiting: "runtime" }),
+      "installing",
+      "zh-CN",
+    );
+    expect($("installing-waiting").textContent).toBe(zhCN.setup.waitingRuntime);
+    push(
+      withLocal("failed", {
+        message: "Lost the connection to the installer.",
+        failure: "runtime_lookup_unreachable",
+      }),
+    );
+    expect($("installing-error").textContent).toBe(
+      zhCN.setup.runtimeLookupUnreachable,
+    );
+  });
+});
+
 describe("setup page Send Diagnostics", () => {
   // A failure scrolls its actions into view, which jsdom lacks.
   beforeEach(() => {
@@ -975,5 +1304,389 @@ describe("setup page Send Diagnostics", () => {
     expect($("send-primary").hidden).toBe(true);
     expect($("send-lead").textContent).toContain("Save Diagnostics");
     expect($("send-close").textContent).toBe("Close");
+  });
+});
+
+describe("setup page refused install location", () => {
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = () => {};
+  });
+
+  const message = (folder: string) =>
+    `Windows private path validation failed: ${folder} is inside a folder other accounts on this computer can rename or replace. Use a current-user owned local directory without links or shared access.`;
+  const failed = (
+    location: string,
+    reason?: NonNullable<SetupState["localServer"]["refusal"]>["reason"],
+  ): SetupState => {
+    const base = state("failed");
+    return {
+      ...base,
+      platform: "win32",
+      localServer: {
+        ...base.localServer,
+        message: message(location),
+        location: { path: location, custom: true },
+        ...(reason
+          ? { refusal: { code: "WINDOWS_PRIVATE_PATH_UNSAFE", reason } }
+          : {}),
+      },
+    };
+  };
+
+  const usual = "Your data is kept. Fix the problem and try again.";
+
+  it("says where to install when a nested folder on a drive is refused", async () => {
+    const folder = "D:\\Software\\Linger";
+    const { push } = await openPage(failed(folder, "UNSAFE_PARENT_ACCESS"));
+    expect($("installing-error").textContent).toBe(message(folder));
+    expect($("installing-plan").textContent).toBe(
+      "Go back and set the install location to the drive itself (Linger installs into D:\\Linger) or an empty folder directly on the drive.",
+    );
+    // The hint leaves with the failure.
+    push(state("installing"));
+    expect($("installing-plan").textContent).toBe(
+      "This takes a few minutes. You can keep working.",
+    );
+  });
+
+  it("gives no hint the person has already followed", async () => {
+    // Directly on the drive, the drive's own permissions are what refuse it.
+    await openPage(failed("E:\\Linger", "UNSAFE_PARENT_ACCESS"));
+    expect($("installing-plan").textContent).toBe(usual);
+  });
+
+  it("keeps the hint to this refusal, known by its code", async () => {
+    await openPage(failed("D:\\Software\\Linger", "UNSAFE_OWNER"));
+    expect($("installing-plan").textContent).toBe(usual);
+    // The words alone do not bring the hint.
+    await openPage(failed("D:\\Software\\Linger"));
+    expect($("installing-plan").textContent).toBe(usual);
+  });
+});
+
+describe("setup page in Chinese", () => {
+  const zh = zhCN.setup;
+  const fill = (text: string, values: Record<string, string>) =>
+    text.replace(/\{(\w+)\}/gu, (_, name: string) => values[name]!);
+
+  it("speaks the language it was served in", async () => {
+    await openPage(welcome(capable), "welcome", "zh-CN");
+    // The harness loads the body only; static text comes from data-t.
+    expect(document.querySelector('[data-t="welcomeTitle"]')!.textContent).toBe(
+      zh.welcomeTitle,
+    );
+    expect($("plan-summary").textContent).toBe(
+      fill(zh.recommendedPlan, { plan: zh.localModelPi }),
+    );
+    expect($("plan-why").textContent).toBe(
+      [
+        "qwen3-8b",
+        fill(zh.fitsGpu, { gpu: "RTX 4090" }),
+        fill(zh.memoryAmount, { size: "64 GB" }),
+        fill(zh.downloadAmount, { size: "6 GB" }),
+      ].join(" · "),
+    );
+    expect($("local-install-label").textContent).toBe(zh.quickInstall);
+  });
+
+  it("words a held local model from the catalog", async () => {
+    await openPage(welcome(held), "welcome", "zh-CN");
+    expect($("plan-why").textContent).toBe(
+      fill(zh.heldWhy, { reasons: zh.reasonHeld, plan: "Codex" }),
+    );
+  });
+
+  it("counts the download its way", async () => {
+    const base = state("installing");
+    await openPage(
+      {
+        ...base,
+        localServer: {
+          ...base.localServer,
+          transfer: {
+            label: "Downloading the local model…",
+            completed: 3 * GB,
+            total: 4 * GB,
+            bytesPerSecond: 50 * 1024 ** 2,
+            partial: true,
+          },
+        },
+      },
+      "installing",
+      "zh-CN",
+    );
+    expect($("installing-transfer-bytes").textContent).toBe(
+      `${fill(zh.thisFile, {
+        amount: fill(zh.amountOf, { done: "3.0 GB", total: "4.0 GB" }),
+      })} · 50 MB/s`,
+    );
+  });
+
+  it("localizes the Inkling 2 Mini spotlight in both recommended and library states", async () => {
+    const inklingCapable: SetupLocalModelsCheck = {
+      ...capable,
+      model: {
+        name: "inkling-2-mini:Q4_K_M",
+        downloadBytes: 15 * GB,
+        diskBytes: 18 * GB,
+        memoryBytes: 22 * GB,
+        featuredInkling: true,
+      },
+    };
+    await openPage(welcome(inklingCapable), "welcome", "zh-CN");
+    expect($("plan-featured-badge").hidden).toBe(false);
+    expect($("plan-featured-badge").textContent).toBe(zh.featuredPartnerBadge);
+    expect($("featured-spotlight").hidden).toBe(false);
+    expect($("featured-spotlight-note").textContent).toBe(
+      zh.featuredModelSelected,
+    );
+    expect($("featured-spotlight-link").textContent).toBe(zh.learnMoreLink);
+    expect(
+      $("featured-spotlight").querySelector(".spotlight-specs")!.textContent,
+    ).toBe(zh.featuredModelSpecs);
+
+    $("local-customize").click();
+    expect($("local-model-featured").hidden).toBe(false);
+    expect($("local-model-featured").textContent).toBe(zh.featuredPartnerBadge);
+    expect($("local-spotlight-text").textContent).toBe(zh.featuredModelSpecs);
+    expect($("local-spotlight-link").textContent).toBe(zh.learnMoreLink);
+
+    await openPage(welcome(capable), "welcome", "zh-CN");
+    expect($("plan-featured-badge").hidden).toBe(true);
+    expect($("featured-spotlight").hidden).toBe(false);
+    expect($("featured-spotlight-note").textContent).toBe(
+      zh.featuredModelLibraryNote,
+    );
+    expect($("featured-spotlight-link").textContent).toBe(
+      zh.thinkingMachinesLink,
+    );
+    $("local-customize").click();
+    expect($("local-model-featured").hidden).toBe(true);
+    expect($("local-spotlight-text").textContent).toBe(
+      zh.featuredModelCustomizeNote,
+    );
+    expect($("local-spotlight-link").textContent).toBe(zh.thinkingMachinesLink);
+  });
+});
+
+describe("setup page Inkling 2 Mini featured spotlight", () => {
+  const inklingCapable = (
+    name = "inkling-2-mini:Q4_K_M",
+  ): SetupLocalModelsCheck => ({
+    ...capable,
+    model: {
+      name,
+      downloadBytes: 15 * GB,
+      diskBytes: 18 * GB,
+      memoryBytes: 22 * GB,
+      ...(isInkling2MiniModelId(name)
+        ? { featuredInkling: true as const }
+        : {}),
+    },
+  });
+
+  it("emphasizes Inkling 2 Mini directly in the plan line and local model card when recommended", async () => {
+    const { run } = await openPage(welcome(inklingCapable()), "welcome");
+    expect($("plan-summary").textContent).toBe(
+      "Recommended for this computer: Local model + Pi",
+    );
+    expect($("plan-featured-badge").hidden).toBe(false);
+    expect($("plan-featured-badge").textContent).toBe(
+      "Featured · Thinking Machines",
+    );
+    expect($("featured-spotlight").hidden).toBe(false);
+    expect($("featured-spotlight").dataset.recommended).toBe("true");
+    expect($("featured-spotlight-note").textContent).toBe(
+      "Selected for Quick Install on this computer.",
+    );
+    expect($("featured-spotlight-link").textContent).toBe("Learn more ↗");
+
+    $("featured-spotlight-link").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({
+        op: "external.open",
+        url: INKLING_2_MINI_ANNOUNCEMENT_URL,
+      }),
+    );
+
+    $("local-customize").click();
+    expect($("featured-spotlight").hidden).toBe(true);
+    expect($("plan-featured-badge").hidden).toBe(true);
+    expect($("local-model-name").textContent).toBe("inkling-2-mini:Q4_K_M");
+    expect($("local-model-featured").hidden).toBe(false);
+    expect($("local-model-featured").textContent).toBe(
+      "Featured · Thinking Machines",
+    );
+    expect($("local-spotlight").dataset.recommended).toBe("true");
+    expect($("local-spotlight-text").textContent).toBe(
+      "26.4B Looped MoE · 3.4B active · Vision & Agentic Coding · Apache 2.0",
+    );
+    expect($("local-spotlight-link").textContent).toBe("Learn more ↗");
+
+    $("local-spotlight-link").click();
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+    expect(run).toHaveBeenLastCalledWith({
+      op: "external.open",
+      url: INKLING_2_MINI_ANNOUNCEMENT_URL,
+    });
+  });
+
+  it("matches org-prefixed Inkling 2 Mini model IDs", async () => {
+    await openPage(
+      welcome(inklingCapable("thinkingmachines/Inkling-2-Mini")),
+      "welcome",
+    );
+    expect($("plan-featured-badge").hidden).toBe(false);
+    expect($("featured-spotlight").dataset.recommended).toBe("true");
+  });
+
+  it("shows the library spotlight strip with Thinking Machines link when another model or subscription is recommended", async () => {
+    for (const check of [capable, small, held]) {
+      const { run } = await openPage(welcome(check), "welcome");
+      expect($("plan-featured-badge").hidden).toBe(true);
+      expect($("featured-spotlight").hidden).toBe(false);
+      expect($("featured-spotlight").dataset.recommended).toBe("false");
+      expect($("featured-spotlight-note").textContent).toContain(
+        "Settings → Models",
+      );
+      expect($("featured-spotlight-link").textContent).toBe(
+        "Thinking Machines ↗",
+      );
+
+      $("featured-spotlight-link").click();
+      await vi.waitFor(() =>
+        expect(run).toHaveBeenCalledWith({
+          op: "external.open",
+          url: INKLING_2_MINI_ANNOUNCEMENT_URL,
+        }),
+      );
+
+      $("local-customize").click();
+      document
+        .querySelector<HTMLButtonElement>(
+          '[data-plan="source"] [data-value="local"]',
+        )!
+        .click();
+      expect($("local-model-featured").hidden).toBe(true);
+      expect($("local-spotlight").dataset.recommended).toBe("false");
+      expect($("local-spotlight-text").textContent).toContain(
+        "Settings → Models",
+      );
+      expect($("local-spotlight-link").textContent).toBe("Thinking Machines ↗");
+      $("local-spotlight-link").click();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+    }
+  });
+
+  it("badges a held Inkling 2 Mini card in Customize without claiming Quick Install selected it", async () => {
+    await openPage(
+      welcome({
+        ...held,
+        model: {
+          name: "inkling-2-mini:UD-Q4_K_M",
+          downloadBytes: 15 * GB,
+          diskBytes: 18 * GB,
+          memoryBytes: 22 * GB,
+          featuredInkling: true,
+        },
+      }),
+      "welcome",
+    );
+    expect($("plan-featured-badge").hidden).toBe(true);
+    expect($("featured-spotlight").dataset.recommended).toBe("false");
+    $("local-customize").click();
+    document
+      .querySelector<HTMLButtonElement>(
+        '[data-plan="source"] [data-value="local"]',
+      )!
+      .click();
+    expect($("local-model-name").textContent).toBe("inkling-2-mini:UD-Q4_K_M");
+    expect($("local-model-featured").hidden).toBe(false);
+    expect($("local-spotlight").dataset.recommended).toBe("true");
+    expect($("local-spotlight-link").textContent).toBe("Learn more ↗");
+  });
+
+  it("hides the featured spotlight when local installation is unavailable", async () => {
+    const base = welcome(small);
+    await openPage(
+      { ...base, localServer: { ...base.localServer, available: false } },
+      "welcome",
+    );
+    expect($("featured-spotlight").hidden).toBe(true);
+    expect($("plan-featured-badge").hidden).toBe(true);
+  });
+
+  it("offers one-click driver installation and renders live progress on Windows Setup", async () => {
+    const driverBlocked: SetupLocalModelsCheck = {
+      state: "checked",
+      eligible: false,
+      blockedNow: true,
+      memoryBytes: 32 * GB,
+      diskFreeBytes: 200 * GB,
+      gpu: "NVIDIA GeForce RTX 5060",
+      recommendation: "codex",
+      reasons: [
+        {
+          code: "cuda-driver-update-required",
+          detectedCudaVersion: "12.8",
+          requiredCudaVersion: "13.0",
+          driverVersion: "572.83",
+        },
+      ],
+    };
+    const base = {
+      ...welcome(driverBlocked),
+      platform: "win32" as const,
+      driverUpdate: {
+        nvidiaApp: "nvidia_app" as const,
+        directInstallSupported: true,
+        installState: { phase: "idle" as const },
+      },
+    };
+    const { run, push } = await openPage(base, "welcome");
+
+    expect($("local-driver-install").hidden).toBe(false);
+    expect($("local-driver-install").textContent).toBe("Install driver update");
+    $("local-driver-install").click();
+    await vi.waitFor(() =>
+      expect(run).toHaveBeenCalledWith({
+        op: "driver.start-install",
+        requiredCuda: "13.0",
+      }),
+    );
+
+    push({
+      ...base,
+      driverUpdate: {
+        ...base.driverUpdate,
+        installState: {
+          phase: "downloading",
+          version: "621.24",
+          completedBytes: 512 * 1024 ** 2,
+          totalBytes: 1024 * 1024 ** 2,
+        },
+      },
+    });
+    expect($("local-driver-status").hidden).toBe(false);
+    expect($("local-driver-status").textContent).toContain(
+      "Downloading NVIDIA driver 621.24",
+    );
+    expect(($("local-driver-install") as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+
+    push({
+      ...base,
+      driverUpdate: {
+        ...base.driverUpdate,
+        installState: {
+          phase: "reboot_required",
+          version: "621.24",
+        },
+      },
+    });
+    expect($("local-driver-status").textContent).toContain(
+      "NVIDIA driver 621.24 installed. Restart Windows to finish",
+    );
   });
 });

@@ -284,6 +284,56 @@ it("passes on the memory counts each reason carries", async () => {
     { code: "free-memory-required", message: "" },
   ]);
 });
+it("passes on validated CUDA driver versions and drops malformed values", async () => {
+  const value = upstream(false);
+  const report = await inspectSetup({
+    localmodels: runner({
+      ...value,
+      stack: {
+        ...value.stack,
+        available: false,
+        state: "blocked-now",
+        hardwareCapable: true,
+        reasons: [
+          {
+            code: "cuda-driver-update-required",
+            message: "Driver supports CUDA 12.1; requires CUDA >= 12.4.",
+            detectedCudaVersion: "12.1",
+            requiredCudaVersion: "12.4",
+            driverVersion: "535.98",
+          },
+          {
+            code: "cuda-driver-version-unknown",
+            message: "Could not detect driver CUDA version.",
+            detectedCudaVersion: "CUDA 12.1",
+            requiredCudaVersion: "12.4",
+            driverVersion: "[N/A]",
+          },
+        ],
+      },
+      recommendation: "codex",
+    }),
+  });
+  expect(report.localModels).toMatchObject({
+    eligible: false,
+    state: "blocked-now",
+    hardwareCapable: true,
+    reasons: [
+      {
+        code: "cuda-driver-update-required",
+        message: "Driver supports CUDA 12.1; requires CUDA >= 12.4.",
+        detectedCudaVersion: "12.1",
+        requiredCudaVersion: "12.4",
+        driverVersion: "535.98",
+      },
+      {
+        code: "cuda-driver-version-unknown",
+        message: "Could not detect driver CUDA version.",
+        requiredCudaVersion: "12.4",
+      },
+    ],
+  });
+});
 it("fails explicitly and redacts tool output when upstream is unavailable or malformed", async () => {
   for (const response of [
     { code: 1, stdout: "private token", stderr: "secret" },

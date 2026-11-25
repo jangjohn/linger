@@ -233,6 +233,7 @@ const (
 	AgentRuntimeExecutionFailureCodeExecutionFailed         AgentRuntimeExecutionFailureCode = "execution_failed"
 	AgentRuntimeExecutionFailureCodeExecutionOutcomeUnknown AgentRuntimeExecutionFailureCode = "execution_outcome_unknown"
 	AgentRuntimeExecutionFailureCodeInterrupted             AgentRuntimeExecutionFailureCode = "interrupted"
+	AgentRuntimeExecutionFailureCodeLocalModelUnavailable   AgentRuntimeExecutionFailureCode = "local_model_unavailable"
 	AgentRuntimeExecutionFailureCodeModelNotOffered         AgentRuntimeExecutionFailureCode = "model_not_offered"
 	AgentRuntimeExecutionFailureCodeModelServiceError       AgentRuntimeExecutionFailureCode = "model_service_error"
 	AgentRuntimeExecutionFailureCodeModelUnavailable        AgentRuntimeExecutionFailureCode = "model_unavailable"
@@ -263,6 +264,8 @@ func (e AgentRuntimeExecutionFailureCode) Valid() bool {
 	case AgentRuntimeExecutionFailureCodeExecutionOutcomeUnknown:
 		return true
 	case AgentRuntimeExecutionFailureCodeInterrupted:
+		return true
+	case AgentRuntimeExecutionFailureCodeLocalModelUnavailable:
 		return true
 	case AgentRuntimeExecutionFailureCodeModelNotOffered:
 		return true
@@ -512,6 +515,30 @@ func (e AgentVisibilityScope) Valid() bool {
 	case AgentVisibilityScopeSponsor:
 		return true
 	case AgentVisibilityScopeWorkspace:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for AnotherMeBackgroundFailureReason.
+const (
+	AnotherMeBackgroundFailureReasonRuntimeAuthRequired AnotherMeBackgroundFailureReason = "runtime_auth_required"
+	AnotherMeBackgroundFailureReasonRuntimeIncompatible AnotherMeBackgroundFailureReason = "runtime_incompatible"
+	AnotherMeBackgroundFailureReasonRuntimeUnavailable  AnotherMeBackgroundFailureReason = "runtime_unavailable"
+	AnotherMeBackgroundFailureReasonUnknown             AnotherMeBackgroundFailureReason = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the AnotherMeBackgroundFailureReason enum.
+func (e AnotherMeBackgroundFailureReason) Valid() bool {
+	switch e {
+	case AnotherMeBackgroundFailureReasonRuntimeAuthRequired:
+		return true
+	case AnotherMeBackgroundFailureReasonRuntimeIncompatible:
+		return true
+	case AnotherMeBackgroundFailureReasonRuntimeUnavailable:
+		return true
+	case AnotherMeBackgroundFailureReasonUnknown:
 		return true
 	default:
 		return false
@@ -906,6 +933,7 @@ const (
 	DecisionKindQuestion            DecisionKind = "question"
 	DecisionKindRoomCreation        DecisionKind = "room_creation"
 	DecisionKindRuntimePermission   DecisionKind = "runtime_permission"
+	DecisionKindSearchKey           DecisionKind = "search_key"
 )
 
 // Valid indicates whether the value is a known member of the DecisionKind enum.
@@ -932,6 +960,8 @@ func (e DecisionKind) Valid() bool {
 	case DecisionKindRoomCreation:
 		return true
 	case DecisionKindRuntimePermission:
+		return true
+	case DecisionKindSearchKey:
 		return true
 	default:
 		return false
@@ -2074,9 +2104,13 @@ func (e LocalModelArchitecture) Valid() bool {
 
 // Defines values for LocalModelAvailabilityReasonCode.
 const (
-	LocalModelAvailabilityDiskInsufficient    LocalModelAvailabilityReasonCode = "DISK_INSUFFICIENT"
-	LocalModelAvailabilityMemoryInsufficient  LocalModelAvailabilityReasonCode = "MEMORY_INSUFFICIENT"
-	LocalModelAvailabilityPlatformUnsupported LocalModelAvailabilityReasonCode = "PLATFORM_UNSUPPORTED"
+	LocalModelAvailabilityDiskInsufficient         LocalModelAvailabilityReasonCode = "DISK_INSUFFICIENT"
+	LocalModelAvailabilityDriverUpdateRequired     LocalModelAvailabilityReasonCode = "DRIVER_UPDATE_REQUIRED"
+	LocalModelAvailabilityGpuUnsupported           LocalModelAvailabilityReasonCode = "GPU_UNSUPPORTED"
+	LocalModelAvailabilityMemoryInsufficient       LocalModelAvailabilityReasonCode = "MEMORY_INSUFFICIENT"
+	LocalModelAvailabilityPlatformUnsupported      LocalModelAvailabilityReasonCode = "PLATFORM_UNSUPPORTED"
+	LocalModelAvailabilityRuntimeDependencyMissing LocalModelAvailabilityReasonCode = "RUNTIME_DEPENDENCY_MISSING"
+	LocalModelAvailabilityUnavailable              LocalModelAvailabilityReasonCode = "UNAVAILABLE"
 )
 
 // Valid indicates whether the value is a known member of the LocalModelAvailabilityReasonCode enum.
@@ -2084,9 +2118,62 @@ func (e LocalModelAvailabilityReasonCode) Valid() bool {
 	switch e {
 	case LocalModelAvailabilityDiskInsufficient:
 		return true
+	case LocalModelAvailabilityDriverUpdateRequired:
+		return true
+	case LocalModelAvailabilityGpuUnsupported:
+		return true
 	case LocalModelAvailabilityMemoryInsufficient:
 		return true
 	case LocalModelAvailabilityPlatformUnsupported:
+		return true
+	case LocalModelAvailabilityRuntimeDependencyMissing:
+		return true
+	case LocalModelAvailabilityUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for LocalModelAvailabilityReasonGpuVendor.
+const (
+	LocalModelGpuVendorAmd     LocalModelAvailabilityReasonGpuVendor = "amd"
+	LocalModelGpuVendorIntel   LocalModelAvailabilityReasonGpuVendor = "intel"
+	LocalModelGpuVendorNone    LocalModelAvailabilityReasonGpuVendor = "none"
+	LocalModelGpuVendorUnknown LocalModelAvailabilityReasonGpuVendor = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the LocalModelAvailabilityReasonGpuVendor enum.
+func (e LocalModelAvailabilityReasonGpuVendor) Valid() bool {
+	switch e {
+	case LocalModelGpuVendorAmd:
+		return true
+	case LocalModelGpuVendorIntel:
+		return true
+	case LocalModelGpuVendorNone:
+		return true
+	case LocalModelGpuVendorUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for LocalModelAvailabilityReasonMemoryKind.
+const (
+	LocalModelMemoryKindRam     LocalModelAvailabilityReasonMemoryKind = "ram"
+	LocalModelMemoryKindUnified LocalModelAvailabilityReasonMemoryKind = "unified"
+	LocalModelMemoryKindVram    LocalModelAvailabilityReasonMemoryKind = "vram"
+)
+
+// Valid indicates whether the value is a known member of the LocalModelAvailabilityReasonMemoryKind enum.
+func (e LocalModelAvailabilityReasonMemoryKind) Valid() bool {
+	switch e {
+	case LocalModelMemoryKindRam:
+		return true
+	case LocalModelMemoryKindUnified:
+		return true
+	case LocalModelMemoryKindVram:
 		return true
 	default:
 		return false
@@ -2138,6 +2225,27 @@ func (e LocalModelDownloadProgressStep) Valid() bool {
 	}
 }
 
+// Defines values for LocalModelEngine.
+const (
+	LocalModelEngineLlamaCpp   LocalModelEngine = "llama.cpp"
+	LocalModelEnginePolystrata LocalModelEngine = "polystrata"
+	LocalModelEngineStrata     LocalModelEngine = "strata"
+)
+
+// Valid indicates whether the value is a known member of the LocalModelEngine enum.
+func (e LocalModelEngine) Valid() bool {
+	switch e {
+	case LocalModelEngineLlamaCpp:
+		return true
+	case LocalModelEnginePolystrata:
+		return true
+	case LocalModelEngineStrata:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for LocalModelErrorCause.
 const (
 	LocalModelErrorCauseGatewayHomeNotPrivate LocalModelErrorCause = "GATEWAY_HOME_NOT_PRIVATE"
@@ -2159,8 +2267,10 @@ const (
 	CHECKSUMMISMATCH          LocalModelErrorCode = "CHECKSUM_MISMATCH"
 	DISKINSUFFICIENT          LocalModelErrorCode = "DISK_INSUFFICIENT"
 	DOWNLOADFAILED            LocalModelErrorCode = "DOWNLOAD_FAILED"
+	DRIVERUPDATEREQUIRED      LocalModelErrorCode = "DRIVER_UPDATE_REQUIRED"
 	ENGINESTARTFAILED         LocalModelErrorCode = "ENGINE_START_FAILED"
 	GATEWAYREGISTRATIONFAILED LocalModelErrorCode = "GATEWAY_REGISTRATION_FAILED"
+	GPUUNSUPPORTED            LocalModelErrorCode = "GPU_UNSUPPORTED"
 	HEALTHCHECKFAILED         LocalModelErrorCode = "HEALTH_CHECK_FAILED"
 	INVALIDSTATE              LocalModelErrorCode = "INVALID_STATE"
 	JOBRUNNING                LocalModelErrorCode = "JOB_RUNNING"
@@ -2171,6 +2281,8 @@ const (
 	NETWORKUNAVAILABLE        LocalModelErrorCode = "NETWORK_UNAVAILABLE"
 	OUTOFMEMORY               LocalModelErrorCode = "OUT_OF_MEMORY"
 	PLATFORMUNSUPPORTED       LocalModelErrorCode = "PLATFORM_UNSUPPORTED"
+	RUNTIMEDEPENDENCYMISSING  LocalModelErrorCode = "RUNTIME_DEPENDENCY_MISSING"
+	UNKNOWNERROR              LocalModelErrorCode = "UNKNOWN_ERROR"
 )
 
 // Valid indicates whether the value is a known member of the LocalModelErrorCode enum.
@@ -2184,9 +2296,13 @@ func (e LocalModelErrorCode) Valid() bool {
 		return true
 	case DOWNLOADFAILED:
 		return true
+	case DRIVERUPDATEREQUIRED:
+		return true
 	case ENGINESTARTFAILED:
 		return true
 	case GATEWAYREGISTRATIONFAILED:
+		return true
+	case GPUUNSUPPORTED:
 		return true
 	case HEALTHCHECKFAILED:
 		return true
@@ -2207,6 +2323,10 @@ func (e LocalModelErrorCode) Valid() bool {
 	case OUTOFMEMORY:
 		return true
 	case PLATFORMUNSUPPORTED:
+		return true
+	case RUNTIMEDEPENDENCYMISSING:
+		return true
+	case UNKNOWNERROR:
 		return true
 	default:
 		return false
@@ -2426,21 +2546,63 @@ func (e LocalModelsComputerStatus) Valid() bool {
 	}
 }
 
+// Defines values for LocalModelsDebugInfoMode.
+const (
+	LocalModelsDebugModeSimulate LocalModelsDebugInfoMode = "simulate"
+	LocalModelsDebugModeTiny     LocalModelsDebugInfoMode = "tiny"
+)
+
+// Valid indicates whether the value is a known member of the LocalModelsDebugInfoMode enum.
+func (e LocalModelsDebugInfoMode) Valid() bool {
+	switch e {
+	case LocalModelsDebugModeSimulate:
+		return true
+	case LocalModelsDebugModeTiny:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for LocalModelsDebugInfoSource.
+const (
+	LocalModelsDebugSourceEnv         LocalModelsDebugInfoSource = "env"
+	LocalModelsDebugSourceStateConfig LocalModelsDebugInfoSource = "state_config"
+	LocalModelsDebugSourceUserConfig  LocalModelsDebugInfoSource = "user_config"
+)
+
+// Valid indicates whether the value is a known member of the LocalModelsDebugInfoSource enum.
+func (e LocalModelsDebugInfoSource) Valid() bool {
+	switch e {
+	case LocalModelsDebugSourceEnv:
+		return true
+	case LocalModelsDebugSourceStateConfig:
+		return true
+	case LocalModelsDebugSourceUserConfig:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for LocalModelsErrorCode.
 const (
-	LocalModelsErrorCodeLOCALCOMPUTEROFFLINE          LocalModelsErrorCode = "LOCAL_COMPUTER_OFFLINE"
-	LocalModelsErrorCodeLOCALMODELACTIONFAILED        LocalModelsErrorCode = "LOCAL_MODEL_ACTION_FAILED"
-	LocalModelsErrorCodeLOCALMODELACTIONFORBIDDEN     LocalModelsErrorCode = "LOCAL_MODEL_ACTION_FORBIDDEN"
-	LocalModelsErrorCodeLOCALMODELACTIONUNCONFIRMED   LocalModelsErrorCode = "LOCAL_MODEL_ACTION_UNCONFIRMED"
-	LocalModelsErrorCodeLOCALMODELDISKINSUFFICIENT    LocalModelsErrorCode = "LOCAL_MODEL_DISK_INSUFFICIENT"
-	LocalModelsErrorCodeLOCALMODELINVALIDSTATE        LocalModelsErrorCode = "LOCAL_MODEL_INVALID_STATE"
-	LocalModelsErrorCodeLOCALMODELJOBRUNNING          LocalModelsErrorCode = "LOCAL_MODEL_JOB_RUNNING"
-	LocalModelsErrorCodeLOCALMODELMEMORYINSUFFICIENT  LocalModelsErrorCode = "LOCAL_MODEL_MEMORY_INSUFFICIENT"
-	LocalModelsErrorCodeLOCALMODELNOROOM              LocalModelsErrorCode = "LOCAL_MODEL_NO_ROOM"
-	LocalModelsErrorCodeLOCALMODELPLATFORMUNSUPPORTED LocalModelsErrorCode = "LOCAL_MODEL_PLATFORM_UNSUPPORTED"
-	LocalModelsErrorCodeLOCALMODELSSERVICEUNAVAILABLE LocalModelsErrorCode = "LOCAL_MODELS_SERVICE_UNAVAILABLE"
-	LocalModelsErrorCodeLOCALMODELSUNAVAILABLE        LocalModelsErrorCode = "LOCAL_MODELS_UNAVAILABLE"
-	LocalModelsErrorCodeLOCALMODELUNKNOWN             LocalModelsErrorCode = "LOCAL_MODEL_UNKNOWN"
+	LocalModelsErrorCodeLOCALCOMPUTEROFFLINE               LocalModelsErrorCode = "LOCAL_COMPUTER_OFFLINE"
+	LocalModelsErrorCodeLOCALMODELACTIONFAILED             LocalModelsErrorCode = "LOCAL_MODEL_ACTION_FAILED"
+	LocalModelsErrorCodeLOCALMODELACTIONFORBIDDEN          LocalModelsErrorCode = "LOCAL_MODEL_ACTION_FORBIDDEN"
+	LocalModelsErrorCodeLOCALMODELACTIONUNCONFIRMED        LocalModelsErrorCode = "LOCAL_MODEL_ACTION_UNCONFIRMED"
+	LocalModelsErrorCodeLOCALMODELDISKINSUFFICIENT         LocalModelsErrorCode = "LOCAL_MODEL_DISK_INSUFFICIENT"
+	LocalModelsErrorCodeLOCALMODELDRIVERUPDATEREQUIRED     LocalModelsErrorCode = "LOCAL_MODEL_DRIVER_UPDATE_REQUIRED"
+	LocalModelsErrorCodeLOCALMODELGPUUNSUPPORTED           LocalModelsErrorCode = "LOCAL_MODEL_GPU_UNSUPPORTED"
+	LocalModelsErrorCodeLOCALMODELINVALIDSTATE             LocalModelsErrorCode = "LOCAL_MODEL_INVALID_STATE"
+	LocalModelsErrorCodeLOCALMODELJOBRUNNING               LocalModelsErrorCode = "LOCAL_MODEL_JOB_RUNNING"
+	LocalModelsErrorCodeLOCALMODELMEMORYINSUFFICIENT       LocalModelsErrorCode = "LOCAL_MODEL_MEMORY_INSUFFICIENT"
+	LocalModelsErrorCodeLOCALMODELNOROOM                   LocalModelsErrorCode = "LOCAL_MODEL_NO_ROOM"
+	LocalModelsErrorCodeLOCALMODELPLATFORMUNSUPPORTED      LocalModelsErrorCode = "LOCAL_MODEL_PLATFORM_UNSUPPORTED"
+	LocalModelsErrorCodeLOCALMODELRUNTIMEDEPENDENCYMISSING LocalModelsErrorCode = "LOCAL_MODEL_RUNTIME_DEPENDENCY_MISSING"
+	LocalModelsErrorCodeLOCALMODELSSERVICEUNAVAILABLE      LocalModelsErrorCode = "LOCAL_MODELS_SERVICE_UNAVAILABLE"
+	LocalModelsErrorCodeLOCALMODELSUNAVAILABLE             LocalModelsErrorCode = "LOCAL_MODELS_UNAVAILABLE"
+	LocalModelsErrorCodeLOCALMODELUNKNOWN                  LocalModelsErrorCode = "LOCAL_MODEL_UNKNOWN"
 )
 
 // Valid indicates whether the value is a known member of the LocalModelsErrorCode enum.
@@ -2456,6 +2618,10 @@ func (e LocalModelsErrorCode) Valid() bool {
 		return true
 	case LocalModelsErrorCodeLOCALMODELDISKINSUFFICIENT:
 		return true
+	case LocalModelsErrorCodeLOCALMODELDRIVERUPDATEREQUIRED:
+		return true
+	case LocalModelsErrorCodeLOCALMODELGPUUNSUPPORTED:
+		return true
 	case LocalModelsErrorCodeLOCALMODELINVALIDSTATE:
 		return true
 	case LocalModelsErrorCodeLOCALMODELJOBRUNNING:
@@ -2465,6 +2631,8 @@ func (e LocalModelsErrorCode) Valid() bool {
 	case LocalModelsErrorCodeLOCALMODELNOROOM:
 		return true
 	case LocalModelsErrorCodeLOCALMODELPLATFORMUNSUPPORTED:
+		return true
+	case LocalModelsErrorCodeLOCALMODELRUNTIMEDEPENDENCYMISSING:
 		return true
 	case LocalModelsErrorCodeLOCALMODELSSERVICEUNAVAILABLE:
 		return true
@@ -2516,6 +2684,7 @@ func (e LocalModelsViewUnavailableReasonCode) Valid() bool {
 // Defines values for LocalRuntimeDiagnosticErrorCode.
 const (
 	LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTEROFFLINE          LocalRuntimeDiagnosticErrorCode = "LOCAL_COMPUTER_OFFLINE"
+	LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTERUPGRADEREQUIRED  LocalRuntimeDiagnosticErrorCode = "LOCAL_COMPUTER_UPGRADE_REQUIRED"
 	LocalRuntimeDiagnosticErrorCodeRUNTIMEAUTHENTICATIONREQUIRED LocalRuntimeDiagnosticErrorCode = "RUNTIME_AUTHENTICATION_REQUIRED"
 	LocalRuntimeDiagnosticErrorCodeRUNTIMEDIAGNOSTICFAILED       LocalRuntimeDiagnosticErrorCode = "RUNTIME_DIAGNOSTIC_FAILED"
 	LocalRuntimeDiagnosticErrorCodeRUNTIMEINCOMPATIBLE           LocalRuntimeDiagnosticErrorCode = "RUNTIME_INCOMPATIBLE"
@@ -2526,6 +2695,8 @@ const (
 func (e LocalRuntimeDiagnosticErrorCode) Valid() bool {
 	switch e {
 	case LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTEROFFLINE:
+		return true
+	case LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTERUPGRADEREQUIRED:
 		return true
 	case LocalRuntimeDiagnosticErrorCodeRUNTIMEAUTHENTICATIONREQUIRED:
 		return true
@@ -2847,6 +3018,7 @@ func (e MessageKind) Valid() bool {
 const (
 	ModelSourceErrorCodeAgentHasActiveRuns            ModelSourceErrorCode = "AGENT_HAS_ACTIVE_RUNS"
 	ModelSourceErrorCodeByokAuthFailed                ModelSourceErrorCode = "BYOK_AUTH_FAILED"
+	ModelSourceErrorCodeByokGatewayFailed             ModelSourceErrorCode = "BYOK_GATEWAY_FAILED"
 	ModelSourceErrorCodeByokInvalidConfig             ModelSourceErrorCode = "BYOK_INVALID_CONFIG"
 	ModelSourceErrorCodeByokNotFound                  ModelSourceErrorCode = "BYOK_NOT_FOUND"
 	ModelSourceErrorCodeByokUnreachable               ModelSourceErrorCode = "BYOK_UNREACHABLE"
@@ -2868,6 +3040,8 @@ func (e ModelSourceErrorCode) Valid() bool {
 	case ModelSourceErrorCodeAgentHasActiveRuns:
 		return true
 	case ModelSourceErrorCodeByokAuthFailed:
+		return true
+	case ModelSourceErrorCodeByokGatewayFailed:
 		return true
 	case ModelSourceErrorCodeByokInvalidConfig:
 		return true
@@ -3067,22 +3241,22 @@ func (e PersonalProfileSourceSelectionKind) Valid() bool {
 
 // Defines values for PersonalWikiFailureReason.
 const (
-	ComputerOffline     PersonalWikiFailureReason = "computer_offline"
-	RuntimeAuthRequired PersonalWikiFailureReason = "runtime_auth_required"
-	RuntimeIncompatible PersonalWikiFailureReason = "runtime_incompatible"
-	RuntimeUnavailable  PersonalWikiFailureReason = "runtime_unavailable"
+	PersonalWikiFailureReasonComputerOffline     PersonalWikiFailureReason = "computer_offline"
+	PersonalWikiFailureReasonRuntimeAuthRequired PersonalWikiFailureReason = "runtime_auth_required"
+	PersonalWikiFailureReasonRuntimeIncompatible PersonalWikiFailureReason = "runtime_incompatible"
+	PersonalWikiFailureReasonRuntimeUnavailable  PersonalWikiFailureReason = "runtime_unavailable"
 )
 
 // Valid indicates whether the value is a known member of the PersonalWikiFailureReason enum.
 func (e PersonalWikiFailureReason) Valid() bool {
 	switch e {
-	case ComputerOffline:
+	case PersonalWikiFailureReasonComputerOffline:
 		return true
-	case RuntimeAuthRequired:
+	case PersonalWikiFailureReasonRuntimeAuthRequired:
 		return true
-	case RuntimeIncompatible:
+	case PersonalWikiFailureReasonRuntimeIncompatible:
 		return true
-	case RuntimeUnavailable:
+	case PersonalWikiFailureReasonRuntimeUnavailable:
 		return true
 	default:
 		return false
@@ -3472,20 +3646,26 @@ func (e RoutineChangedPayloadChangeKind) Valid() bool {
 
 // Defines values for RoutineListenerApp.
 const (
-	RoutineListenerAppGmail          RoutineListenerApp = "gmail"
-	RoutineListenerAppGoogleCalendar RoutineListenerApp = "google_calendar"
-	RoutineListenerAppOutlook        RoutineListenerApp = "outlook"
-	RoutineListenerAppSlack          RoutineListenerApp = "slack"
+	RoutineListenerAppFeishuMail      RoutineListenerApp = "feishu_mail"
+	RoutineListenerAppGmail           RoutineListenerApp = "gmail"
+	RoutineListenerAppGoogleCalendar  RoutineListenerApp = "google_calendar"
+	RoutineListenerAppOutlook         RoutineListenerApp = "outlook"
+	RoutineListenerAppOutlookCalendar RoutineListenerApp = "outlook_calendar"
+	RoutineListenerAppSlack           RoutineListenerApp = "slack"
 )
 
 // Valid indicates whether the value is a known member of the RoutineListenerApp enum.
 func (e RoutineListenerApp) Valid() bool {
 	switch e {
+	case RoutineListenerAppFeishuMail:
+		return true
 	case RoutineListenerAppGmail:
 		return true
 	case RoutineListenerAppGoogleCalendar:
 		return true
 	case RoutineListenerAppOutlook:
+		return true
+	case RoutineListenerAppOutlookCalendar:
 		return true
 	case RoutineListenerAppSlack:
 		return true
@@ -3539,6 +3719,45 @@ func (e RuntimePermissionDecisionViewKind) Valid() bool {
 	case RuntimePermissionDecisionViewKindCode:
 		return true
 	case RuntimePermissionDecisionViewKindGui:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SearchKeyDecisionViewOrigin.
+const (
+	SearchKeyDecisionViewOriginRequested SearchKeyDecisionViewOrigin = "requested"
+	SearchKeyDecisionViewOriginSuggested SearchKeyDecisionViewOrigin = "suggested"
+)
+
+// Valid indicates whether the value is a known member of the SearchKeyDecisionViewOrigin enum.
+func (e SearchKeyDecisionViewOrigin) Valid() bool {
+	switch e {
+	case SearchKeyDecisionViewOriginRequested:
+		return true
+	case SearchKeyDecisionViewOriginSuggested:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SearchKeyDecisionViewReason.
+const (
+	SearchKeyDecisionViewReasonFreeLimit SearchKeyDecisionViewReason = "free_limit"
+	SearchKeyDecisionViewReasonMissing   SearchKeyDecisionViewReason = "missing"
+	SearchKeyDecisionViewReasonRejected  SearchKeyDecisionViewReason = "rejected"
+)
+
+// Valid indicates whether the value is a known member of the SearchKeyDecisionViewReason enum.
+func (e SearchKeyDecisionViewReason) Valid() bool {
+	switch e {
+	case SearchKeyDecisionViewReasonFreeLimit:
+		return true
+	case SearchKeyDecisionViewReasonMissing:
+		return true
+	case SearchKeyDecisionViewReasonRejected:
 		return true
 	default:
 		return false
@@ -3728,6 +3947,42 @@ func (e TeamMdPattern) Valid() bool {
 	}
 }
 
+// Defines values for TenantAgentAvailabilityReason.
+const (
+	TenantAgentAvailabilityReasonAuthenticationRequired TenantAgentAvailabilityReason = "authentication_required"
+	TenantAgentAvailabilityReasonOnline                 TenantAgentAvailabilityReason = "online"
+	TenantAgentAvailabilityReasonReconnecting           TenantAgentAvailabilityReason = "reconnecting"
+	TenantAgentAvailabilityReasonRuntimeError           TenantAgentAvailabilityReason = "runtime_error"
+	TenantAgentAvailabilityReasonRuntimeIncompatible    TenantAgentAvailabilityReason = "runtime_incompatible"
+	TenantAgentAvailabilityReasonRuntimeNotInstalled    TenantAgentAvailabilityReason = "runtime_not_installed"
+	TenantAgentAvailabilityReasonStatusUnavailable      TenantAgentAvailabilityReason = "status_unavailable"
+	TenantAgentAvailabilityReasonWaitingForComputer     TenantAgentAvailabilityReason = "waiting_for_computer"
+)
+
+// Valid indicates whether the value is a known member of the TenantAgentAvailabilityReason enum.
+func (e TenantAgentAvailabilityReason) Valid() bool {
+	switch e {
+	case TenantAgentAvailabilityReasonAuthenticationRequired:
+		return true
+	case TenantAgentAvailabilityReasonOnline:
+		return true
+	case TenantAgentAvailabilityReasonReconnecting:
+		return true
+	case TenantAgentAvailabilityReasonRuntimeError:
+		return true
+	case TenantAgentAvailabilityReasonRuntimeIncompatible:
+		return true
+	case TenantAgentAvailabilityReasonRuntimeNotInstalled:
+		return true
+	case TenantAgentAvailabilityReasonStatusUnavailable:
+		return true
+	case TenantAgentAvailabilityReasonWaitingForComputer:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TenantAgentAvailabilityStatus.
 const (
 	TenantAgentAvailabilityStatusError   TenantAgentAvailabilityStatus = "error"
@@ -3788,6 +4043,27 @@ func (e UnifiedDocumentStatus) Valid() bool {
 	case UnifiedDocumentStatusActive:
 		return true
 	case UnifiedDocumentStatusTrashed:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for UrlPreviewFramingFraming.
+const (
+	UrlPreviewFramingFramingAllowed UrlPreviewFramingFraming = "allowed"
+	UrlPreviewFramingFramingRefused UrlPreviewFramingFraming = "refused"
+	UrlPreviewFramingFramingUnknown UrlPreviewFramingFraming = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the UrlPreviewFramingFraming enum.
+func (e UrlPreviewFramingFraming) Valid() bool {
+	switch e {
+	case UrlPreviewFramingFramingAllowed:
+		return true
+	case UrlPreviewFramingFramingRefused:
+		return true
+	case UrlPreviewFramingFramingUnknown:
 		return true
 	default:
 		return false
@@ -3941,6 +4217,42 @@ func (e VoiceProvider) Valid() bool {
 	}
 }
 
+// Defines values for VoiceProviderKeyErrorCode.
+const (
+	VoiceProviderKeyErrorCodeInvalidRequest               VoiceProviderKeyErrorCode = "INVALID_REQUEST"
+	VoiceProviderKeyErrorCodeVoiceKeyFromEnvironment      VoiceProviderKeyErrorCode = "VOICE_KEY_FROM_ENVIRONMENT"
+	VoiceProviderKeyErrorCodeVoiceKeyNoBalance            VoiceProviderKeyErrorCode = "VOICE_KEY_NO_BALANCE"
+	VoiceProviderKeyErrorCodeVoiceKeyNoRealtimePermission VoiceProviderKeyErrorCode = "VOICE_KEY_NO_REALTIME_PERMISSION"
+	VoiceProviderKeyErrorCodeVoiceKeyRejected             VoiceProviderKeyErrorCode = "VOICE_KEY_REJECTED"
+	VoiceProviderKeyErrorCodeVoiceKeyStorageUnavailable   VoiceProviderKeyErrorCode = "VOICE_KEY_STORAGE_UNAVAILABLE"
+	VoiceProviderKeyErrorCodeVoiceMediaOff                VoiceProviderKeyErrorCode = "VOICE_MEDIA_OFF"
+	VoiceProviderKeyErrorCodeVoiceProviderUnavailable     VoiceProviderKeyErrorCode = "VOICE_PROVIDER_UNAVAILABLE"
+)
+
+// Valid indicates whether the value is a known member of the VoiceProviderKeyErrorCode enum.
+func (e VoiceProviderKeyErrorCode) Valid() bool {
+	switch e {
+	case VoiceProviderKeyErrorCodeInvalidRequest:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceKeyFromEnvironment:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceKeyNoBalance:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceKeyNoRealtimePermission:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceKeyRejected:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceKeyStorageUnavailable:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceMediaOff:
+		return true
+	case VoiceProviderKeyErrorCodeVoiceProviderUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for VoiceProviderKeyStatusSource.
 const (
 	Environment VoiceProviderKeyStatusSource = "environment"
@@ -4040,6 +4352,267 @@ func (e VoiceTranscriptEventKind) Valid() bool {
 	case DictationTurn:
 		return true
 	case Speech:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchBackendKeyState.
+const (
+	WebSearchBackendKeyStateNone       WebSearchBackendKeyState = "none"
+	WebSearchBackendKeyStateRejected   WebSearchBackendKeyState = "rejected"
+	WebSearchBackendKeyStateUnverified WebSearchBackendKeyState = "unverified"
+	WebSearchBackendKeyStateVerified   WebSearchBackendKeyState = "verified"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchBackendKeyState enum.
+func (e WebSearchBackendKeyState) Valid() bool {
+	switch e {
+	case WebSearchBackendKeyStateNone:
+		return true
+	case WebSearchBackendKeyStateRejected:
+		return true
+	case WebSearchBackendKeyStateUnverified:
+		return true
+	case WebSearchBackendKeyStateVerified:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchBackendStatus.
+const (
+	WebSearchBackendStatusKeyRejected WebSearchBackendStatus = "key_rejected"
+	WebSearchBackendStatusKeyRequired WebSearchBackendStatus = "key_required"
+	WebSearchBackendStatusReady       WebSearchBackendStatus = "ready"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchBackendStatus enum.
+func (e WebSearchBackendStatus) Valid() bool {
+	switch e {
+	case WebSearchBackendStatusKeyRejected:
+		return true
+	case WebSearchBackendStatusKeyRequired:
+		return true
+	case WebSearchBackendStatusReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchBackendTier.
+const (
+	WebSearchBackendTierFree WebSearchBackendTier = "free"
+	WebSearchBackendTierKey  WebSearchBackendTier = "key"
+	WebSearchBackendTierNone WebSearchBackendTier = "none"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchBackendTier enum.
+func (e WebSearchBackendTier) Valid() bool {
+	switch e {
+	case WebSearchBackendTierFree:
+		return true
+	case WebSearchBackendTierKey:
+		return true
+	case WebSearchBackendTierNone:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchBackendId.
+const (
+	WebSearchBackendIdBrave      WebSearchBackendId = "brave"
+	WebSearchBackendIdDirect     WebSearchBackendId = "direct"
+	WebSearchBackendIdDuckduckgo WebSearchBackendId = "duckduckgo"
+	WebSearchBackendIdExa        WebSearchBackendId = "exa"
+	WebSearchBackendIdFirecrawl  WebSearchBackendId = "firecrawl"
+	WebSearchBackendIdTavily     WebSearchBackendId = "tavily"
+	WebSearchBackendIdYou        WebSearchBackendId = "you"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchBackendId enum.
+func (e WebSearchBackendId) Valid() bool {
+	switch e {
+	case WebSearchBackendIdBrave:
+		return true
+	case WebSearchBackendIdDirect:
+		return true
+	case WebSearchBackendIdDuckduckgo:
+		return true
+	case WebSearchBackendIdExa:
+		return true
+	case WebSearchBackendIdFirecrawl:
+		return true
+	case WebSearchBackendIdTavily:
+		return true
+	case WebSearchBackendIdYou:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchCommand.
+const (
+	WebSearchCommandOpen   WebSearchCommand = "open"
+	WebSearchCommandSearch WebSearchCommand = "search"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchCommand enum.
+func (e WebSearchCommand) Valid() bool {
+	switch e {
+	case WebSearchCommandOpen:
+		return true
+	case WebSearchCommandSearch:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchFilter.
+const (
+	WebSearchFilterRecency WebSearchFilter = "recency"
+	WebSearchFilterSite    WebSearchFilter = "site"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchFilter enum.
+func (e WebSearchFilter) Valid() bool {
+	switch e {
+	case WebSearchFilterRecency:
+		return true
+	case WebSearchFilterSite:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchKeyBackend.
+const (
+	WebSearchKeyBackendBrave     WebSearchKeyBackend = "brave"
+	WebSearchKeyBackendExa       WebSearchKeyBackend = "exa"
+	WebSearchKeyBackendFirecrawl WebSearchKeyBackend = "firecrawl"
+	WebSearchKeyBackendTavily    WebSearchKeyBackend = "tavily"
+	WebSearchKeyBackendYou       WebSearchKeyBackend = "you"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchKeyBackend enum.
+func (e WebSearchKeyBackend) Valid() bool {
+	switch e {
+	case WebSearchKeyBackendBrave:
+		return true
+	case WebSearchKeyBackendExa:
+		return true
+	case WebSearchKeyBackendFirecrawl:
+		return true
+	case WebSearchKeyBackendTavily:
+		return true
+	case WebSearchKeyBackendYou:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchQuotaFrom.
+const (
+	WebSearchQuotaFromLastResponse WebSearchQuotaFrom = "last_response"
+	WebSearchQuotaFromProvider     WebSearchQuotaFrom = "provider"
+	WebSearchQuotaFromUnavailable  WebSearchQuotaFrom = "unavailable"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchQuotaFrom enum.
+func (e WebSearchQuotaFrom) Valid() bool {
+	switch e {
+	case WebSearchQuotaFromLastResponse:
+		return true
+	case WebSearchQuotaFromProvider:
+		return true
+	case WebSearchQuotaFromUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchQuotaReason.
+const (
+	WebSearchQuotaReasonKeyRejected         WebSearchQuotaReason = "key_rejected"
+	WebSearchQuotaReasonNoKey               WebSearchQuotaReason = "no_key"
+	WebSearchQuotaReasonNotObserved         WebSearchQuotaReason = "not_observed"
+	WebSearchQuotaReasonNotReported         WebSearchQuotaReason = "not_reported"
+	WebSearchQuotaReasonProviderUnavailable WebSearchQuotaReason = "provider_unavailable"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchQuotaReason enum.
+func (e WebSearchQuotaReason) Valid() bool {
+	switch e {
+	case WebSearchQuotaReasonKeyRejected:
+		return true
+	case WebSearchQuotaReasonNoKey:
+		return true
+	case WebSearchQuotaReasonNotObserved:
+		return true
+	case WebSearchQuotaReasonNotReported:
+		return true
+	case WebSearchQuotaReasonProviderUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchQuotaUnit.
+const (
+	WebSearchQuotaUnitCredits  WebSearchQuotaUnit = "credits"
+	WebSearchQuotaUnitRequests WebSearchQuotaUnit = "requests"
+	WebSearchQuotaUnitUsd      WebSearchQuotaUnit = "usd"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchQuotaUnit enum.
+func (e WebSearchQuotaUnit) Valid() bool {
+	switch e {
+	case WebSearchQuotaUnitCredits:
+		return true
+	case WebSearchQuotaUnitRequests:
+		return true
+	case WebSearchQuotaUnitUsd:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebSearchSearchBackend.
+const (
+	WebSearchSearchBackendBrave      WebSearchSearchBackend = "brave"
+	WebSearchSearchBackendDuckduckgo WebSearchSearchBackend = "duckduckgo"
+	WebSearchSearchBackendExa        WebSearchSearchBackend = "exa"
+	WebSearchSearchBackendFirecrawl  WebSearchSearchBackend = "firecrawl"
+	WebSearchSearchBackendTavily     WebSearchSearchBackend = "tavily"
+	WebSearchSearchBackendYou        WebSearchSearchBackend = "you"
+)
+
+// Valid indicates whether the value is a known member of the WebSearchSearchBackend enum.
+func (e WebSearchSearchBackend) Valid() bool {
+	switch e {
+	case WebSearchSearchBackendBrave:
+		return true
+	case WebSearchSearchBackendDuckduckgo:
+		return true
+	case WebSearchSearchBackendExa:
+		return true
+	case WebSearchSearchBackendFirecrawl:
+		return true
+	case WebSearchSearchBackendTavily:
+		return true
+	case WebSearchSearchBackendYou:
 		return true
 	default:
 		return false
@@ -4274,6 +4847,24 @@ func (e ListWorkItemsParamsScope) Valid() bool {
 	}
 }
 
+// Defines values for GetUrlPreviewFramingParamsPageScheme.
+const (
+	Http  GetUrlPreviewFramingParamsPageScheme = "http"
+	Https GetUrlPreviewFramingParamsPageScheme = "https"
+)
+
+// Valid indicates whether the value is a known member of the GetUrlPreviewFramingParamsPageScheme enum.
+func (e GetUrlPreviewFramingParamsPageScheme) Valid() bool {
+	switch e {
+	case Http:
+		return true
+	case Https:
+		return true
+	default:
+		return false
+	}
+}
+
 // Account defines model for Account.
 type Account struct {
 	// CreatedAt UTC timestamp in RFC 3339 format with an explicit offset.
@@ -4489,7 +5080,7 @@ type AgentRuntimeConfig struct {
 	ReasoningEffort *AgentReasoningEffort  `json:"reasoning_effort,omitempty"`
 }
 
-// AgentRuntimeExecutionFailure Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished, but every message the Agent tried to post failed, so the Room received no reply from it. reply_not_sent means a Room Run finished without trying to post anything while a Human who mentioned the Agent waited for its reply; the Runtime ended the turn in text nobody sees, which is not posted for it. interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
+// AgentRuntimeExecutionFailure Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished while a Human who mentioned the Agent waited for its reply, every message write the Agent tried to post failed, and no reply reached the Room. reply_not_sent means a Room Run finished while a Human who mentioned the Agent waited for its reply and no reply reached the Room without any failed message write attempt (for instance, the Runtime ended the turn in text nobody sees, which is not posted for it). interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
 type AgentRuntimeExecutionFailure struct {
 	Code           AgentRuntimeExecutionFailureCode `json:"code"`
 	RuntimeType    *LocalRuntimeType                `json:"runtime_type,omitempty"`
@@ -4558,7 +5149,7 @@ type AgentRuntimePresentationOutputCreatedEventSurface string
 
 // AgentRuntimeStoppedStatusChangedEvent defines model for AgentRuntimeStoppedStatusChangedEvent.
 type AgentRuntimeStoppedStatusChangedEvent struct {
-	// Failure Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished, but every message the Agent tried to post failed, so the Room received no reply from it. reply_not_sent means a Room Run finished without trying to post anything while a Human who mentioned the Agent waited for its reply; the Runtime ended the turn in text nobody sees, which is not posted for it. interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
+	// Failure Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished while a Human who mentioned the Agent waited for its reply, every message write the Agent tried to post failed, and no reply reached the Room. reply_not_sent means a Room Run finished while a Human who mentioned the Agent waited for its reply and no reply reached the Room without any failed message write attempt (for instance, the Runtime ended the turn in text nobody sees, which is not posted for it). interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
 	Failure *AgentRuntimeExecutionFailure                `json:"failure,omitempty"`
 	Outcome AgentRuntimeStoppedStatusChangedEventOutcome `json:"outcome"`
 	Status  string                                       `json:"status"`
@@ -4757,9 +5348,23 @@ type AnotherMe struct {
 	// AgentActorId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 	AgentActorId *Id `json:"agent_actor_id,omitempty"`
 
+	// BackgroundFailure Present while the Another Me's background model calls (Wiki, Memory, daily reports) have failed at least three times in a row; absent again after the next one completes.
+	BackgroundFailure *AnotherMeBackgroundFailure `json:"background_failure,omitempty"`
+
 	// RoomId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 	RoomId *Id `json:"room_id,omitempty"`
 }
+
+// AnotherMeBackgroundFailure Present while the Another Me's background model calls (Wiki, Memory, daily reports) have failed at least three times in a row; absent again after the next one completes.
+type AnotherMeBackgroundFailure struct {
+	ConsecutiveFailures int `json:"consecutive_failures"`
+
+	// Reason Why the latest background model call failed: the Runtime is incompatible or its model is not available to the account, the Runtime needs sign-in, the Runtime is unavailable, or a cause the Human cannot act on. Clients show an unknown value as unknown.
+	Reason AnotherMeBackgroundFailureReason `json:"reason"`
+}
+
+// AnotherMeBackgroundFailureReason Why the latest background model call failed: the Runtime is incompatible or its model is not available to the account, the Runtime needs sign-in, the Runtime is unavailable, or a cause the Human cannot act on. Clients show an unknown value as unknown.
+type AnotherMeBackgroundFailureReason string
 
 // ArtifactTreeSegment defines model for ArtifactTreeSegment.
 type ArtifactTreeSegment struct {
@@ -5148,20 +5753,23 @@ type DecisionAnswer struct {
 	// AttachmentUploadIds Message attachment uploads a profile_setup_sources "done" answer attaches to the Human's message; same rules as message creation.
 	AttachmentUploadIds *[]AttachmentUploadToken `json:"attachment_upload_ids,omitempty"`
 
+	// Backend A backend that takes an API key saved in the product.
+	Backend *WebSearchKeyBackend `json:"backend,omitempty"`
+
 	// Comment The reason given with a denial, or a note with a question's answers.
 	Comment *string `json:"comment,omitempty"`
 
 	// ConnectionId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 	ConnectionId *Id `json:"connection_id,omitempty"`
 
-	// Decision approve or deny for connector_write, agent_change, runtime_permission, connection_auth and room_creation; deny or connected (recorded by TeamHub once the owner connects Chrome) for browser_connection; deny or configured (recorded by TeamHub once a Composio key is saved) for provider_key; deny or granted (recorded by TeamHub once the Computer reports every permission granted) for computer_permission; submit for question; connected or skipped for profile_setup_apps; done or skipped for profile_setup_sources.
+	// Decision approve or deny for connector_write, agent_change, runtime_permission, connection_auth and room_creation; deny or connected (recorded by TeamHub once the owner connects Chrome) for browser_connection; deny or configured (recorded by TeamHub once a Composio key is saved) for provider_key and search_key (with the backend whose key was saved); deny or granted (recorded by TeamHub once the Computer reports every permission granted) for computer_permission; submit for question; connected or skipped for profile_setup_apps; done or skipped for profile_setup_sources.
 	Decision DecisionAnswerDecision `json:"decision"`
 
 	// Links Absolute http(s) URLs a profile_setup_sources "done" answer shares; trimmed and deduplicated by TeamHub.
 	Links *[]string `json:"links,omitempty"`
 }
 
-// DecisionAnswerDecision approve or deny for connector_write, agent_change, runtime_permission, connection_auth and room_creation; deny or connected (recorded by TeamHub once the owner connects Chrome) for browser_connection; deny or configured (recorded by TeamHub once a Composio key is saved) for provider_key; deny or granted (recorded by TeamHub once the Computer reports every permission granted) for computer_permission; submit for question; connected or skipped for profile_setup_apps; done or skipped for profile_setup_sources.
+// DecisionAnswerDecision approve or deny for connector_write, agent_change, runtime_permission, connection_auth and room_creation; deny or connected (recorded by TeamHub once the owner connects Chrome) for browser_connection; deny or configured (recorded by TeamHub once a Composio key is saved) for provider_key and search_key (with the backend whose key was saved); deny or granted (recorded by TeamHub once the Computer reports every permission granted) for computer_permission; submit for question; connected or skipped for profile_setup_apps; done or skipped for profile_setup_sources.
 type DecisionAnswerDecision string
 
 // DecisionAnswerValue A radio or checkbox answer names option ids. Any other value is the Human's own written answer, which every option question accepts, so a checkbox answer holds up to 20 options and one written answer.
@@ -5272,7 +5880,10 @@ type DecisionRequestedMessageCard struct {
 	// RuntimePermission The view of a runtime_permission decision: a tool call that needs the sponsor's approval. title is built by rules from the call and host evidence, never by the judge model; tool and input are the full call.
 	RuntimePermission *RuntimePermissionDecisionView `json:"runtime_permission,omitempty"`
 
-	// Status For connector_write and agent_change, approved and executing mean TeamHub is running the approved request, and unknown means a run stopped midway and may have taken effect; TeamHub does not run it again. A question or AnotherMe setup card ends answered. An approved runtime_permission lets the Agent retry that one call until expires_at, and ends consumed once it does. An approved connection_auth is authorizing until the OAuth it started completes (succeeded), fails, or expires. A provider_key ends answered when someone saves a Composio key, denied when its Human declines. A browser_connection ends answered when its owner connects, denied when they decline. A room_creation ends succeeded with its Room created, or denied. A computer_permission ends answered once every permission it asks for is granted, denied when its owner declines.
+	// SearchKey The view of a search_key decision: the web search backend the card shows. origin is requested when the Agent's command named it, and suggested when the command named none and nothing was usable, so TeamHub picked the first backend in its order that still needs a key. reason says why: no key is saved (missing), the provider refused the saved one (rejected), or the keyless You.com searches are used up (free_limit). The Human may add a key for any other backend instead; saving any web search key answers the card configured with that backend.
+	SearchKey *SearchKeyDecisionView `json:"search_key,omitempty"`
+
+	// Status For connector_write and agent_change, approved and executing mean TeamHub is running the approved request, and unknown means a run stopped midway and may have taken effect; TeamHub does not run it again. A question or AnotherMe setup card ends answered. An approved runtime_permission lets the Agent retry that one call until expires_at, and ends consumed once it does. An approved connection_auth is authorizing until the OAuth it started completes (succeeded), fails, or expires. A provider_key ends answered when someone saves a Composio key, denied when its Human declines. A browser_connection ends answered when its owner connects, denied when they decline. A room_creation ends succeeded with its Room created, or denied. A computer_permission ends answered once every permission it asks for is granted, denied when its owner declines. A search_key ends answered when someone saves any web search key, denied when its Human declines.
 	Status DecisionStatus `json:"status"`
 
 	// Title What the card asks; a question card's prompt.
@@ -5280,7 +5891,7 @@ type DecisionRequestedMessageCard struct {
 	Version int64  `json:"version"`
 }
 
-// DecisionStatus For connector_write and agent_change, approved and executing mean TeamHub is running the approved request, and unknown means a run stopped midway and may have taken effect; TeamHub does not run it again. A question or AnotherMe setup card ends answered. An approved runtime_permission lets the Agent retry that one call until expires_at, and ends consumed once it does. An approved connection_auth is authorizing until the OAuth it started completes (succeeded), fails, or expires. A provider_key ends answered when someone saves a Composio key, denied when its Human declines. A browser_connection ends answered when its owner connects, denied when they decline. A room_creation ends succeeded with its Room created, or denied. A computer_permission ends answered once every permission it asks for is granted, denied when its owner declines.
+// DecisionStatus For connector_write and agent_change, approved and executing mean TeamHub is running the approved request, and unknown means a run stopped midway and may have taken effect; TeamHub does not run it again. A question or AnotherMe setup card ends answered. An approved runtime_permission lets the Agent retry that one call until expires_at, and ends consumed once it does. An approved connection_auth is authorizing until the OAuth it started completes (succeeded), fails, or expires. A provider_key ends answered when someone saves a Composio key, denied when its Human declines. A browser_connection ends answered when its owner connects, denied when they decline. A room_creation ends succeeded with its Room created, or denied. A computer_permission ends answered once every permission it asks for is granted, denied when its owner declines. A search_key ends answered when someone saves any web search key, denied when its Human declines.
 type DecisionStatus string
 
 // DirectRoomOpenRequest defines model for DirectRoomOpenRequest.
@@ -6560,19 +7171,34 @@ type LocalModel struct {
 	Availability LocalModelAvailability  `json:"availability"`
 
 	// Capabilities Capabilities verified by localmodels on this platform.
-	Capabilities  *[]LocalModelCapability     `json:"capabilities,omitempty"`
-	ContextTokens int64                       `json:"context_tokens"`
-	Description   string                      `json:"description"`
-	Download      *LocalModelDownloadProgress `json:"download,omitempty"`
-	DownloadBytes int64                       `json:"download_bytes"`
-	Endpoint      *LocalModelEndpoint         `json:"endpoint,omitempty"`
-	Error         *LocalModelError            `json:"error,omitempty"`
+	Capabilities *[]LocalModelCapability `json:"capabilities,omitempty"`
+
+	// Concurrency Maximum concurrent request slots configured or probed for this model when loaded.
+	Concurrency *int `json:"concurrency,omitempty"`
+
+	// ConcurrencyProbing True while a loaded or loading local model is running its post-load max-concurrency probe before reporting loaded.
+	ConcurrencyProbing *bool                       `json:"concurrency_probing,omitempty"`
+	ContextTokens      int64                       `json:"context_tokens"`
+	Description        string                      `json:"description"`
+	Download           *LocalModelDownloadProgress `json:"download,omitempty"`
+	DownloadBytes      int64                       `json:"download_bytes"`
+	Endpoint           *LocalModelEndpoint         `json:"endpoint,omitempty"`
+
+	// Engine Inference engine family that runs this model entry. Never inferred from name or description.
+	Engine *LocalModelEngine `json:"engine,omitempty"`
+
+	// EngineLabel Display-only engine version and backend for this model, such as PolyStrata 0.2.19-poly.1 · CUDA.
+	EngineLabel *string          `json:"engine_label,omitempty"`
+	Error       *LocalModelError `json:"error,omitempty"`
 
 	// Family Model family for brand presentation; never inferred from name.
 	Family *LocalModelFamily `json:"family,omitempty"`
 
 	// Fit Where the model can live, judged on total capacity so it stays stable across loads. system means localmodels can run it from RAM, slower.
 	Fit LocalModelFit `json:"fit"`
+
+	// HostRamBytes Additional host system RAM used alongside GPU VRAM for hybrid offload engines (such as PolyStrata); absent when all weights stay in the model's primary pool.
+	HostRamBytes *int64 `json:"host_ram_bytes,omitempty"`
 
 	// Id Stable localmodels library id: catalog id and variant, such as qwen3-4b:Q4_K_M.
 	Id LocalModelId `json:"id"`
@@ -6651,13 +7277,43 @@ type LocalModelAvailability struct {
 
 // LocalModelAvailabilityReason defines model for LocalModelAvailabilityReason.
 type LocalModelAvailabilityReason struct {
-	Code      LocalModelAvailabilityReasonCode `json:"code"`
-	HaveBytes *int64                           `json:"have_bytes,omitempty"`
-	NeedBytes *int64                           `json:"need_bytes,omitempty"`
+	Code LocalModelAvailabilityReasonCode `json:"code"`
+
+	// DetectedCuda With DRIVER_UPDATE_REQUIRED: CUDA version reported by the installed driver.
+	DetectedCuda *string `json:"detected_cuda,omitempty"`
+
+	// DetectedGlibc With RUNTIME_DEPENDENCY_MISSING: glibc version detected on this Computer.
+	DetectedGlibc *string `json:"detected_glibc,omitempty"`
+
+	// DriverVersion With DRIVER_UPDATE_REQUIRED: installed NVIDIA driver version.
+	DriverVersion *string `json:"driver_version,omitempty"`
+
+	// GpuVendor With GPU_UNSUPPORTED: detected GPU vendor class on this Computer.
+	GpuVendor *LocalModelAvailabilityReasonGpuVendor `json:"gpu_vendor,omitempty"`
+	HaveBytes *int64                                 `json:"have_bytes,omitempty"`
+
+	// MemoryKind With MEMORY_INSUFFICIENT: which memory space was short.
+	MemoryKind *LocalModelAvailabilityReasonMemoryKind `json:"memory_kind,omitempty"`
+
+	// MissingLibraries With RUNTIME_DEPENDENCY_MISSING: missing shared libraries such as libgomp.so.1.
+	MissingLibraries *[]string `json:"missing_libraries,omitempty"`
+	NeedBytes        *int64    `json:"need_bytes,omitempty"`
+
+	// RequiredCuda With DRIVER_UPDATE_REQUIRED: minimum CUDA version required by the pinned engine.
+	RequiredCuda *string `json:"required_cuda,omitempty"`
+
+	// RequiredGlibc With RUNTIME_DEPENDENCY_MISSING: minimum glibc version required by the engine.
+	RequiredGlibc *string `json:"required_glibc,omitempty"`
 }
 
 // LocalModelAvailabilityReasonCode defines model for LocalModelAvailabilityReason.Code.
 type LocalModelAvailabilityReasonCode string
+
+// LocalModelAvailabilityReasonGpuVendor With GPU_UNSUPPORTED: detected GPU vendor class on this Computer.
+type LocalModelAvailabilityReasonGpuVendor string
+
+// LocalModelAvailabilityReasonMemoryKind With MEMORY_INSUFFICIENT: which memory space was short.
+type LocalModelAvailabilityReasonMemoryKind string
 
 // LocalModelCapability Model capability verified by localmodels on this platform.
 type LocalModelCapability string
@@ -6678,12 +7334,15 @@ type LocalModelEndpoint struct {
 	BaseUrl string `json:"base_url"`
 }
 
+// LocalModelEngine Inference engine family that runs this model entry. Never inferred from name or description.
+type LocalModelEngine string
+
 // LocalModelError defines model for LocalModelError.
 type LocalModelError struct {
 	// Cause Why a GATEWAY_REGISTRATION_FAILED happened, when the Computer supervised the failed job. GATEWAY_HOME_NOT_PRIVATE: the local gateway's private folder at path has another owner; closing Linger and renaming that folder lets the model load.
 	Cause *LocalModelErrorCause `json:"cause,omitempty"`
 
-	// Code Closed localmodels library error set. It is extended only together with the localmodels library contract.
+	// Code Closed localmodels library error set. It is extended only together with the localmodels library contract; UNKNOWN_ERROR preserves forward compatibility with newer localmodels releases.
 	Code LocalModelErrorCode `json:"code"`
 
 	// Detail Diagnostic text for display; never matched on.
@@ -6696,7 +7355,7 @@ type LocalModelError struct {
 // LocalModelErrorCause Why a GATEWAY_REGISTRATION_FAILED happened, when the Computer supervised the failed job. GATEWAY_HOME_NOT_PRIVATE: the local gateway's private folder at path has another owner; closing Linger and renaming that folder lets the model load.
 type LocalModelErrorCause string
 
-// LocalModelErrorCode Closed localmodels library error set. It is extended only together with the localmodels library contract.
+// LocalModelErrorCode Closed localmodels library error set. It is extended only together with the localmodels library contract; UNKNOWN_ERROR preserves forward compatibility with newer localmodels releases.
 type LocalModelErrorCode string
 
 // LocalModelFamily Model family for brand presentation; never inferred from name.
@@ -6748,6 +7407,9 @@ type LocalModelNoteCode string
 
 // LocalModelPool One place models load into. The system and unified budgets are 80% of RAM, as localmodels computes them.
 type LocalModelPool struct {
+	// ExternalHolders Closeable desktop applications holding this pool's memory, as localmodels reports them. An empty list means localmodels looked and found no closeable app; absent means not reported, and the rest of used_bytes is then not known to be other apps.
+	ExternalHolders *[]LocalModelPoolExternalHolder `json:"external_holders,omitempty"`
+
 	// GpuIndex Present only for kind gpu; matches LocalModelGpu.index.
 	GpuIndex *int                   `json:"gpu_index,omitempty"`
 	Holders  []LocalModelPoolHolder `json:"holders"`
@@ -6761,6 +7423,12 @@ type LocalModelPool struct {
 
 // LocalModelPoolKind defines model for LocalModelPool.Kind.
 type LocalModelPoolKind string
+
+// LocalModelPoolExternalHolder A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close.
+type LocalModelPoolExternalHolder struct {
+	Bytes int64  `json:"bytes"`
+	Name  string `json:"name"`
+}
 
 // LocalModelPoolHolder Something holding pool memory. A component is a foundation service such as an embedding, reranker, or speech model; it is never a model row.
 type LocalModelPoolHolder struct {
@@ -6812,6 +7480,20 @@ type LocalModelsComputer struct {
 // LocalModelsComputerStatus defines model for LocalModelsComputer.Status.
 type LocalModelsComputerStatus string
 
+// LocalModelsDebugInfo Present only when localmodels debug mode (tiny or simulate) is active on the Computer. config_path is shown only to the Computer owner.
+type LocalModelsDebugInfo struct {
+	// ConfigPath Local debug.json path when source is state_config or user_config; owner-only in the public view.
+	ConfigPath *string                    `json:"config_path,omitempty"`
+	Mode       LocalModelsDebugInfoMode   `json:"mode"`
+	Source     LocalModelsDebugInfoSource `json:"source"`
+}
+
+// LocalModelsDebugInfoMode defines model for LocalModelsDebugInfo.Mode.
+type LocalModelsDebugInfoMode string
+
+// LocalModelsDebugInfoSource defines model for LocalModelsDebugInfo.Source.
+type LocalModelsDebugInfoSource string
+
 // LocalModelsError The common error body with error.code narrowed to LocalModelsErrorCode.
 type LocalModelsError struct {
 	// Code error.code of a refused local-models action (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. LOCAL_MODEL_ACTION_FORBIDDEN: the viewer is not the Computer owner. LOCAL_MODELS_UNAVAILABLE: the Computer has no usable localmodels tool. LOCAL_MODEL_ACTION_FAILED: the Computer refused with a library error that has no code of its own here (502). LOCAL_MODELS_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). LOCAL_MODEL_ACTION_UNCONFIRMED: the connected Computer had not decided by the action's deadline; it may still run the action, and the library snapshots show the outcome (504). The other LOCAL_MODEL_ codes are the Computer's refusal codes of the same name (409).
@@ -6848,7 +7530,10 @@ type LocalModelsRefreshAcceptedAction string
 type LocalModelsView struct {
 	Available bool                `json:"available"`
 	Computer  LocalModelsComputer `json:"computer"`
-	Models    []LocalModelView    `json:"models"`
+
+	// Debug Present only when localmodels debug mode (tiny or simulate) is active on the Computer. config_path is shown only to the Computer owner.
+	Debug  *LocalModelsDebugInfo `json:"debug,omitempty"`
+	Models []LocalModelView      `json:"models"`
 
 	// ObservedAt UTC timestamp in RFC 3339 format with an explicit offset.
 	ObservedAt    *Timestamp                        `json:"observed_at,omitempty"`
@@ -6944,7 +7629,10 @@ type MailCanvasState struct {
 	SourceDigest string                `json:"source_digest"`
 	Status       MailCanvasStateStatus `json:"status"`
 	Subject      string                `json:"subject"`
-	To           string                `json:"to"`
+
+	// Target The canvas's mail app, gmail, outlook or feishu_mail; Send must use a connection of this app.
+	Target *string `json:"target,omitempty"`
+	To     string  `json:"to"`
 }
 
 // MailCanvasStateStatus defines model for MailCanvasState.Status.
@@ -7348,7 +8036,7 @@ type MessageThreadSummaryUpdatedPayload struct {
 
 // ModelSourceError The common error body with error.code narrowed to ModelSourceErrorCode.
 type ModelSourceError struct {
-	// Code error.code of a refused model-source request (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. MODEL_SOURCE_FORBIDDEN: the viewer is not the Computer owner. MODEL_SOURCE_UNAVAILABLE: the Computer has no localmodels tool or cannot switch model sources. AGENT_HAS_ACTIVE_RUNS: Agents on the Computer have running work and force_terminate was false; details carries one entry per such Agent, with field "agent" and the Agent's display name as reason. RUNTIME_NOT_ENABLED, LOCAL_MODEL_NO_ROOM, LOCAL_MODEL_UNKNOWN, and the BYOK_ codes are the Computer's refusals (409); for BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE and BYOK_UPSTREAM_REJECTED, message is the Computer's own and names the address it sent to and the endpoint's HTTP status. MODEL_SOURCE_FAILED: the Computer failed with an error that has no code of its own here (502). MODEL_SOURCE_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). MODEL_SOURCE_UNCONFIRMED: the Computer had not answered by the deadline; it may still switch (504).
+	// Code error.code of a refused model-source request (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. MODEL_SOURCE_FORBIDDEN: the viewer is not the Computer owner. MODEL_SOURCE_UNAVAILABLE: the Computer has no localmodels tool or cannot switch model sources. AGENT_HAS_ACTIVE_RUNS: Agents on the Computer have running work and force_terminate was false; details carries one entry per such Agent, with field "agent" and the Agent's display name as reason. RUNTIME_NOT_ENABLED, LOCAL_MODEL_NO_ROOM, LOCAL_MODEL_UNKNOWN, and the BYOK endpoint refusals (BYOK_INVALID_CONFIG, BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE, BYOK_UPSTREAM_REJECTED) are the Computer's refusals (409); for BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE and BYOK_UPSTREAM_REJECTED, message is the Computer's own and names the address it sent to and the endpoint's HTTP status. BYOK_GATEWAY_FAILED: the Computer could not start, stop, or configure its local BYOK gateway (502); when the Computer reported a diagnostic message, message carries it and details carries one entry with field "gateway" and that diagnostic as reason. MODEL_SOURCE_FAILED: the Computer failed with an error that has no code of its own here (502). MODEL_SOURCE_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). MODEL_SOURCE_UNCONFIRMED: the Computer had not answered by the deadline; it may still switch (504).
 	Code    ModelSourceErrorCode `json:"code"`
 	Details *[]ErrorDetail       `json:"details,omitempty"`
 
@@ -7357,7 +8045,7 @@ type ModelSourceError struct {
 	RequestId string `json:"request_id"`
 }
 
-// ModelSourceErrorCode error.code of a refused model-source request (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. MODEL_SOURCE_FORBIDDEN: the viewer is not the Computer owner. MODEL_SOURCE_UNAVAILABLE: the Computer has no localmodels tool or cannot switch model sources. AGENT_HAS_ACTIVE_RUNS: Agents on the Computer have running work and force_terminate was false; details carries one entry per such Agent, with field "agent" and the Agent's display name as reason. RUNTIME_NOT_ENABLED, LOCAL_MODEL_NO_ROOM, LOCAL_MODEL_UNKNOWN, and the BYOK_ codes are the Computer's refusals (409); for BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE and BYOK_UPSTREAM_REJECTED, message is the Computer's own and names the address it sent to and the endpoint's HTTP status. MODEL_SOURCE_FAILED: the Computer failed with an error that has no code of its own here (502). MODEL_SOURCE_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). MODEL_SOURCE_UNCONFIRMED: the Computer had not answered by the deadline; it may still switch (504).
+// ModelSourceErrorCode error.code of a refused model-source request (403, 409, 502, 503, 504); 400, 401, and 404 use the common codes. LOCAL_COMPUTER_OFFLINE: the Computer is not connected. MODEL_SOURCE_FORBIDDEN: the viewer is not the Computer owner. MODEL_SOURCE_UNAVAILABLE: the Computer has no localmodels tool or cannot switch model sources. AGENT_HAS_ACTIVE_RUNS: Agents on the Computer have running work and force_terminate was false; details carries one entry per such Agent, with field "agent" and the Agent's display name as reason. RUNTIME_NOT_ENABLED, LOCAL_MODEL_NO_ROOM, LOCAL_MODEL_UNKNOWN, and the BYOK endpoint refusals (BYOK_INVALID_CONFIG, BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE, BYOK_UPSTREAM_REJECTED) are the Computer's refusals (409); for BYOK_AUTH_FAILED, BYOK_NOT_FOUND, BYOK_UNREACHABLE and BYOK_UPSTREAM_REJECTED, message is the Computer's own and names the address it sent to and the endpoint's HTTP status. BYOK_GATEWAY_FAILED: the Computer could not start, stop, or configure its local BYOK gateway (502); when the Computer reported a diagnostic message, message carries it and details carries one entry with field "gateway" and that diagnostic as reason. MODEL_SOURCE_FAILED: the Computer failed with an error that has no code of its own here (502). MODEL_SOURCE_SERVICE_UNAVAILABLE: Agent Service could not be reached (503). MODEL_SOURCE_UNCONFIRMED: the Computer had not answered by the deadline; it may still switch (504).
 type ModelSourceErrorCode string
 
 // ModelSourceErrorResponse defines model for ModelSourceErrorResponse.
@@ -8443,6 +9131,28 @@ type SaveVoiceProviderKeyRequest struct {
 	ApiKey string `json:"api_key"`
 }
 
+// SaveWebSearchKeyRequest defines model for SaveWebSearchKeyRequest.
+type SaveWebSearchKeyRequest struct {
+	ApiKey string `json:"api_key"`
+
+	// DecisionId The search_key card the key is added from. TeamHub then runs the search or page open that card was posted for against this backend with the new key before saving it, and answers the card with what that call returned. Without it, or for a card posted by a connect request, the key gets the official check.
+	DecisionId *string `json:"decision_id,omitempty"`
+}
+
+// SearchKeyDecisionView The view of a search_key decision: the web search backend the card shows. origin is requested when the Agent's command named it, and suggested when the command named none and nothing was usable, so TeamHub picked the first backend in its order that still needs a key. reason says why: no key is saved (missing), the provider refused the saved one (rejected), or the keyless You.com searches are used up (free_limit). The Human may add a key for any other backend instead; saving any web search key answers the card configured with that backend.
+type SearchKeyDecisionView struct {
+	// Backend A backend that takes an API key saved in the product.
+	Backend WebSearchKeyBackend         `json:"backend"`
+	Origin  SearchKeyDecisionViewOrigin `json:"origin"`
+	Reason  SearchKeyDecisionViewReason `json:"reason"`
+}
+
+// SearchKeyDecisionViewOrigin defines model for SearchKeyDecisionView.Origin.
+type SearchKeyDecisionViewOrigin string
+
+// SearchKeyDecisionViewReason defines model for SearchKeyDecisionView.Reason.
+type SearchKeyDecisionViewReason string
+
 // SendMailCanvasRequest defines model for SendMailCanvasRequest.
 type SendMailCanvasRequest struct {
 	// ConnectionId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
@@ -8485,6 +9195,12 @@ type SetExternalConnectionAgentAccessRequest struct {
 // SetExternalConnectionAutoRemindersRequest defines model for SetExternalConnectionAutoRemindersRequest.
 type SetExternalConnectionAutoRemindersRequest struct {
 	Enabled bool `json:"enabled"`
+}
+
+// SetWebSearchDefaultRequest defines model for SetWebSearchDefaultRequest.
+type SetWebSearchDefaultRequest struct {
+	// Backend A backend that runs searches.
+	Backend WebSearchSearchBackend `json:"backend"`
 }
 
 // Sha256 defines model for Sha256.
@@ -8830,7 +9546,12 @@ type TenantAgentAvailability struct {
 	// ActiveTaskCount Number of non-terminal managed Tasks assigned to this Agent.
 	ActiveTaskCount int64                       `json:"active_task_count"`
 	CurrentActivity *TenantAgentCurrentActivity `json:"current_activity,omitempty"`
-	Label           string                      `json:"label"`
+
+	// Label English wording of the status, the fallback for clients that do not know `reason`.
+	Label string `json:"label"`
+
+	// Reason Why the Agent has its status, as a stable code clients word in their own language. `label` and `current_activity.summary` carry the same state in English for clients that do not know the code. With `runtime_error` the summary is the Runtime's own diagnostic text.
+	Reason *TenantAgentAvailabilityReason `json:"reason,omitempty"`
 
 	// Status Runtime availability. Managed Task execution is represented by active_task_count.
 	Status TenantAgentAvailabilityStatus `json:"status"`
@@ -8841,6 +9562,9 @@ type TenantAgentAvailabilityPage struct {
 	Items []TenantAgentAvailabilitySnapshot `json:"items"`
 	Page  PageMeta                          `json:"page"`
 }
+
+// TenantAgentAvailabilityReason Why the Agent has its status, as a stable code clients word in their own language. `label` and `current_activity.summary` carry the same state in English for clients that do not know the code. With `runtime_error` the summary is the Runtime's own diagnostic text.
+type TenantAgentAvailabilityReason string
 
 // TenantAgentAvailabilitySnapshot defines model for TenantAgentAvailabilitySnapshot.
 type TenantAgentAvailabilitySnapshot struct {
@@ -8986,6 +9710,15 @@ type UnifiedDocumentVersionRef struct {
 	VersionNumber int    `json:"version_number"`
 }
 
+// UrlPreviewFraming defines model for UrlPreviewFraming.
+type UrlPreviewFraming struct {
+	// Framing refused: the final response forbids framing by another site (X-Frame-Options DENY or SAMEORIGIN, or a CSP frame-ancestors that allows no page of the Linger page's scheme), so the panel offers a new tab instead of a frame. allowed: it does not. unknown: TeamHub did not read the page, because it was unreachable, slow or redirected too often, TeamHub was busy with other probes, or it is on a non-public address or a port other than 80 and 443, which TeamHub never requests; the panel frames it and lets the browser decide.
+	Framing UrlPreviewFramingFraming `json:"framing"`
+}
+
+// UrlPreviewFramingFraming refused: the final response forbids framing by another site (X-Frame-Options DENY or SAMEORIGIN, or a CSP frame-ancestors that allows no page of the Linger page's scheme), so the panel offers a new tab instead of a frame. allowed: it does not. unknown: TeamHub did not read the page, because it was unreachable, slow or redirected too often, TeamHub was busy with other probes, or it is on a non-public address or a port other than 80 and 443, which TeamHub never requests; the panel frames it and lets the browser decide.
+type UrlPreviewFramingFraming string
+
 // VoiceCapture defines model for VoiceCapture.
 type VoiceCapture struct {
 	ArchivedThroughMs *int64 `json:"archived_through_ms,omitempty"`
@@ -9020,10 +9753,16 @@ type VoiceCapture struct {
 	Status                       VoiceCaptureStatus `json:"status"`
 
 	// TranscriptDocumentVersionId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
-	TranscriptDocumentVersionId  *Id                                   `json:"transcript_document_version_id,omitempty"`
-	TranscriptRecoveryProgressMs *int64                                `json:"transcript_recovery_progress_ms,omitempty"`
-	TranscriptRecoveryStatus     *VoiceCaptureTranscriptRecoveryStatus `json:"transcript_recovery_status,omitempty"`
-	TranscriptRecoveryTotalMs    *int64                                `json:"transcript_recovery_total_ms,omitempty"`
+	TranscriptDocumentVersionId *Id `json:"transcript_document_version_id,omitempty"`
+
+	// TranscriptRecoveryAttempt The recovery attempt that is running or due next; once recovery failed, the attempts already made. Present with transcript_recovery_status.
+	TranscriptRecoveryAttempt *int64 `json:"transcript_recovery_attempt,omitempty"`
+
+	// TranscriptRecoveryMaxAttempts Attempts a recovery makes before it fails and waits for the account's retry.
+	TranscriptRecoveryMaxAttempts *int64                                `json:"transcript_recovery_max_attempts,omitempty"`
+	TranscriptRecoveryProgressMs  *int64                                `json:"transcript_recovery_progress_ms,omitempty"`
+	TranscriptRecoveryStatus      *VoiceCaptureTranscriptRecoveryStatus `json:"transcript_recovery_status,omitempty"`
+	TranscriptRecoveryTotalMs     *int64                                `json:"transcript_recovery_total_ms,omitempty"`
 
 	// UpdatedAt UTC timestamp in RFC 3339 format with an explicit offset.
 	UpdatedAt Timestamp `json:"updated_at"`
@@ -9180,6 +9919,27 @@ type VoiceMediaPolicy struct {
 // VoiceProvider defines model for VoiceProvider.
 type VoiceProvider string
 
+// VoiceProviderKeyError The common error body with error.code narrowed to VoiceProviderKeyErrorCode.
+type VoiceProviderKeyError struct {
+	// Code error.code of a refused voice provider key save. 400: INVALID_REQUEST (malformed request or key); VOICE_KEY_REJECTED (the provider refused the key); VOICE_KEY_NO_BALANCE (the provider account's balance or monthly budget is used up); VOICE_KEY_NO_REALTIME_PERMISSION (the Soniox key may not use realtime transcription). 409: VOICE_KEY_FROM_ENVIRONMENT. 503: VOICE_KEY_STORAGE_UNAVAILABLE, VOICE_MEDIA_OFF, or VOICE_PROVIDER_UNAVAILABLE (the provider could not be reached or did not answer in time).
+	Code    VoiceProviderKeyErrorCode `json:"code"`
+	Details *[]ErrorDetail            `json:"details,omitempty"`
+
+	// Message Human-readable summary safe to display; clients branch on code, not message.
+	Message   string `json:"message"`
+	RequestId string `json:"request_id"`
+	Retryable *bool  `json:"retryable,omitempty"`
+}
+
+// VoiceProviderKeyErrorCode error.code of a refused voice provider key save. 400: INVALID_REQUEST (malformed request or key); VOICE_KEY_REJECTED (the provider refused the key); VOICE_KEY_NO_BALANCE (the provider account's balance or monthly budget is used up); VOICE_KEY_NO_REALTIME_PERMISSION (the Soniox key may not use realtime transcription). 409: VOICE_KEY_FROM_ENVIRONMENT. 503: VOICE_KEY_STORAGE_UNAVAILABLE, VOICE_MEDIA_OFF, or VOICE_PROVIDER_UNAVAILABLE (the provider could not be reached or did not answer in time).
+type VoiceProviderKeyErrorCode string
+
+// VoiceProviderKeyErrorResponse defines model for VoiceProviderKeyErrorResponse.
+type VoiceProviderKeyErrorResponse struct {
+	// Error The common error body with error.code narrowed to VoiceProviderKeyErrorCode.
+	Error VoiceProviderKeyError `json:"error"`
+}
+
 // VoiceProviderKeyStatus defines model for VoiceProviderKeyStatus.
 type VoiceProviderKeyStatus struct {
 	// CanSave False when the provider's environment variable is set, no secret encryption key is configured, or voice media is off.
@@ -9290,6 +10050,127 @@ type VoiceTranscriptEventPage struct {
 	PartialStartOffsetMs *int64                 `json:"partial_start_offset_ms,omitempty"`
 	PartialTranscript    *string                `json:"partial_transcript,omitempty"`
 }
+
+// WebSearchBackend One backend with the static text a client shows for it and its live state. status is ready when a call would run now: DuckDuckGo and direct always, You.com also without a key, the others with a key that is not rejected.
+type WebSearchBackend struct {
+	Commands []WebSearchCommand `json:"commands"`
+
+	// Description The provider's own one-line description of its product.
+	Description string `json:"description"`
+
+	// Filters The search filters the backend honors; any other is refused before a call.
+	Filters []WebSearchFilter `json:"filters"`
+
+	// FreeTier The provider's free allowance, for display.
+	FreeTier *string `json:"free_tier,omitempty"`
+
+	// Id A web search backend. duckduckgo searches without a key. direct opens pages only and is fetched by the Agent CLI on the Agent's computer; TeamHub never fetches a page itself.
+	Id       WebSearchBackendId       `json:"id"`
+	KeyState WebSearchBackendKeyState `json:"key_state"`
+
+	// KeyUrl Where the Human gets a key.
+	KeyUrl *string `json:"key_url,omitempty"`
+
+	// Keyless Whether the backend works without a saved key.
+	Keyless bool `json:"keyless"`
+
+	// MaxLimit The most results one search returns; 0 for a backend without search.
+	MaxLimit int `json:"max_limit"`
+
+	// MaxSites How many sites one search may name; 0 when it takes no site filter.
+	MaxSites int    `json:"max_sites"`
+	Name     string `json:"name"`
+
+	// OfficialKeyCheck Whether the provider has an official endpoint TeamHub checks a key with before saving it. Without one the key is saved unverified and proven by its first call.
+	OfficialKeyCheck bool `json:"official_key_check"`
+
+	// Quota Left out when the caller asked for the list without quota.
+	Quota  *WebSearchQuota        `json:"quota,omitempty"`
+	Status WebSearchBackendStatus `json:"status"`
+
+	// Tier How a call to the backend runs now. key: with an API key saved in the product (or one it still needs); free: without a key, on a free service with limits that TeamHub does not count (DuckDuckGo, and You.com without a key); none: direct, which needs no account.
+	Tier WebSearchBackendTier `json:"tier"`
+
+	// TierText A short display line for the tier, set for free.
+	TierText *string `json:"tier_text,omitempty"`
+}
+
+// WebSearchBackendKeyState defines model for WebSearchBackend.KeyState.
+type WebSearchBackendKeyState string
+
+// WebSearchBackendStatus defines model for WebSearchBackend.Status.
+type WebSearchBackendStatus string
+
+// WebSearchBackendTier How a call to the backend runs now. key: with an API key saved in the product (or one it still needs); free: without a key, on a free service with limits that TeamHub does not count (DuckDuckGo, and You.com without a key); none: direct, which needs no account.
+type WebSearchBackendTier string
+
+// WebSearchBackendId A web search backend. duckduckgo searches without a key. direct opens pages only and is fetched by the Agent CLI on the Agent's computer; TeamHub never fetches a page itself.
+type WebSearchBackendId string
+
+// WebSearchBackendList Every backend in TeamHub's default order. default_search is the backend a search without one uses now: the default a Human saved (chosen_default_search) even when its key stopped working, else the first backend with a usable key in that order, else duckduckgo.
+type WebSearchBackendList struct {
+	Backends []WebSearchBackend `json:"backends"`
+
+	// CanSaveKeys False when the deployment has no TEAMHUB_SECRET_ENCRYPTION_KEY to seal keys with.
+	CanSaveKeys bool `json:"can_save_keys"`
+
+	// ChosenDefaultSearch A backend that runs searches.
+	ChosenDefaultSearch *WebSearchSearchBackend `json:"chosen_default_search,omitempty"`
+	DefaultOpen         string                  `json:"default_open"`
+
+	// DefaultSearch A backend that runs searches.
+	DefaultSearch WebSearchSearchBackend `json:"default_search"`
+}
+
+// WebSearchCommand defines model for WebSearchCommand.
+type WebSearchCommand string
+
+// WebSearchDefault defines model for WebSearchDefault.
+type WebSearchDefault struct {
+	// ChosenDefaultSearch A backend that runs searches.
+	ChosenDefaultSearch *WebSearchSearchBackend `json:"chosen_default_search,omitempty"`
+
+	// DefaultSearch A backend that runs searches.
+	DefaultSearch WebSearchSearchBackend `json:"default_search"`
+}
+
+// WebSearchFilter defines model for WebSearchFilter.
+type WebSearchFilter string
+
+// WebSearchKeyBackend A backend that takes an API key saved in the product.
+type WebSearchKeyBackend string
+
+// WebSearchQuota What is left on the backend's account. from says where the numbers came from: provider is the provider's official usage endpoint read for this response; last_response is the rate-limit headers of the last call (Brave), as of observed_at; unavailable carries no numbers and reason says why.
+type WebSearchQuota struct {
+	From WebSearchQuotaFrom `json:"from"`
+
+	// Limit Absent when the provider reports no cap.
+	Limit *float32 `json:"limit,omitempty"`
+
+	// ObservedAt UTC timestamp in RFC 3339 format with an explicit offset.
+	ObservedAt *Timestamp `json:"observed_at,omitempty"`
+	Plan       *string    `json:"plan,omitempty"`
+
+	// Reason no_key: no key is saved; not_reported: there is no usage endpoint to read (keyless You.com, DuckDuckGo, Exa, direct); not_observed: Brave has answered no call yet; key_rejected: the provider refused the saved key; provider_unavailable: the usage endpoint did not answer in time.
+	Reason    *WebSearchQuotaReason `json:"reason,omitempty"`
+	Remaining *float32              `json:"remaining,omitempty"`
+
+	// ResetsAt UTC timestamp in RFC 3339 format with an explicit offset.
+	ResetsAt *Timestamp          `json:"resets_at,omitempty"`
+	Unit     *WebSearchQuotaUnit `json:"unit,omitempty"`
+}
+
+// WebSearchQuotaFrom defines model for WebSearchQuota.From.
+type WebSearchQuotaFrom string
+
+// WebSearchQuotaReason no_key: no key is saved; not_reported: there is no usage endpoint to read (keyless You.com, DuckDuckGo, Exa, direct); not_observed: Brave has answered no call yet; key_rejected: the provider refused the saved key; provider_unavailable: the usage endpoint did not answer in time.
+type WebSearchQuotaReason string
+
+// WebSearchQuotaUnit defines model for WebSearchQuota.Unit.
+type WebSearchQuotaUnit string
+
+// WebSearchSearchBackend A backend that runs searches.
+type WebSearchSearchBackend string
 
 // WorkItem defines model for WorkItem.
 type WorkItem struct {
@@ -9678,6 +10559,9 @@ type TooManyRequests = ErrorResponse
 // Unauthenticated defines model for Unauthenticated.
 type Unauthenticated = ErrorResponse
 
+// VoiceProviderKeyRefused defines model for VoiceProviderKeyRefused.
+type VoiceProviderKeyRefused = VoiceProviderKeyErrorResponse
+
 // sessionCookieContextKey is the context key for sessionCookie security scheme
 type sessionCookieContextKey string
 
@@ -9988,6 +10872,18 @@ type CreateWorkItemParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
 }
 
+// GetUrlPreviewFramingParams defines parameters for GetUrlPreviewFraming.
+type GetUrlPreviewFramingParams struct {
+	// Url The http or https page to preview.
+	Url string `form:"url" json:"url"`
+
+	// PageScheme The scheme of the Linger page that frames the site; frame-ancestors scheme sources are matched against it. Without it, http and https sources both allow the frame.
+	PageScheme *GetUrlPreviewFramingParamsPageScheme `form:"page_scheme,omitempty" json:"page_scheme,omitempty"`
+}
+
+// GetUrlPreviewFramingParamsPageScheme defines parameters for GetUrlPreviewFraming.
+type GetUrlPreviewFramingParamsPageScheme string
+
 // ListVoiceEventsParams defines parameters for ListVoiceEvents.
 type ListVoiceEventsParams struct {
 	After *string `form:"after,omitempty" json:"after,omitempty"`
@@ -10003,6 +10899,12 @@ type StreamVoiceEventsParams struct {
 type ListVoiceTranscriptEventsParams struct {
 	AfterUpdatedAt *Timestamp `form:"after_updated_at,omitempty" json:"after_updated_at,omitempty"`
 	AfterId        *Id        `form:"after_id,omitempty" json:"after_id,omitempty"`
+}
+
+// ListWebSearchBackendsParams defines parameters for ListWebSearchBackends.
+type ListWebSearchBackendsParams struct {
+	// IncludeQuota Read each backend's live quota from its provider.
+	IncludeQuota *bool `form:"include_quota,omitempty" json:"include_quota,omitempty"`
 }
 
 // UpdateWorkItemParams defines parameters for UpdateWorkItem.
@@ -10346,6 +11248,12 @@ type StartVoiceCaptureJSONRequestBody = VoiceCaptureStartRequest
 
 // CommitVoiceDictationTurnJSONRequestBody defines body for CommitVoiceDictationTurn for application/json ContentType.
 type CommitVoiceDictationTurnJSONRequestBody = VoiceDictationCommitRequest
+
+// SaveWebSearchKeyJSONRequestBody defines body for SaveWebSearchKey for application/json ContentType.
+type SaveWebSearchKeyJSONRequestBody = SaveWebSearchKeyRequest
+
+// SetWebSearchDefaultJSONRequestBody defines body for SetWebSearchDefault for application/json ContentType.
+type SetWebSearchDefaultJSONRequestBody = SetWebSearchDefaultRequest
 
 // UpdateWorkItemJSONRequestBody defines body for UpdateWorkItem for application/json ContentType.
 type UpdateWorkItemJSONRequestBody = WorkItemUpdateRequest

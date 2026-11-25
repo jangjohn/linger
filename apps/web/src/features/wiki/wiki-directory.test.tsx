@@ -355,7 +355,7 @@ describe("Wiki directory", () => {
   it("filters a collection page by name", async () => {
     await setup("/t/tenant-northstar/library/wiki/projects");
     const search = await screen.findByRole("searchbox", {
-      name: "Search Projects",
+      name: "Search projects",
     });
     expect(await screen.findByRole("link", { name: /alpha/ })).toBeVisible();
     fireEvent.change(search, { target: { value: "BET" } });

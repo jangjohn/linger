@@ -12,6 +12,10 @@ import { requireRoomRouteParam } from "@/features/rooms/room-route-params";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type { TeamHubDocument } from "@/features/teamhub/teamhub-types";
 import { documentFileName } from "@/features/library/document-display-name";
+import { commonMessages } from "@/i18n/common.messages";
+import { type Translate, formatLocale, translate } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT } from "@/i18n/use-translation";
 import { useWikiDocuments } from "./knowledge-sidebar-trees";
 import { WikiDailyCard } from "./wiki-daily-card";
 import {
@@ -37,6 +41,7 @@ import {
   reportDate,
   usePeriodReports,
 } from "@/features/memory/wiki-period-reports";
+import { wikiMessages as m } from "./wiki.messages";
 import "./wiki-home-page.css";
 
 const entityHues = [
@@ -47,10 +52,6 @@ const entityHues = [
   "#9c2a1c",
   "#5e9c1c",
 ];
-const dateFormatter = new Intl.DateTimeFormat("en-US", {
-  month: "short",
-  day: "numeric",
-});
 
 export function pageName(page: TeamHubDocument) {
   return documentFileName(page).replace(/\.md$/i, "");
@@ -74,17 +75,23 @@ function entityColors(key: number | string) {
   return { background: `${color}1a`, color };
 }
 
-export function editedLabel(page: TeamHubDocument) {
+export function editedLabel(page: TeamHubDocument, t: Translate = translate) {
   const date = new Date(page.updated_at);
   return Number.isNaN(date.valueOf())
     ? ""
-    : `Edited ${dateFormatter.format(date)}`;
+    : t(m.edited, {
+        date: new Intl.DateTimeFormat(formatLocale(), {
+          month: "short",
+          day: "numeric",
+        }).format(date),
+      });
 }
 
 /** Graph nodes by Wiki page key; descriptions and links feed the cards. */
-export function useWikiGraphNodes(tenantId: string) {
+export function useWikiGraphNodes(tenantId: string, enabled = true) {
   const { client } = useTeamHubRuntime();
   const graph = useQuery({
+    enabled,
     queryFn: () => client.getPersonalKnowledgeGraphVisualization(tenantId),
     queryKey: ["teamhub", tenantId, "personal-wiki", "graph"],
     retry: false,
@@ -128,8 +135,8 @@ export function useWikiCollectionPages(tenantId: string) {
 }
 
 const homeTabs = [
-  { id: "profile", label: "Profile" },
-  { id: "wiki", label: "Wiki" },
+  { id: "profile", label: m.profileTab },
+  { id: "wiki", label: m.title },
 ] as const;
 type WikiHomeTab = (typeof homeTabs)[number]["id"];
 
@@ -148,15 +155,16 @@ export function WikiHomePage() {
     searchParams.get("tab") === "wiki" ? "wiki" : "profile";
   const refresh = usePersonalWikiRefresh(tenantId);
   const { tabRef, indicator } = useTabIndicator(tab);
+  const t = useT();
   return (
     <main className="workspace-content-viewport workspace-scrollbar wiki-landing min-w-0 flex-1 overflow-y-auto bg-app-surface [scrollbar-gutter:stable]">
       {/* Same column, heading and tabs as the Library page. */}
       <div className="workspace-file-browser">
-        <h1 className="sr-only">Wiki</h1>
+        <h1 className="sr-only">{t(m.title)}</h1>
         {/* Profile and Wiki tabs head the page in the Library column. */}
         <header className="wiki-home-header flex items-center gap-3">
           <div
-            aria-label="Wiki views"
+            aria-label={t(m.views)}
             className="workspace-file-tabs relative flex max-w-full gap-1 overflow-x-auto"
             role="tablist"
           >
@@ -174,7 +182,7 @@ export function WikiHomePage() {
                 role="tab"
                 type="button"
               >
-                {candidate.label}
+                {t(candidate.label)}
               </button>
             ))}
             {indicator}
@@ -190,7 +198,7 @@ export function WikiHomePage() {
             <Suspense
               fallback={
                 <p role="status" className="text-sm text-app-muted">
-                  Loading Profile…
+                  {t(m.loadingProfile)}
                 </p>
               }
             >
@@ -215,10 +223,11 @@ function WikiOverview({
   const { preview, refreshing } = refresh;
   const navigate = useNavigate();
   const collections = useWikiCollectionPages(tenantId);
-  const nodes = useWikiGraphNodes(tenantId);
+  const nodes = useWikiGraphNodes(tenantId, refresh.hasPublishedWiki);
   const reports = usePeriodReports(tenantId, "daily");
   const previews = useMemo(() => wikiPreviewPages(preview), [preview]);
   const anotherMe = useAnotherMeActorId(tenantId);
+  const t = useT();
   const base = `/t/${encodeURIComponent(tenantId)}/library/wiki`;
   const documentPath = (page: TeamHubDocument) =>
     `/t/${encodeURIComponent(tenantId)}/documents/${encodeURIComponent(page.id)}`;
@@ -237,17 +246,18 @@ function WikiOverview({
       ? entry.preview.description
       : nodes.get(entry.key)?.description;
   const subtitle = (entry: WikiEntry) =>
-    description(entry) || (entry.published ? editedLabel(entry.published) : "");
+    description(entry) ||
+    (entry.published ? editedLabel(entry.published, t) : "");
   const card = { documentPath, tenantId };
-  const status = (empty: string) =>
+  const status = (empty: Message<string>) =>
     collections.pending ? (
-      <p className="landing-empty">Loading…</p>
+      <p className="landing-empty">{t(commonMessages.loading)}</p>
     ) : collections.error ? (
       <p role="alert" className="landing-empty">
-        Pages are unavailable.
+        {t(m.pagesUnavailable)}
       </p>
     ) : refreshing ? null : (
-      <p className="landing-empty">{empty}</p>
+      <p className="landing-empty">{t(empty)}</p>
     );
 
   return (
@@ -259,15 +269,15 @@ function WikiOverview({
         <div className="landing-col landing-col-left">
           <section className="landing-section landing-daily">
             <SectionHeader
-              title="Daily report"
+              title={t(m.dailyReport)}
               count={daily.length}
               to={`${base}/graph`}
             />
             {reports.isPending ? (
-              <p className="landing-empty">Loading reports…</p>
+              <p className="landing-empty">{t(m.loadingReports)}</p>
             ) : reports.error ? (
               <p role="alert" className="landing-empty">
-                Reports are unavailable.
+                {t(m.reportsUnavailable)}
               </p>
             ) : daily.length ? (
               <div className="daily-list">
@@ -289,16 +299,16 @@ function WikiOverview({
                 })}
               </div>
             ) : (
-              <p className="landing-empty">No daily reports yet.</p>
+              <p className="landing-empty">{t(m.noDailyReports)}</p>
             )}
           </section>
           <EntryCards
             {...card}
             className="landing-projects"
-            title="Projects"
+            title={t(m.projects)}
             to={`${base}/projects`}
             entries={projects}
-            empty={status("No projects yet.")}
+            empty={status(m.noProjects)}
             description={description}
             members={(entry) =>
               [
@@ -315,10 +325,10 @@ function WikiOverview({
           <EntryCards
             {...card}
             className="landing-topics"
-            title="Topics"
+            title={t(m.topics)}
             to={`${base}/topics`}
             entries={topics}
-            empty={status("No topics yet.")}
+            empty={status(m.noTopics)}
             description={description}
             members={() => []}
           />
@@ -326,7 +336,7 @@ function WikiOverview({
         <div className="landing-col landing-col-right">
           <section className="landing-section landing-people">
             <SectionHeader
-              title="People"
+              title={t(m.people)}
               count={people.length}
               to={`${base}/contacts`}
             />
@@ -348,12 +358,12 @@ function WikiOverview({
                 ))}
               </div>
             ) : (
-              status("No people yet.")
+              status(m.noPeople)
             )}
           </section>
           <section className="landing-section landing-companies">
             <SectionHeader
-              title="Companies"
+              title={t(m.companies)}
               count={companies.length}
               to={`${base}/clients`}
             />
@@ -377,7 +387,7 @@ function WikiOverview({
                 ))}
               </div>
             ) : (
-              status("No companies yet.")
+              status(m.noCompanies)
             )}
           </section>
         </div>
@@ -441,6 +451,7 @@ function EntryCards({
   description: (entry: WikiEntry) => string | undefined;
   members: (entry: WikiEntry) => string[];
 }) {
+  const t = useT();
   return (
     <section className={`landing-section ${className}`}>
       <SectionHeader title={title} count={entries.length} to={to} />
@@ -458,7 +469,7 @@ function EntryCards({
               <span className="project-card-desc">{description(entry)}</span>
               <span className="project-card-meta">
                 <span className="project-card-time">
-                  {entry.published ? editedLabel(entry.published) : ""}
+                  {entry.published ? editedLabel(entry.published, t) : ""}
                 </span>
                 <span className="project-involvers">
                   {members(entry).map((name) => (
@@ -494,6 +505,7 @@ function SectionHeader({
   count: number;
   to: string;
 }) {
+  const t = useT();
   return (
     <header className="landing-section-header">
       <h2 className="landing-section-title">
@@ -501,7 +513,7 @@ function SectionHeader({
         <span className="section-count">{count}</span>
       </h2>
       <Link className="landing-view-all" to={to}>
-        View all
+        {t(m.viewAll)}
         <Icon icon={ArrowRight02Icon} size={14} />
       </Link>
     </header>
@@ -510,14 +522,15 @@ function SectionHeader({
 
 export function WikiBack() {
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
+  const t = useT();
   return (
     <Link
-      aria-label="Back to Wiki"
+      aria-label={t(m.backToWiki)}
       className="wiki-back"
       to={`/t/${encodeURIComponent(tenantId)}/library/wiki?tab=wiki`}
     >
       <Icon icon={ArrowLeft02Icon} size={16} />
-      Back
+      {t(commonMessages.back)}
     </Link>
   );
 }
